@@ -1,10 +1,12 @@
 use std::fs::File;
-use std::io::{BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::batch::{decode_batch, encode_batch};
-use crate::{Durability, DurableFs, Error, OsDurableFs, Result, SequenceNumber, WriteBatch};
+use crate::{
+    Durability, DurableFile, DurableFs, Error, OsDurableFs, Result, SequenceNumber, WriteBatch,
+};
 
 const BLOCK_BYTES: usize = 32 * 1024;
 const HEADER_BYTES: usize = 7;
@@ -13,7 +15,8 @@ const FIRST: u8 = 2;
 const MIDDLE: u8 = 3;
 const LAST: u8 = 4;
 const CHECKSUM_MASK_DELTA: u32 = 0xa282_ead8;
-const MAX_LOGICAL_RECORD_BYTES: usize = 256 * 1024 * 1024;
+const LOGICAL_HEADER_BYTES: usize = 1 + 8 + 4;
+const MAX_OPERATION_OVERHEAD_BYTES: usize = 1 + 4 + 4 + 1 + 8;
 
 /// One complete atomic write recovered from a write-ahead log.
 ///
@@ -67,19 +70,20 @@ pub struct RecoveredBatch {
 /// input before keys or values are copied, so corrupt lengths cannot request
 /// an allocation larger than the validated record.
 pub struct WalWriter {
-    file: File,
+    file: Box<dyn DurableFile>,
     path: PathBuf,
     max_batch_bytes: usize,
+    max_logical_record_bytes: usize,
     block_offset: usize,
-    fs: Arc<dyn DurableFs>,
 }
 
 impl WalWriter {
     /// Creates a new WAL segment, truncating an existing file at `path`.
     ///
     /// `max_batch_bytes` limits the combined key and value payload accepted by
-    /// [`WalWriter::append`]. It must be nonzero. Encoded records also have a
-    /// 256 MiB defensive recovery limit.
+    /// [`WalWriter::append`]. It must be nonzero. The same value must be passed
+    /// to [`replay_wal`] so writing and recovery enforce identical payload and
+    /// checked encoded-overhead limits.
     pub fn create(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Self> {
         Self::create_with_fs(path, max_batch_bytes, Arc::new(OsDurableFs))
     }
@@ -94,21 +98,23 @@ impl WalWriter {
         max_batch_bytes: usize,
         fs: Arc<dyn DurableFs>,
     ) -> Result<Self> {
-        if max_batch_bytes == 0 {
-            return Err(Error::InvalidArgument(
-                "max_batch_bytes must be greater than zero".into(),
-            ));
-        }
+        let max_logical_record_bytes = encoded_record_limit(max_batch_bytes)?;
         let path = path.as_ref().to_path_buf();
         let file = fs
             .create(&path)
             .map_err(|source| io_error("create WAL", &path, source))?;
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs.sync_directory(directory)
+            .map_err(|source| io_error("sync WAL directory", directory, source))?;
         Ok(Self {
             file,
             path,
             max_batch_bytes,
+            max_logical_record_bytes,
             block_offset: 0,
-            fs,
         })
     }
 
@@ -138,9 +144,13 @@ impl WalWriter {
             )));
         }
         let logical = encode_batch(sequence, batch)?;
-        if logical.len() > MAX_LOGICAL_RECORD_BYTES {
+        if logical.len() > self.max_logical_record_bytes {
             return Err(Error::InvalidArgument(format!(
-                "encoded write batch exceeds WAL limit of {MAX_LOGICAL_RECORD_BYTES} bytes"
+                "encoded write batch {} exceeds the checked WAL limit {} derived from \
+                 max_batch_bytes {}",
+                logical.len(),
+                self.max_logical_record_bytes,
+                self.max_batch_bytes
             )));
         }
         self.write_logical_record(&logical)?;
@@ -155,8 +165,8 @@ impl WalWriter {
     /// This upgrades earlier buffered appends to the same file-level durability
     /// guarantee used by synchronous appends.
     pub fn sync(&self) -> Result<()> {
-        self.fs
-            .sync_file(&self.file)
+        self.file
+            .sync_all()
             .map_err(|source| io_error("sync WAL", &self.path, source))
     }
 
@@ -166,8 +176,9 @@ impl WalWriter {
         while position < logical.len() {
             let remaining_in_block = BLOCK_BYTES - self.block_offset;
             if remaining_in_block < HEADER_BYTES {
+                let padding = [0; HEADER_BYTES - 1];
                 self.file
-                    .write_all(&vec![0; remaining_in_block])
+                    .write_all(&padding[..remaining_in_block])
                     .map_err(|source| io_error("pad WAL block", &self.path, source))?;
                 self.block_offset = 0;
             }
@@ -202,14 +213,19 @@ impl WalWriter {
 
 /// Replays every complete, valid batch in a WAL segment.
 ///
-/// A short header, short payload, checksum failure, or unfinished fragment
-/// chain at the physical end of the file is treated as a torn tail and ignored.
-/// The same damage before later bytes is [`Error::Corruption`], because silently
-/// skipping an older committed region could resurrect stale data. Checksums are
+/// A structurally short final header or payload, or an unfinished final
+/// FIRST/MIDDLE chain, is treated as a torn tail and ignored. A checksum
+/// mismatch is always [`Error::Corruption`], including in the final fragment,
+/// because complete bytes with an invalid checksum are damage rather than
+/// structural truncation.
+///
+/// `max_batch_bytes` must match the value used by [`WalWriter`]. Recovery uses
+/// it both to reject decoded payloads that are too large and to derive a
+/// checked encoded-record ceiling before accumulating fragments. Checksums are
 /// stored in a masked form so their on-disk bytes are decorrelated from common
-/// CRC values; this reduces the chance that embedded checksum-like data or
-/// repeated patterns confuse low-level record scanning.
-pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<RecoveredBatch>> {
+/// CRC values.
+pub fn replay_wal(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Vec<RecoveredBatch>> {
+    let max_logical_record_bytes = encoded_record_limit(max_batch_bytes)?;
     let path = path.as_ref();
     let file = File::open(path).map_err(|source| io_error("open WAL", path, source))?;
     let file_length = file
@@ -264,25 +280,32 @@ pub fn replay_wal(path: impl AsRef<Path>) -> Result<Vec<RecoveredBatch>> {
             }
             let fragment = &block[offset + HEADER_BYTES..fragment_end];
             if unmask_checksum(stored_checksum) != checksum(fragment_type, fragment) {
-                let absolute_end =
-                    block_start + u64::try_from(fragment_end).expect("block position fits u64");
-                if absolute_end == file_length {
-                    return Ok(recovered);
-                }
-                return Err(wal_corruption("checksum mismatch before the WAL tail"));
+                return Err(wal_corruption("physical fragment checksum mismatch"));
             }
 
             match fragment_type {
-                FULL if !assembling => decode_record(fragment, &mut recovered)?,
+                FULL if !assembling => decode_record(
+                    fragment,
+                    &mut recovered,
+                    max_batch_bytes,
+                    max_logical_record_bytes,
+                )?,
                 FIRST if !assembling => {
                     logical.clear();
-                    append_fragment(&mut logical, fragment)?;
+                    append_fragment(&mut logical, fragment, max_logical_record_bytes)?;
                     assembling = true;
                 }
-                MIDDLE if assembling => append_fragment(&mut logical, fragment)?,
+                MIDDLE if assembling => {
+                    append_fragment(&mut logical, fragment, max_logical_record_bytes)?
+                }
                 LAST if assembling => {
-                    append_fragment(&mut logical, fragment)?;
-                    decode_record(&logical, &mut recovered)?;
+                    append_fragment(&mut logical, fragment, max_logical_record_bytes)?;
+                    decode_record(
+                        &logical,
+                        &mut recovered,
+                        max_batch_bytes,
+                        max_logical_record_bytes,
+                    )?;
                     logical.clear();
                     assembling = false;
                 }
@@ -332,21 +355,64 @@ fn read_block(
     Ok(filled)
 }
 
-fn append_fragment(logical: &mut Vec<u8>, fragment: &[u8]) -> Result<()> {
+fn append_fragment(
+    logical: &mut Vec<u8>,
+    fragment: &[u8],
+    max_logical_record_bytes: usize,
+) -> Result<()> {
     let new_length = logical
         .len()
         .checked_add(fragment.len())
-        .filter(|length| *length <= MAX_LOGICAL_RECORD_BYTES)
-        .ok_or_else(|| wal_corruption("logical record exceeds the recovery size limit"))?;
+        .filter(|length| *length <= max_logical_record_bytes)
+        .ok_or_else(|| {
+            wal_corruption(format!(
+                "logical record exceeds the {max_logical_record_bytes}-byte limit derived from \
+                 max_batch_bytes"
+            ))
+        })?;
     logical.reserve(new_length - logical.len());
     logical.extend_from_slice(fragment);
     Ok(())
 }
 
-fn decode_record(encoded: &[u8], recovered: &mut Vec<RecoveredBatch>) -> Result<()> {
+fn decode_record(
+    encoded: &[u8],
+    recovered: &mut Vec<RecoveredBatch>,
+    max_batch_bytes: usize,
+    max_logical_record_bytes: usize,
+) -> Result<()> {
+    if encoded.len() > max_logical_record_bytes {
+        return Err(wal_corruption(format!(
+            "logical record exceeds the {max_logical_record_bytes}-byte limit derived from \
+             max_batch_bytes"
+        )));
+    }
     let (sequence, batch) = decode_batch(encoded)?;
+    if batch.approximate_bytes() > max_batch_bytes {
+        return Err(wal_corruption(format!(
+            "write batch payload {} exceeds max_batch_bytes {max_batch_bytes}",
+            batch.approximate_bytes()
+        )));
+    }
     recovered.push(RecoveredBatch { sequence, batch });
     Ok(())
+}
+
+fn encoded_record_limit(max_batch_bytes: usize) -> Result<usize> {
+    if max_batch_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "max_batch_bytes must be greater than zero".into(),
+        ));
+    }
+    max_batch_bytes
+        .checked_mul(MAX_OPERATION_OVERHEAD_BYTES)
+        .and_then(|overhead| overhead.checked_add(max_batch_bytes))
+        .and_then(|with_payload| with_payload.checked_add(LOGICAL_HEADER_BYTES))
+        .ok_or_else(|| {
+            Error::InvalidArgument(
+                "max_batch_bytes causes the encoded WAL record limit to overflow".into(),
+            )
+        })
 }
 
 fn checksum(fragment_type: u8, fragment: &[u8]) -> u32 {

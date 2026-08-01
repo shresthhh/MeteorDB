@@ -18,7 +18,7 @@ mod wal;
 pub use batch::{WriteBatch, WriteOp};
 pub use clock::{Clock, SystemClock};
 pub use error::{Error, Result};
-pub use fs::{DurableFs, OsDurableFs};
+pub use fs::{DurableFile, DurableFs, OsDurableFs};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
 pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};

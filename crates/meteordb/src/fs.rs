@@ -1,23 +1,45 @@
 use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+
+/// An open durable file whose writes and synchronization can be injected.
+///
+/// WAL code uses this interface instead of calling [`File::write_all`] or
+/// [`File::sync_all`] directly, so tests can deterministically observe and
+/// fail the physical operations that define append durability.
+pub trait DurableFile: Send {
+    /// Writes all bytes or returns the first physical write error.
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()>;
+
+    /// Requests that all file contents and metadata reach stable storage.
+    fn sync_all(&self) -> std::io::Result<()>;
+}
+
+struct OsDurableFile(File);
+
+impl DurableFile for OsDurableFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        Write::write_all(&mut self.0, bytes)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.0.sync_all()
+    }
+}
 
 /// Filesystem operations whose crash behavior matters to persistent metadata.
 ///
 /// Keeping these operations behind a trait lets recovery tests substitute a
 /// filesystem that fails at a chosen append, synchronization, or rename. A
-/// successful write is not necessarily durable: [`DurableFs::sync_file`]
-/// asks the operating system to push a file to stable storage, while
-/// [`DurableFs::sync_directory`] persists directory-entry changes such as a
-/// newly created or renamed file.
+/// successful file synchronization is not sufficient to persist a new name:
+/// [`DurableFs::sync_directory`] separately persists directory-entry changes
+/// such as a newly created or renamed file.
 pub trait DurableFs: Send + Sync {
     /// Creates or truncates `path` and opens it for writing.
-    fn create(&self, path: &Path) -> std::io::Result<File>;
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>>;
 
     /// Opens `path` for appending, creating it when it does not exist.
-    fn append(&self, path: &Path) -> std::io::Result<File>;
-
-    /// Requests that file contents and metadata reach stable storage.
-    fn sync_file(&self, file: &File) -> std::io::Result<()>;
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>>;
 
     /// Requests that changes to entries in `path` reach stable storage.
     ///
@@ -38,20 +60,20 @@ pub trait DurableFs: Send + Sync {
 pub struct OsDurableFs;
 
 impl DurableFs for OsDurableFs {
-    fn create(&self, path: &Path) -> std::io::Result<File> {
-        OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        Ok(Box::new(OsDurableFile(
+            OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(path)?,
+        )))
     }
 
-    fn append(&self, path: &Path) -> std::io::Result<File> {
-        OpenOptions::new().create(true).append(true).open(path)
-    }
-
-    fn sync_file(&self, file: &File) -> std::io::Result<()> {
-        file.sync_all()
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        Ok(Box::new(OsDurableFile(
+            OpenOptions::new().create(true).append(true).open(path)?,
+        )))
     }
 
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
