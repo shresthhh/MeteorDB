@@ -78,12 +78,13 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Creates a new WAL segment, truncating an existing file at `path`.
+    /// Exclusively creates a new WAL segment.
     ///
     /// `max_batch_bytes` limits the combined key and value payload accepted by
     /// [`WalWriter::append`]. It must be nonzero. The same value must be passed
     /// to [`replay_wal`] so writing and recovery enforce identical payload and
-    /// checked encoded-overhead limits.
+    /// checked encoded-overhead limits. If `path` already exists, creation
+    /// fails without modifying its bytes because recovery is not implemented.
     pub fn create(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Self> {
         Self::create_with_fs(path, max_batch_bytes, Arc::new(OsDurableFs))
     }
@@ -102,7 +103,7 @@ impl WalWriter {
         let path = path.as_ref().to_path_buf();
         let file = fs
             .create(&path)
-            .map_err(|source| io_error("create WAL", &path, source))?;
+            .map_err(|source| io_error("create new WAL", &path, source))?;
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())

@@ -196,6 +196,23 @@ fn empty_and_oversized_batches_are_rejected_without_writing() {
     assert_eq!(std::fs::metadata(path).unwrap().len(), 0);
 }
 
+#[test]
+fn writer_creation_exclusively_preserves_an_existing_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000001.wal");
+    let existing = b"existing WAL bytes";
+    std::fs::write(&path, existing).unwrap();
+
+    assert!(matches!(
+        WalWriter::create(&path, 128),
+        Err(Error::Io {
+            operation: "create new WAL",
+            ..
+        })
+    ));
+    assert_eq!(std::fs::read(path).unwrap(), existing);
+}
+
 struct TrackingFs {
     inner: OsDurableFs,
     events: Arc<Mutex<Vec<&'static str>>>,

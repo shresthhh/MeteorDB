@@ -35,7 +35,11 @@ impl DurableFile for OsDurableFile {
 /// [`DurableFs::sync_directory`] separately persists directory-entry changes
 /// such as a newly created or renamed file.
 pub trait DurableFs: Send + Sync {
-    /// Creates or truncates `path` and opens it for writing.
+    /// Exclusively creates `path` and opens it for writing.
+    ///
+    /// This fails with [`std::io::ErrorKind::AlreadyExists`] when `path`
+    /// already exists, preventing accidental truncation and check-then-create
+    /// races.
     fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>>;
 
     /// Opens `path` for appending, creating it when it does not exist.
@@ -62,11 +66,7 @@ pub struct OsDurableFs;
 impl DurableFs for OsDurableFs {
     fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
         Ok(Box::new(OsDurableFile(
-            OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(path)?,
+            OpenOptions::new().create_new(true).write(true).open(path)?,
         )))
     }
 
