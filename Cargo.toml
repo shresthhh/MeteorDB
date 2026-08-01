@@ -8,4 +8,5 @@ license = "MIT"
 rust-version = "1.88"
 
 [workspace.dependencies]
+crc32c = "0.6.8"
 thiserror = "2.0.12"
