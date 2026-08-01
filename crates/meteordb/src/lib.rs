@@ -1,17 +1,21 @@
-//! Public configuration, write-batch, error, and clock contracts for MeteorDB.
+//! Public contracts and MVCC building blocks for MeteorDB.
 //!
-//! This crate currently defines the stable vocabulary used by later storage-engine
-//! components. It intentionally does not expose the internal module layout, so
-//! applications can import every supported contract directly from the crate root.
+//! The crate exposes configuration, write batches, internal-key ordering, and
+//! snapshot lifetime tracking. Modules remain private so applications can use a
+//! stable crate-root API without depending on the source-file layout.
 
 #![deny(missing_docs)]
 
 mod batch;
 mod clock;
 mod error;
+mod internal_key;
 mod options;
+mod snapshot;
 
 pub use batch::{WriteBatch, WriteOp};
 pub use clock::{Clock, SystemClock};
 pub use error::{Error, Result};
+pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
 pub use options::{Compression, Durability, Options};
+pub use snapshot::{SnapshotGuard, SnapshotRegistry};
