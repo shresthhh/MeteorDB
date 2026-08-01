@@ -8,18 +8,22 @@
 
 mod batch;
 mod clock;
+mod engine;
 mod error;
 mod fs;
 mod internal_key;
+mod memtable;
 mod options;
 mod snapshot;
 mod wal;
 
 pub use batch::{WriteBatch, WriteOp};
 pub use clock::{Clock, SystemClock};
+pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
 pub use fs::{DurableFile, DurableFs, OsDurableFs};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
+pub use memtable::{MemTable, ValueRecord};
 pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};
 pub use wal::{RecoveredBatch, WalWriter, replay_wal};
