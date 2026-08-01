@@ -1,0 +1,14 @@
+[package]
+name = "meteordb"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.7.0"
+tempfile = "3.20.0"

@@ -172,9 +172,12 @@ Durability modes:
 - `Buffered`: acknowledge after the append reaches the operating system; the
   caller may explicitly request synchronization.
 
-A torn final WAL record is ignored during recovery. A checksum failure in an
-earlier committed region is reported as corruption rather than treated as an
-empty or missing value.
+A structurally incomplete final WAL header, payload, or fragment chain is
+ignored during recovery. A checksum mismatch is always reported as corruption,
+including in the final physical fragment, because complete bytes with an
+invalid checksum are not structural truncation. Replay receives the same
+`max_batch_bytes` limit as the writer so recovery cannot accumulate an
+unbounded logical record.
 
 ### 5.2 Memtable Rotation
 
