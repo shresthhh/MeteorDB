@@ -1,15 +1,8 @@
-use std::io::ErrorKind;
-
 use meteordb::{Engine, Options, Result, WriteBatch};
 
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let path = std::env::temp_dir().join("meteordb-quickstart");
-    remove_database(&path)?;
-
-    let result = run(&path);
-    let cleanup = remove_database(&path);
-    result?;
-    cleanup?;
+    let database = tempfile::tempdir()?;
+    run(database.path())?;
     Ok(())
 }
 
@@ -35,12 +28,4 @@ fn run(path: &std::path::Path) -> Result<()> {
 
     drop(snapshot);
     engine.close()
-}
-
-fn remove_database(path: &std::path::Path) -> std::io::Result<()> {
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-    }
 }

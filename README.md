@@ -26,14 +26,25 @@ The current crate provides:
 Atomic batches and snapshot-isolated point reads are supported. General
 transactions are not.
 
+Only the database path, durability mode, and key/value/batch input limits
+currently affect the in-memory engine. SSTable sizing and block layout,
+Bloom-filter, block-cache, compression, and memtable-rotation configuration are
+public forward-compatible surfaces, but they are not operational until those
+storage subsystems land.
+
 ## Prerequisites
 
-- Rust 1.88.0
-- Cargo
-- A C compiler/linker available as `cc` or configured through `CC`
+- Rust 1.88.0 with Cargo
+- A working native C toolchain whose linker is available as `cc`
 
 The repository's `rust-toolchain.toml` selects Rust 1.88.0 with `rustfmt` and
-`clippy`.
+`clippy`. On Ubuntu or Debian, install the native toolchain with:
+
+```bash
+sudo apt install build-essential
+```
+
+On macOS, install the Xcode command-line tools with `xcode-select --install`.
 
 ## Build and test
 
@@ -65,6 +76,12 @@ Its central API flow is:
 ```rust
 use meteordb::{Engine, Options, Result, WriteBatch};
 
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let database = tempfile::tempdir()?;
+    run(database.path())?;
+    Ok(())
+}
+
 fn run(path: &std::path::Path) -> Result<()> {
     let engine = Engine::open(Options::new(path))?;
 
@@ -90,8 +107,11 @@ fn run(path: &std::path::Path) -> Result<()> {
 }
 ```
 
-The example uses a database directory under `std::env::temp_dir()` and removes
-it before and after the run, so repeated executions start from the same state.
+`tempfile::tempdir()` creates a uniquely owned directory and removes it
+automatically. The snapshot is dropped and the engine is closed inside `run`,
+before the temporary-directory handle is dropped; errors also unwind `run` and
+drop its handles before automatic cleanup. The example never recursively
+deletes a shared predictable path.
 
 ## How a write becomes visible
 
