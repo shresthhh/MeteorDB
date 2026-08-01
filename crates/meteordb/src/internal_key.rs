@@ -3,6 +3,7 @@ use std::cmp::Ordering;
 use crate::{Error, Result};
 
 const INTERNAL_KEY_TRAILER_BYTES: usize = 9;
+const USER_KEY_TERMINATOR_BYTES: usize = 2;
 const MAX_SEQUENCE_NUMBER: SequenceNumber = u64::MAX - 1;
 
 /// The commit-order number attached to one stored version of a user key.
@@ -45,17 +46,23 @@ impl ValueKind {
 
 /// An owned storage-engine key containing a user key, sequence, and value kind.
 ///
-/// The encoded bytes are `user_key || big_endian(!sequence) || kind`. Reversing
-/// the sequence bits makes newer versions compare before older versions when
-/// their encoded bytes are compared. The maximum `u64` sequence is reserved so
-/// later engine code has a sentinel above every valid committed sequence.
+/// The user key is escaped before the trailer: nonzero bytes are copied,
+/// `0x00` becomes `0x00 0xff`, and `0x00 0x00` terminates the key. The trailer
+/// is `big_endian(!sequence) || kind`. A terminator is required because simply
+/// appending a trailer to a variable-length key lets trailer bytes affect the
+/// ordering of prefix keys such as `a` and `aa`. Escaping reserves the
+/// terminator while preserving ordinary byte order, including keys containing
+/// zero bytes.
 ///
-/// [`Ord`] compares user keys first, then sequences newest-first, then kinds.
-/// It does not compare the whole encoding directly because a user key may be a
-/// prefix of another user key.
+/// Every encoding costs eleven fixed bytes: the two-byte terminator and the
+/// nine-byte trailer. Each zero byte in the user key costs one additional byte.
+/// In return, ordinary encoded-byte comparison exactly implements [`Ord`]:
+/// user keys ascend, sequences descend, and kinds break remaining ties. The
+/// maximum `u64` sequence is reserved for future sentinel or seek-bound use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InternalKey {
     encoded: Vec<u8>,
+    user_key: Vec<u8>,
 }
 
 impl InternalKey {
@@ -74,12 +81,14 @@ impl InternalKey {
             ));
         }
 
-        let user_key = user_key.as_ref();
-        let mut encoded = Vec::with_capacity(user_key.len() + INTERNAL_KEY_TRAILER_BYTES);
-        encoded.extend_from_slice(user_key);
+        let user_key = user_key.as_ref().to_vec();
+        let mut encoded = Vec::with_capacity(
+            user_key.len() + USER_KEY_TERMINATOR_BYTES + INTERNAL_KEY_TRAILER_BYTES,
+        );
+        encode_user_key(&user_key, &mut encoded);
         encoded.extend_from_slice(&(!sequence).to_be_bytes());
         encoded.push(kind.byte());
-        Ok(Self { encoded })
+        Ok(Self { encoded, user_key })
     }
 
     /// Creates a value key for a valid committed sequence number.
@@ -110,21 +119,31 @@ impl InternalKey {
 
     /// Validates and copies an encoded internal key.
     ///
-    /// Encodings shorter than the nine-byte trailer and encodings with unknown
-    /// kind bytes are reported as [`Error::Corruption`]. The reversed sequence
-    /// representation accepts every valid sequence except the reserved maximum.
+    /// Validation rejects a missing user-key terminator, malformed zero-byte
+    /// escapes, a trailer of any length other than nine bytes, unknown kind
+    /// bytes, the reserved maximum sequence, and bytes trailing the trailer.
     pub fn decode(encoded: impl AsRef<[u8]>) -> Result<Self> {
         let encoded = encoded.as_ref();
-        if encoded.len() < INTERNAL_KEY_TRAILER_BYTES {
+        let (user_key, trailer_start) = decode_user_key(encoded)?;
+        let trailer_len = encoded.len() - trailer_start;
+        if trailer_len < INTERNAL_KEY_TRAILER_BYTES {
             return Err(Error::Corruption {
                 context: "internal key",
-                detail: "encoded key is shorter than 9 bytes".to_owned(),
+                detail: format!("truncated trailer: expected 9 bytes, found {trailer_len}"),
+            });
+        }
+        if trailer_len > INTERNAL_KEY_TRAILER_BYTES {
+            return Err(Error::Corruption {
+                context: "internal key",
+                detail: format!(
+                    "trailing bytes after trailer: expected 9 bytes, found {trailer_len}"
+                ),
             });
         }
 
         let kind_byte = encoded[encoded.len() - 1];
         ValueKind::from_byte(kind_byte)?;
-        let sequence = decode_sequence(encoded);
+        let sequence = decode_sequence(&encoded[trailer_start..trailer_start + 8]);
         if sequence > MAX_SEQUENCE_NUMBER {
             return Err(Error::Corruption {
                 context: "internal key",
@@ -134,17 +153,19 @@ impl InternalKey {
 
         Ok(Self {
             encoded: encoded.to_vec(),
+            user_key,
         })
     }
 
-    /// Borrows the original user-key portion of this internal key.
+    /// Borrows the decoded user key, with escaped zero bytes restored.
     pub fn user_key(&self) -> &[u8] {
-        &self.encoded[..self.encoded.len() - INTERNAL_KEY_TRAILER_BYTES]
+        &self.user_key
     }
 
     /// Returns the committed sequence number stored in this internal key.
     pub fn sequence(&self) -> SequenceNumber {
-        decode_sequence(&self.encoded)
+        let sequence_start = self.encoded.len() - INTERNAL_KEY_TRAILER_BYTES;
+        decode_sequence(&self.encoded[sequence_start..sequence_start + 8])
     }
 
     /// Returns whether this key represents a value or a deletion marker.
@@ -155,8 +176,8 @@ impl InternalKey {
 
     /// Borrows the encoded bytes used by tables and in-memory indexes.
     ///
-    /// For equal user keys, ordinary byte comparison places newer sequences
-    /// first. Use [`Ord`] on `InternalKey` when comparing different user keys.
+    /// Ordinary byte comparison exactly matches [`InternalKey::cmp`], including
+    /// for prefix keys and user keys containing zero bytes.
     pub fn as_bytes(&self) -> &[u8] {
         &self.encoded
     }
@@ -169,10 +190,7 @@ impl InternalKey {
 
 impl Ord for InternalKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.user_key()
-            .cmp(other.user_key())
-            .then_with(|| other.sequence().cmp(&self.sequence()))
-            .then_with(|| self.kind().cmp(&other.kind()))
+        self.encoded.cmp(&other.encoded)
     }
 }
 
@@ -182,12 +200,61 @@ impl PartialOrd for InternalKey {
     }
 }
 
+fn encode_user_key(user_key: &[u8], encoded: &mut Vec<u8>) {
+    for &byte in user_key {
+        if byte == 0 {
+            encoded.extend_from_slice(&[0x00, 0xff]);
+        } else {
+            encoded.push(byte);
+        }
+    }
+    encoded.extend_from_slice(&[0x00, 0x00]);
+}
+
+fn decode_user_key(encoded: &[u8]) -> Result<(Vec<u8>, usize)> {
+    let mut user_key = Vec::new();
+    let mut index = 0;
+
+    while index < encoded.len() {
+        let byte = encoded[index];
+        if byte != 0 {
+            user_key.push(byte);
+            index += 1;
+            continue;
+        }
+
+        let Some(&follower) = encoded.get(index + 1) else {
+            return Err(Error::Corruption {
+                context: "internal key",
+                detail: "zero byte at end of encoding has no escape follower".to_owned(),
+            });
+        };
+        match follower {
+            0x00 => return Ok((user_key, index + USER_KEY_TERMINATOR_BYTES)),
+            0xff => {
+                user_key.push(0);
+                index += 2;
+            }
+            _ => {
+                return Err(Error::Corruption {
+                    context: "internal key",
+                    detail: format!("invalid zero-byte escape follower {follower:#04x}"),
+                });
+            }
+        }
+    }
+
+    Err(Error::Corruption {
+        context: "internal key",
+        detail: "missing user-key terminator".to_owned(),
+    })
+}
+
 fn decode_sequence(encoded: &[u8]) -> SequenceNumber {
-    let sequence_start = encoded.len() - INTERNAL_KEY_TRAILER_BYTES;
     let reversed = u64::from_be_bytes(
-        encoded[sequence_start..sequence_start + 8]
+        encoded
             .try_into()
-            .expect("the internal-key trailer always contains eight sequence bytes"),
+            .expect("validated internal keys always contain eight sequence bytes"),
     );
     !reversed
 }

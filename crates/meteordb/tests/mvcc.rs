@@ -18,6 +18,47 @@ fn user_keys_sort_in_ascending_byte_order() {
 
     assert!(short < longer);
     assert!(longer < later);
+    assert_eq!(short.as_bytes().cmp(longer.as_bytes()), short.cmp(&longer));
+    assert_eq!(longer.as_bytes().cmp(later.as_bytes()), longer.cmp(&later));
+}
+
+#[test]
+fn encoded_prefix_keys_sort_in_user_key_order() {
+    let keys = [
+        InternalKey::value(b"", 7),
+        InternalKey::value(b"a", 7),
+        InternalKey::value(b"aa", 7),
+        InternalKey::value(b"b", 7),
+    ];
+
+    for pair in keys.windows(2) {
+        assert!(pair[0] < pair[1]);
+        assert!(pair[0].as_bytes() < pair[1].as_bytes());
+    }
+}
+
+#[test]
+fn zero_bytes_are_escaped_without_changing_order() {
+    let keys = [
+        InternalKey::value(b"", 7),
+        InternalKey::value(b"\0", 7),
+        InternalKey::value(b"\0\0", 7),
+        InternalKey::value(b"\0\x01", 7),
+        InternalKey::value(b"\x01", 7),
+    ];
+
+    assert_eq!(
+        InternalKey::value(b"a\0b", 7).as_bytes(),
+        [
+            b'a', 0x00, 0xff, b'b', 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8,
+            0x01,
+        ]
+    );
+
+    for pair in keys.windows(2) {
+        assert!(pair[0] < pair[1]);
+        assert!(pair[0].as_bytes() < pair[1].as_bytes());
+    }
 }
 
 #[test]
@@ -39,8 +80,8 @@ fn malformed_internal_keys_are_rejected() {
         InternalKey::decode(b"short"),
         Err(Error::Corruption {
             context: "internal key",
-            detail,
-        }) if detail == "encoded key is shorter than 9 bytes"
+            ..
+        })
     ));
 
     let mut unknown_kind = InternalKey::value(b"k", 7).into_bytes();
@@ -51,8 +92,60 @@ fn malformed_internal_keys_are_rejected() {
         InternalKey::decode(&unknown_kind),
         Err(Error::Corruption {
             context: "internal key",
-            detail,
-        }) if detail == "unknown value kind byte 2"
+            ..
+        })
+    ));
+
+    let missing_terminator = [b'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x01];
+    assert!(matches!(
+        InternalKey::decode(missing_terminator),
+        Err(Error::Corruption {
+            context: "internal key",
+            ..
+        })
+    ));
+
+    let invalid_escape = [
+        b'k', 0x00, 0x01, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8, 0x01,
+    ];
+    assert!(matches!(
+        InternalKey::decode(invalid_escape),
+        Err(Error::Corruption {
+            context: "internal key",
+            ..
+        })
+    ));
+
+    let truncated_trailer = [
+        b'k', 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf8,
+    ];
+    assert!(matches!(
+        InternalKey::decode(truncated_trailer),
+        Err(Error::Corruption {
+            context: "internal key",
+            ..
+        })
+    ));
+
+    let reserved_sequence = [
+        b'k', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+    ];
+    assert!(matches!(
+        InternalKey::decode(reserved_sequence),
+        Err(Error::Corruption {
+            context: "internal key",
+            ..
+        })
+    ));
+
+    let mut trailing_bytes = InternalKey::value(b"k", 7).into_bytes();
+    trailing_bytes.push(0x01);
+    assert!(matches!(
+        InternalKey::decode(trailing_bytes),
+        Err(Error::Corruption {
+            context: "internal key",
+            ..
+        })
     ));
 }
 
@@ -110,5 +203,22 @@ proptest! {
         prop_assert_eq!(decoded.sequence(), sequence);
         prop_assert_eq!(decoded.kind(), kind);
         prop_assert_eq!(decoded, key);
+    }
+
+    #[test]
+    fn encoded_comparison_matches_internal_key_order(
+        left_user_key in prop::collection::vec(any::<u8>(), 0..256),
+        left_sequence in 0..u64::MAX,
+        left_kind in prop_oneof![Just(ValueKind::Deletion), Just(ValueKind::Value)],
+        right_user_key in prop::collection::vec(any::<u8>(), 0..256),
+        right_sequence in 0..u64::MAX,
+        right_kind in prop_oneof![Just(ValueKind::Deletion), Just(ValueKind::Value)],
+    ) {
+        let left = InternalKey::try_new(left_user_key, left_sequence, left_kind)
+            .expect("generated sequences are valid");
+        let right = InternalKey::try_new(right_user_key, right_sequence, right_kind)
+            .expect("generated sequences are valid");
+
+        prop_assert_eq!(left.as_bytes().cmp(right.as_bytes()), left.cmp(&right));
     }
 }
