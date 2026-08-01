@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::{io, path::PathBuf};
 
 use crate::{
     DurableFs, Error, MemTable, Options, OsDurableFs, Result, SequenceNumber, SnapshotGuard,
@@ -30,7 +31,48 @@ struct WriteState {
     next_sequence: SequenceNumber,
     memtable: MemTable,
     closed: bool,
-    write_failure: Option<String>,
+    terminal_failure: Option<TerminalFailure>,
+}
+
+struct TerminalFailure {
+    operation: Option<&'static str>,
+    path: Option<PathBuf>,
+    source_kind: Option<io::ErrorKind>,
+    message: String,
+}
+
+impl TerminalFailure {
+    fn from_error(error: Error) -> Self {
+        match error {
+            Error::Io {
+                operation,
+                path,
+                source,
+            } => Self {
+                operation: Some(operation),
+                path: Some(path),
+                source_kind: Some(source.kind()),
+                message: source.to_string(),
+            },
+            error => Self {
+                operation: None,
+                path: None,
+                source_kind: None,
+                message: error.to_string(),
+            },
+        }
+    }
+
+    fn to_error(&self) -> Error {
+        match (self.operation, &self.path, self.source_kind) {
+            (Some(operation), Some(path), Some(kind)) => Error::Io {
+                operation,
+                path: path.clone(),
+                source: io::Error::new(kind, self.message.clone()),
+            },
+            _ => Error::Background(self.message.clone()),
+        }
+    }
 }
 
 impl Engine {
@@ -38,7 +80,8 @@ impl Engine {
     ///
     /// This Task 4 implementation creates `000001.wal` inside
     /// [`Options::path`] and starts with an empty memtable. WAL replay and
-    /// multi-segment recovery belong to a later task.
+    /// multi-segment recovery belong to a later task. Until then, an existing
+    /// `000001.wal` causes this operation to fail without modifying the file.
     pub fn open(options: Options) -> Result<Self> {
         Self::open_with_fs(options, Arc::new(OsDurableFs))
     }
@@ -64,7 +107,7 @@ impl Engine {
                     next_sequence: 1,
                     memtable: MemTable::default(),
                     closed: false,
-                    write_failure: None,
+                    terminal_failure: None,
                 }),
                 committed_sequence: AtomicU64::new(0),
                 snapshots: SnapshotRegistry::default(),
@@ -104,10 +147,7 @@ impl Engine {
     /// the new sequence also observes the preceding memtable writes.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
         let mut state = self.lock_state();
-        ensure_open(&state)?;
-        if let Some(message) = &state.write_failure {
-            return Err(Error::Background(message.clone()));
-        }
+        ensure_writable(&state)?;
         validate_batch(&self.inner.options, &batch)?;
 
         let sequence = state.next_sequence;
@@ -120,10 +160,7 @@ impl Engine {
             .wal
             .append(sequence, &batch, self.inner.options.durability)
         {
-            state.write_failure = Some(format!(
-                "the WAL append failed; further writes are disabled: {error}"
-            ));
-            return Err(error);
+            return Err(record_terminal_failure(&mut state, error));
         }
 
         state.memtable.apply(sequence, batch)?;
@@ -167,25 +204,36 @@ impl Engine {
     /// [`crate::Durability::Buffered`] callers can use this method as an explicit
     /// durability barrier.
     pub fn sync(&self) -> Result<()> {
-        let state = self.lock_state();
-        ensure_open(&state)?;
-        if let Some(message) = &state.write_failure {
-            return Err(Error::Background(message.clone()));
+        let mut state = self.lock_state();
+        ensure_writable(&state)?;
+        if let Err(error) = state.wal.sync() {
+            return Err(record_terminal_failure(&mut state, error));
         }
-        state.wal.sync()
+        Ok(())
     }
 
     /// Closes the shared engine handle.
     ///
     /// The first call synchronizes the WAL before marking the engine closed.
-    /// Later calls return success without repeating work. Every other engine
-    /// or snapshot operation returns [`Error::Closed`] after publication.
+    /// Later calls return success without repeating work. If synchronization
+    /// fails, the engine still closes logically, records that terminal
+    /// durability error, and every later `close`, write, or sync returns the
+    /// same typed error without retrying I/O. Reads then return [`Error::Closed`].
     pub fn close(&self) -> Result<()> {
         let mut state = self.lock_state();
+        if let Some(failure) = &state.terminal_failure {
+            let error = failure.to_error();
+            state.closed = true;
+            return Err(error);
+        }
         if state.closed {
             return Ok(());
         }
-        state.wal.sync()?;
+        if let Err(error) = state.wal.sync() {
+            let error = record_terminal_failure(&mut state, error);
+            state.closed = true;
+            return Err(error);
+        }
         state.closed = true;
         Ok(())
     }
@@ -246,6 +294,21 @@ fn ensure_open(state: &WriteState) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+fn ensure_writable(state: &WriteState) -> Result<()> {
+    if let Some(failure) = &state.terminal_failure {
+        Err(failure.to_error())
+    } else {
+        ensure_open(state)
+    }
+}
+
+fn record_terminal_failure(state: &mut WriteState, error: Error) -> Error {
+    let failure = TerminalFailure::from_error(error);
+    let returned = failure.to_error();
+    state.terminal_failure = Some(failure);
+    returned
 }
 
 fn validate_batch(options: &Options, batch: &WriteBatch) -> Result<()> {
