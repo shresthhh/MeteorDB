@@ -88,6 +88,7 @@ struct WriteState {
     next_sequence: SequenceNumber,
     flush_running: bool,
     obsolete_sstables: VecDeque<ObsoleteSstables>,
+    reader_versions: Vec<Weak<crate::Version>>,
     closed: bool,
     terminal_failure: Option<TerminalFailure>,
     background_failure: bool,
@@ -357,6 +358,7 @@ impl Engine {
                     })?,
                     flush_running: false,
                     obsolete_sstables: VecDeque::new(),
+                    reader_versions: Vec::new(),
                     closed: false,
                     terminal_failure: None,
                     background_failure: false,
@@ -770,7 +772,7 @@ impl Engine {
         key: &[u8],
         sequence: SequenceNumber,
         read_time_unix_ms: u64,
-        state: MutexGuard<'_, WriteState>,
+        mut state: MutexGuard<'_, WriteState>,
     ) -> Result<Option<Vec<u8>>> {
         if let Some((_, record)) = state
             .mutable
@@ -791,6 +793,7 @@ impl Engine {
         }
 
         let version = state.versions.current();
+        state.reader_versions.push(Arc::downgrade(&version));
         drop(state);
         for file in version.files(0).iter().filter(|file| overlaps(file, key)) {
             if let Some(value) =
@@ -853,7 +856,7 @@ impl Engine {
         limit: usize,
         sequence: SequenceNumber,
         read_time_unix_ms: u64,
-        state: MutexGuard<'_, WriteState>,
+        mut state: MutexGuard<'_, WriteState>,
         guard: SnapshotGuard,
     ) -> Result<KvIterator> {
         let mut children = Vec::with_capacity(1 + state.immutables.len());
@@ -862,6 +865,7 @@ impl Engine {
             push_memtable_child(&mut children, &immutable.table, &bounds);
         }
         let version = state.versions.current();
+        state.reader_versions.push(Arc::downgrade(&version));
         drop(state);
 
         for level in 0..crate::NUM_LEVELS {
@@ -1218,15 +1222,21 @@ fn validate_compaction_plan(plan: &crate::CompactionPlan, version: &crate::Versi
 }
 
 fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
-    let protected: BTreeSet<_> = state
+    state
+        .reader_versions
+        .retain(|version| version.strong_count() > 0);
+    let protected_versions = state
         .obsolete_sstables
         .iter()
         .filter(|obsolete| !obsolete.is_unreferenced())
-        .flat_map(|obsolete| {
-            (0..crate::NUM_LEVELS)
-                .flat_map(|level| obsolete.version.files(level).iter().map(FileMeta::number))
-        })
-        .collect();
+        .map(|obsolete| obsolete.version.clone())
+        .chain(state.reader_versions.iter().filter_map(Weak::upgrade));
+    let mut protected = BTreeSet::new();
+    for version in protected_versions {
+        for level in 0..crate::NUM_LEVELS {
+            protected.extend(version.files(level).iter().map(FileMeta::number));
+        }
+    }
     let mut removed = false;
     let mut retained = VecDeque::new();
     while let Some(mut obsolete) = state.obsolete_sstables.pop_front() {
