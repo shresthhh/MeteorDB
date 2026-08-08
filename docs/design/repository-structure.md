@@ -70,10 +70,14 @@ flowchart LR
     Engine --> WAL
     Engine --> Memtable
     Memtable --> Flush
-    Flush --> SSTable
-    SSTable --> Manifest
-    Engine --> Cache
-    Cache --> SSTable
+    Flush --> Builder
+    Builder --> SSTable
+    Builder --> Manifest
+    Engine --> TableReader
+    TableReader -->|checks| Cache
+    Cache -->|hit or miss| TableReader
+    TableReader -->|read checked block on miss| SSTable
+    TableReader -->|admit validated content| Cache
 ```
 
 The final diagram uses subgraphs and labeled edges to distinguish foreground

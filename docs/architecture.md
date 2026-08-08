@@ -12,11 +12,13 @@ flowchart TB
     App[Application threads]
 
     subgraph Foreground[Foreground engine]
+        Open[Engine::open and VersionSet]
         API[Engine API]
         Writer[Serialized write state]
         Mutable[Mutable MVCC memtable]
         Immutable[Immutable memtable queue]
         Versions[Current immutable version]
+        Reader[TableReader]
         Stats[Read statistics]
     end
 
@@ -37,7 +39,10 @@ flowchart TB
         Data[Data blocks]
     end
 
-    App --> API
+    App --> Open
+    Open --> API
+    Open --> Versions
+    Open -->|acquires and holds for writer lifetime| Lock
     API --> Writer
     Writer --> WAL
     Writer --> Mutable
@@ -47,13 +52,16 @@ flowchart TB
     Builder --> Manifest
     Manifest --> Versions
     Current --> Manifest
-    Lock --> Manifest
     API --> Versions
-    Versions --> Tables
-    API --> Metadata
-    API --> Data
-    Metadata <--> Tables
-    Data <--> Tables
+    Versions --> Reader
+    API --> Reader
+    Reader -->|checks| Metadata
+    Reader -->|checks| Data
+    Metadata -->|hit or miss| Reader
+    Data -->|hit or miss| Reader
+    Reader -->|on miss: read checksummed block| Tables
+    Reader -->|admit validated content| Metadata
+    Reader -->|admit validated content| Data
     API --> Stats
 ```
 
@@ -97,8 +105,9 @@ sequenceDiagram
     participant E as Engine
     participant M as Memtables
     participant V as Current version
+    participant T as TableReader
     participant C as Block cache
-    participant S as SSTables
+    participant S as SSTable file
 
     A->>E: get(key) or snapshot.get(key)
     E->>M: Find newest visible version
@@ -106,18 +115,28 @@ sequenceDiagram
         M-->>E: Value, tombstone, or absence
     else Not found in memory
         E->>V: Retain current live-file metadata
-        E->>S: Probe overlapping level 0 files newest first
-        E->>S: Probe at most one candidate per higher level
-        S->>C: Read cached index, Bloom, and data blocks
-        C-->>S: Cached block or miss
-        S-->>E: Visible value, tombstone, or absence
+        E->>T: Probe overlapping level 0 files newest first
+        E->>T: Probe at most one candidate per higher level
+        T->>C: Look up index, Bloom, or data block
+        alt Cache hit
+            C-->>T: Validated decoded block bytes
+        else Cache miss
+            C-->>T: Miss
+            T->>S: Read checksummed block
+            S-->>T: Stored block bytes
+            T->>T: Validate checksum and decode structure
+            T->>C: Admit validated decoded block bytes
+        end
+        T-->>E: Visible value, tombstone, or absence
     end
     E-->>A: Value or None
 ```
 
 An ordinary read uses the latest published sequence. A snapshot captures a
 fixed sequence and retains it for its lifetime. Bloom-filter negatives avoid
-data-block reads but positive results still require a key lookup.
+data-block reads but positive results still require a key lookup. The engine
+constructs a `TableReader` for a candidate file; the reader, not the SSTable
+file, checks and fills the block cache.
 
 ## Flush and recovery
 
@@ -137,15 +156,20 @@ On open, MeteorDB:
 5. creates a fresh active WAL and durably records recovery counters; and
 6. starts the flush worker to persist recovered memtables.
 
-Checksums, framing, monotonic sequence numbers, and manifest counters turn torn
-or inconsistent state into an explicit corruption error rather than a partial
-logical write.
+Recovery distinguishes an incomplete final append from damage to complete
+bytes. A structurally short final WAL header or payload, or an unfinished final
+fragment chain, is treated as a torn tail and ignored. The same structural
+cases at the end of a manifest are truncated back to the last complete record
+before appending resumes. Checksum mismatches, invalid fragment ordering,
+missing required WAL or SSTable files, sequence gaps, and inconsistent manifest
+metadata instead return typed corruption or I/O errors; none is accepted as a
+partial logical write.
 
 ## On-disk ownership
 
 | File | Owner and lifetime |
 | --- | --- |
-| `LOCK` | Held exclusively by the open `VersionSet` |
+| `LOCK` | Acquired during `Engine::open` and held exclusively by its `VersionSet` for the writer lifetime |
 | `CURRENT` | Names the active manifest |
 | `MANIFEST-NNNNNN` | Append-only version edits and recovery counters |
 | `NNNNNN.wal` | Owned by one mutable or immutable memtable until flush is durable |
@@ -181,8 +205,10 @@ so recovery does not silently reuse durable names.
 6. `CURRENT` identifies the manifest used for recovery.
 7. Level 0 files may overlap; files within each higher level must not overlap.
 8. SSTables and published versions are immutable.
-9. Corrupt checksums, invalid ordering, missing required files, and impossible
-   recovery counters fail open explicitly.
+9. Structurally incomplete final WAL records are ignored and incomplete final
+   manifest records are truncated according to their recovery rules.
+10. Corrupt checksums, invalid fragment or sequence ordering, missing required
+    files, and inconsistent recovery metadata fail open with typed errors.
 
 ## Module map
 

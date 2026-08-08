@@ -25,7 +25,10 @@ detect damaged fragments.
 
 MeteorDB creates a new WAL when it rotates a memtable. The manifest records the
 oldest required WAL and the active WAL. Recovery replays the required range in
-strict sequence order; a missing segment, gap, or corrupt record is an error.
+strict sequence order. A structurally short final header or payload, or an
+unfinished final fragment chain, is treated as a torn tail and ignored.
+Checksum damage, invalid fragment order, a missing required segment, or a
+sequence gap is an error.
 
 Synchronous durability is the default and synchronizes each successful append.
 Buffered durability can reduce foreground synchronization but risks losing
@@ -86,14 +89,18 @@ synchronizes the edit, and only then publishes the version to readers.
 
 `CURRENT` identifies the active manifest. On recovery, MeteorDB replays its
 complete edits, rejects invalid metadata, validates referenced files, and
-truncates a torn trailing manifest record to the last valid boundary.
+truncates a structurally incomplete trailing manifest record to the last
+complete boundary. A checksum mismatch or invalid fragment order is corruption,
+not a truncatable torn tail.
 
 ## Block caching
 
 Point reads use an in-process LRU block cache keyed by SSTable number, block
 offset, and block kind. The cache reserves 20% of its byte budget for Bloom and
 index metadata and 80% for data blocks. Independent budgets prevent a stream of
-large data blocks from evicting all navigation metadata.
+large data blocks from evicting all navigation metadata. `TableReader` checks
+the cache; after a miss it reads and validates the checksummed SSTable block,
+then admits the validated decoded bytes. SSTable files do not query the cache.
 
 `Engine::stats` reports cache capacity, usage, hits, misses, admissions, and
 evictions together with point reads, Bloom checks, useful negatives, and table
