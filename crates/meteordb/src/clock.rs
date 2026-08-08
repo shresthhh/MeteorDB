@@ -1,11 +1,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Supplies wall-clock Unix time for expiration decisions.
+/// Supplies wall-clock Unix time for future expiration decisions.
 ///
-/// The trait keeps time-dependent engine code deterministic in tests: production
-/// uses [`SystemClock`], while tests can provide a fixed implementation.
-/// Implementations must be thread-safe because database work may use the clock
-/// from foreground and background threads.
+/// This public abstraction is reserved so expiration handling can be integrated
+/// deterministically: production code can use [`SystemClock`], while tests can
+/// provide a fixed implementation. No current engine path consumes a clock or
+/// enforces TTL. Implementations are thread-safe so future foreground and
+/// background integration can share them.
 pub trait Clock: Send + Sync {
     /// Returns the current wall-clock time in milliseconds since the Unix epoch.
     ///

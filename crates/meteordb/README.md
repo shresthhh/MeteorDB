@@ -20,8 +20,8 @@ torn-tail cases, and returns errors for complete corruption or missing required
 files.
 
 The API and file formats are pre-alpha and may change without migration
-support. Range scans, compaction, version reclamation, and TTL enforcement are
-not implemented.
+support. See the root [roadmap](../../ROADMAP.md) for changing capability
+status and planned work.
 
 ## Code and validation
 

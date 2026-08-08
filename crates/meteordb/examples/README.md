@@ -13,4 +13,5 @@ developer's existing database. Keep output short and avoid timing,
 randomness, network access, or platform-specific assumptions unless those are
 the point of the example.
 
-See the [crate guide](../README.md) for current guarantees and limitations.
+See the [crate guide](../README.md) for current guarantees and the root
+[roadmap](../../../ROADMAP.md) for changing capability status.
