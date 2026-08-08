@@ -1,176 +1,126 @@
 # MeteorDB
 
-MeteorDB is an experimental embedded key/value storage engine written in Rust.
-It is being built to explore durable, ordered storage for AI-oriented workloads
-while keeping the core API useful as a general byte-key/byte-value engine.
+Embedded storage for latency-sensitive AI infrastructure.
 
-> **Implementation status:** MeteorDB is under active development and is not
-> ready for production data. The current engine stores committed versions in
-> memory and writes them to a WAL, but it does not recover them when reopened.
-> `Engine::open` currently starts with an empty memtable and creates or
-> truncates `000001.wal`.
+MeteorDB is an ordered byte-key/byte-value engine for applications that need
+durable local state with predictable point lookups. It is designed as a storage
+foundation for inference caches, feature data, and embedding metadata without
+requiring those workload-specific adapters in the core engine.
 
-## What works today
+> **Pre-alpha:** The file format and API may change without migration support.
+> Do not use MeteorDB as the only copy of production data.
 
-The current crate provides:
+## Why MeteorDB
 
-- `Engine` point reads, puts, deletes, atomic `WriteBatch` commits, snapshots,
-  explicit WAL synchronization, and idempotent close;
-- configurable `Options`, typed errors, and synchronous or buffered durability;
-- MVCC internal keys that order user keys and historical versions;
-- a checksummed, fragmented write-ahead log plus public WAL writer and replay
-  APIs; and
-- a serialized write path that publishes a complete batch to the in-memory
-  table only after its WAL append succeeds.
+AI infrastructure often needs more than an in-memory map but less than a
+remote database. MeteorDB keeps the storage engine in-process, orders arbitrary
+byte keys, makes batches atomic, and provides snapshot point reads. Its current
+focus is correctness across WAL recovery, memtable flush, immutable SSTables,
+and durable metadata.
 
-Atomic batches and snapshot-isolated point reads are supported. General
-transactions are not.
+## Current capabilities
 
-Only the database path, durability mode, and key/value/batch input limits
-currently affect the in-memory engine. SSTable sizing and block layout,
-Bloom-filter, block-cache, compression, and memtable-rotation configuration are
-public forward-compatible surfaces, but they are not operational until those
-storage subsystems land.
-
-## Prerequisites
-
-- Rust 1.88.0 with Cargo
-- A working native C toolchain whose linker is available as `cc`
-
-The repository's `rust-toolchain.toml` selects Rust 1.88.0 with `rustfmt` and
-`clippy`. On Ubuntu or Debian, install the native toolchain with:
-
-```bash
-sudo apt install build-essential
-```
-
-On macOS, install the Xcode command-line tools with `xcode-select --install`.
-
-## Build and test
-
-```bash
-git clone https://github.com/shresthhh/MeteorDB.git
-cd MeteorDB
-cargo build --workspace
-cargo test --workspace
-```
-
-Run the executable quickstart:
-
-```bash
-cargo run -p meteordb --example quickstart
-```
-
-It prints:
-
-```text
-current profile: database engineer
-```
+| Capability | Status |
+| --- | --- |
+| Checksummed write-ahead log | Implemented |
+| Atomic write batches | Implemented |
+| MVCC snapshot point reads | Implemented |
+| Memtable rotation and background flush | Implemented |
+| Immutable SSTables | Implemented |
+| Per-table Bloom filters | Implemented |
+| Durable manifest recovery | Implemented |
+| Level-aware point reads | Implemented |
+| Partitioned block cache | Implemented |
+| Read-path and cache statistics | Implemented |
+| Range and prefix scans | Roadmap |
+| Compaction and version reclamation | Roadmap |
+| TTL enforcement | Roadmap |
+| AI workload adapters | Roadmap |
+| Published benchmark results | Roadmap |
 
 ## Quickstart
 
-The complete runnable source is
-[`crates/meteordb/examples/quickstart.rs`](crates/meteordb/examples/quickstart.rs).
-Its central API flow is:
+MeteorDB requires Rust 1.88 and a native linker available as `cc`.
+
+```bash
+cargo build --workspace
+cargo test --workspace
+cargo run -p meteordb --example quickstart
+```
+
+The central API is synchronous and uses owned byte-compatible inputs:
 
 ```rust
 use meteordb::{Engine, Options, Result, WriteBatch};
 
-fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
-    let database = tempfile::tempdir()?;
-    run(database.path())?;
-    Ok(())
-}
-
-fn run(path: &std::path::Path) -> Result<()> {
+fn use_database(path: &std::path::Path) -> Result<()> {
     let engine = Engine::open(Options::new(path))?;
 
     let mut batch = WriteBatch::default();
     batch
-        .put("user:42", "Ada")
-        .put("profile:42", "systems researcher");
+        .put("feature:user:42", "enabled")
+        .put("profile:user:42", "database engineer");
     engine.write(batch)?;
 
     let snapshot = engine.snapshot()?;
-    engine.put("profile:42", "database engineer")?;
-
+    engine.put("profile:user:42", "systems engineer")?;
     assert_eq!(
-        snapshot.get("profile:42")?.as_deref(),
-        Some(b"systems researcher".as_slice())
+        snapshot.get("profile:user:42")?.as_deref(),
+        Some(b"database engineer".as_slice())
     );
-
-    let current = engine.get("profile:42")?.expect("profile should exist");
-    println!("current profile: {}", String::from_utf8_lossy(&current));
 
     drop(snapshot);
     engine.close()
 }
 ```
 
-`tempfile::tempdir()` creates a uniquely owned directory and removes it
-automatically. The snapshot is dropped and the engine is closed inside `run`,
-before the temporary-directory handle is dropped; errors also unwind `run` and
-drop its handles before automatic cleanup. The example never recursively
-deletes a shared predictable path.
+See the [complete runnable example](crates/meteordb/examples/quickstart.rs) for
+database-directory ownership and cleanup.
 
-## How a write becomes visible
+## Architecture
 
-MeteorDB first validates the whole batch. One mutex then gives concurrent
-writers a definite order and assigns the batch one sequence number. The engine
-encodes the batch as one logical WAL record; the default synchronous durability
-mode asks the operating system to sync that record before continuing.
+```mermaid
+flowchart LR
+    Client[Application] --> Engine[Engine]
+    Engine --> WAL[WAL segments]
+    Engine --> Mutable[Mutable memtable]
+    Mutable --> Immutable[Immutable memtables]
+    Immutable --> Flush[Background flush]
+    Flush --> SSTables[Level 0 SSTables]
+    Flush --> Manifest[Manifest and CURRENT]
+    Engine --> Cache[Partitioned block cache]
+    Cache <--> SSTables
+    Engine --> Manifest
+```
 
-Only after the WAL append succeeds does the engine add every operation to the
-MVCC memtable and publish the sequence to readers. A failed append therefore
-does not expose part of a batch in memory. Ordinary point reads use the latest
-published sequence. A snapshot keeps the sequence captured when it was created,
-so later updates do not change what that snapshot sees.
+Writes enter the WAL before becoming visible in the mutable memtable. Rotation
+moves a full memtable to a background flush queue; the resulting SSTable is
+published through the manifest before its WAL can be retired. Point reads
+search memory first and then the live SSTables recorded by the manifest.
 
-This is only the current in-memory write/read path. Flushing to sorted tables,
-reopening from durable state, and reclaiming old versions are not implemented
-yet.
+Read the [architecture reference](docs/architecture.md) for recovery,
+concurrency, and correctness details.
 
-## Feature status
+## Repository
 
-| Capability | Status |
+| Path | Purpose |
 | --- | --- |
-| Typed options, errors, clocks, and owned write batches | Implemented |
-| MVCC internal-key encoding and snapshot lifetime tracking | Implemented |
-| Atomic serialized batches in a WAL-backed in-memory engine | Implemented |
-| Checksummed and fragmented WAL writer/replay APIs | Implemented |
-| Point `get`, `put`, `delete`, snapshots, `sync`, and `close` | Implemented |
-| Engine recovery from existing WAL files | Planned |
-| Memtable rotation and flush | Planned |
-| SSTables and block cache | Planned |
-| Bloom filters | Planned |
-| Range and prefix scans | Planned |
-| Leveled compaction and safe version reclamation | Planned |
-| TTL enforcement | Planned |
-| AI workload adapters | Planned |
+| [`crates/meteordb/src`](crates/meteordb/src) | Storage-engine implementation |
+| [`crates/meteordb/tests`](crates/meteordb/tests) | Cross-component integration tests |
+| [`crates/meteordb/examples`](crates/meteordb/examples) | Runnable API examples |
+| [`docs`](docs) | Product and technical documentation |
 
-## AI workload direction
+## Documentation
 
-MeteorDB's roadmap includes typed adapters for inference caching, feature
-storage, and embedding metadata over the same ordered byte API. These are design
-goals, not completed features. Approximate-nearest-neighbor search is outside
-the current project scope.
-
-Future comparisons with RocksDB should run equivalent workloads with documented
-hardware, configuration, datasets, and reproducible commands. The repository
-does not currently publish benchmark results or performance claims.
-
-## Design documents
-
-- [MeteorDB design](docs/superpowers/specs/2026-07-17-meteordb-design.md)
-- [MeteorDB implementation plan](docs/superpowers/plans/2026-07-17-meteordb.md)
-
-These documents describe the intended full engine. Their roadmap sections
-should not be read as statements about the current implementation.
+- [Documentation map](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Storage-engine concepts](docs/storage-engine.md)
+- [Roadmap](ROADMAP.md)
 
 ## Contributing
 
-Keep public documentation aligned with exported code and clearly distinguish
-implemented behavior from roadmap work. Before submitting a change, run:
+MeteorDB welcomes focused changes with tests for correctness-sensitive
+behavior. Before submitting a change, run:
 
 ```bash
 cargo fmt --check
@@ -178,3 +128,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 git diff --check
 ```
+
+Keep public claims aligned with code on `main`, preserve durability ordering,
+and include corruption or recovery cases when changing persistent formats.
+
+## License
+
+MeteorDB is available under the [MIT License](LICENSE).
