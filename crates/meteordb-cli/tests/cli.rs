@@ -102,6 +102,54 @@ fn check_reports_the_total_validated_manifest_edit_count() {
 }
 
 #[test]
+fn check_max_files_ignores_numbered_wals_outside_the_required_manifest_range() {
+    let dir = tempfile::tempdir().unwrap();
+    create_database(dir.path());
+
+    let manifest = command(dir.path())
+        .args(["dump-manifest", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(manifest.status.success());
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+    let log_number = manifest["log_number"].as_u64().unwrap();
+    let active_log_number = manifest["active_log_number"].as_u64().unwrap();
+    assert_ne!(log_number, 0, "test requires current WAL range metadata");
+
+    let required_wals = fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension().is_some_and(|extension| extension == "wal")
+                && path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .and_then(|stem| stem.parse::<u64>().ok())
+                    .is_some_and(|number| number >= log_number && number <= active_log_number)
+        })
+        .collect::<Vec<_>>();
+    assert!(!required_wals.is_empty());
+
+    let obsolete_number = active_log_number.checked_add(1_000).unwrap();
+    fs::copy(
+        &required_wals[0],
+        dir.path().join(format!("{obsolete_number:06}.wal")),
+    )
+    .unwrap();
+
+    let live_sstables = usize::try_from(manifest["files_total"].as_u64().unwrap()).unwrap();
+    command(dir.path())
+        .args([
+            "check",
+            "--max-files",
+            &(live_sstables + required_wals.len()).to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("status: ok"));
+}
+
+#[test]
 fn check_surfaces_sstable_corruption_with_a_distinct_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let sstable = create_database(dir.path());

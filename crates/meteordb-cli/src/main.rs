@@ -373,6 +373,7 @@ fn inspect_required_wals(
     max_batch_bytes: usize,
     max_files: usize,
 ) -> Result<Vec<WalInspection>, CliError> {
+    let legacy_wal_metadata = manifest.log_number == 0 && manifest.active_log_number == 0;
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(path).map_err(|source| Error::Io {
         operation: "read database directory",
@@ -385,6 +386,11 @@ fn inspect_required_wals(
             source,
         })?;
         if let Some(number) = parse_numbered_name(&entry.file_name(), ".wal") {
+            if !legacy_wal_metadata
+                && (number < manifest.log_number || number > manifest.active_log_number)
+            {
+                continue;
+            }
             if paths.len() == max_files {
                 return Err(CliError::message(format!(
                     "required WAL count exceeds remaining max_files {max_files}"
@@ -395,7 +401,7 @@ fn inspect_required_wals(
     }
     paths.sort_by_key(|(number, _)| *number);
 
-    let selected = if manifest.log_number == 0 && manifest.active_log_number == 0 {
+    let selected = if legacy_wal_metadata {
         paths
     } else {
         for required in [manifest.log_number, manifest.active_log_number] {
@@ -408,18 +414,12 @@ fn inspect_required_wals(
             }
         }
         paths
-            .into_iter()
-            .filter(|(number, _)| {
-                *number >= manifest.log_number && *number <= manifest.active_log_number
-            })
-            .collect()
     };
 
     let mut inspections = Vec::with_capacity(selected.len());
     for (_, wal_path) in selected {
         inspections.push(inspect_wal(wal_path, max_batch_bytes)?);
     }
-    let legacy_wal_metadata = manifest.log_number == 0 && manifest.active_log_number == 0;
     let mut last_sequence = manifest.last_sequence;
     let mut expected_sequence = manifest
         .last_sequence

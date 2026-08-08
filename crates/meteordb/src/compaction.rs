@@ -223,7 +223,7 @@ pub(crate) fn run(
             context.read_stats.clone(),
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(context.options),
-                max_metadata_bytes: reader_metadata_limit(context.options),
+                max_metadata_bytes: usize::MAX,
             },
             context.fs.clone(),
         )?;
@@ -494,10 +494,6 @@ fn reader_block_limit(options: &Options) -> usize {
         .block_bytes
         .max(crate::DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES)
         .saturating_mul(4)
-}
-
-fn reader_metadata_limit(options: &Options) -> usize {
-    options.sstable_metadata_bytes_limit()
 }
 
 fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Error {

@@ -6,24 +6,35 @@
 - Documentation/report commit: the commit containing this updated report.
 - Remaining review fixes: the commit containing this updated report.
 - Final review fixes: the commit containing this updated report.
+- Trust-domain and obsolete-WAL fixes: the commit containing this updated report.
 
 ## Review findings fixed
 
 ### Final Task 15 review fixes
 
-- Engine SSTable readers no longer use `target_sstable_bytes` as a metadata
-  ceiling. `Options::sstable_metadata_bytes_limit` is the single engine and
-  compaction calculation, preventing the two read paths from drifting.
-- The trusted calculation covers the active memtable's one-batch overshoot,
-  `max_batch_bytes`, zero-byte internal-key expansion, engine-value headers,
-  next-fit data-block fragmentation (including tiny blocks), Bloom-filter
-  bits, index separators/varints/handles/restarts, properties keys, and all
-  metadata block trailers. Checked ceiling division and saturating arithmetic
-  keep extreme trusted configurations defined without wrapping.
-- The ceiling remains finite for finite configured limits. Footer metadata
-  handles are still summed and compared with it before a metadata payload is
-  allocated; the sparse crafted oversized-metadata regression continues to
-  prove early rejection.
+- Engine and compaction readers no longer derive a finite metadata ceiling from
+  sizing and input options. Retained MVCC history can make one indivisible
+  user-key version group arbitrarily larger than those targets, so no such
+  formula soundly bounds all valid writer output. The misleading
+  `Options::sstable_metadata_bytes_limit` calculation and both reader wrappers
+  were removed.
+- Normal engine readers use an unbounded metadata policy while preserving
+  footer range, ordering, overflow, checksum, and structural validation.
+  `Engine::open` and the README document that the database directory is trusted
+  local engine state.
+- The untrusted inspection CLI remains the bounded path:
+  `--max-metadata-bytes` is checked against combined footer handles before any
+  metadata payload allocation, and output retention remains caller-bounded.
+  The sparse crafted oversized-metadata regression still proves early
+  inspector rejection.
+- A regression preserves 512 post-snapshot versions of one key through
+  compaction. Its valid 15,211 metadata bytes exceeded the removed 7,620-byte
+  formula, while both snapshot and current reads now succeed.
+- `check --max-files` filters numbered WALs to the manifest-required inclusive
+  range before charging the caller's file budget. Legacy manifests without WAL
+  range metadata continue to include and charge all numbered WALs. An
+  obsolete-WAL regression proves current manifests are not rejected because
+  of out-of-range files.
 - `DurableFs::open_read` is again a compatibility adapter over the
   implementer's `read_file`, retaining those owned bytes in a seekable handle.
   The default `read_file` performs a direct same-call no-follow OS read, so the
@@ -161,12 +172,11 @@ After implementation, the manifest, SSTable, and CLI focused suites pass 26,
 metadata handles and a `u64::MAX` property-key length declaration without
 constructing corresponding payload buffers.
 
-The final regressions were also run red first. The tiny-block engine test
-failed with `metadata handle bytes 3808 exceed metadata allocation limit 192`.
-The compatibility filesystem test failed because no `MANIFEST-*` read reached
-its `read_file` override. After implementation, the affected compaction,
-recovery, manifest, WAL, SSTable, and read-path suites pass 14, 21, 26, 20, 18,
-and 16 tests respectively.
+The final trust-domain regressions were run red first. The retained-history
+test failed with `metadata handle bytes 15211 exceed metadata allocation limit
+7620`. The obsolete-WAL test failed with `required WAL count exceeds remaining
+max_files 1`. After implementation both focused regressions pass, and the
+crafted oversized-metadata inspector test remains green.
 
 ## Full GCC validation
 
@@ -208,3 +218,6 @@ git diff --check
 - WAL torn-tail handling intentionally remains identical to recovery:
   structurally incomplete final fragments are ignored, while checksum damage
   remains corruption.
+- Trusted engine opens may allocate metadata proportional to structurally valid
+  local SSTable metadata. This intentionally avoids rejecting valid writer
+  output; callers inspecting untrusted files must use the CLI's finite budgets.

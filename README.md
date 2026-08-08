@@ -150,6 +150,12 @@ yet.
 
 ## Inspection resource limits
 
+`Engine::open` assumes its database directory is trusted, local engine state.
+Engine readers therefore accept all structurally valid SSTable metadata that
+MeteorDB writers can produce; sizing targets are not security limits and cannot
+soundly cap retained MVCC history. Use the inspection CLI, not `Engine::open`,
+when examining untrusted database files.
+
 Inspection commands apply caller-trusted limits before retaining replay state
 or allocating SSTable metadata buffers:
 

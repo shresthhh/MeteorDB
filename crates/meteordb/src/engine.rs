@@ -154,6 +154,10 @@ impl Engine {
     }
 
     /// Opens or recovers an engine using the operating system's durable filesystem.
+    ///
+    /// The database directory is a trusted local engine directory. Use the
+    /// bounded `meteordb check` or `dump-sstable` commands to inspect untrusted
+    /// files without trusting their metadata allocation sizes.
     pub fn open(options: Options) -> Result<Self> {
         Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
     }
@@ -878,7 +882,7 @@ impl Engine {
                     self.inner.read_stats.clone(),
                     TableReaderOptions {
                         max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
-                        max_metadata_bytes: reader_metadata_limit(&self.inner.options),
+                        max_metadata_bytes: usize::MAX,
                     },
                     self.inner.fs.clone(),
                 )?;
@@ -920,7 +924,7 @@ impl Engine {
             self.inner.read_stats.clone(),
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
-                max_metadata_bytes: reader_metadata_limit(&self.inner.options),
+                max_metadata_bytes: usize::MAX,
             },
             self.inner.fs.clone(),
         )?;
@@ -1428,10 +1432,6 @@ fn reader_block_limit(options: &Options) -> usize {
         .saturating_add(options.max_value_bytes)
         .saturating_add(128);
     target_with_encoding.max(largest_entry)
-}
-
-fn reader_metadata_limit(options: &Options) -> usize {
-    options.sstable_metadata_bytes_limit()
 }
 
 fn ensure_open(state: &WriteState) -> Result<()> {

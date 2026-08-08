@@ -187,6 +187,37 @@ fn tiny_blocks_and_many_small_records_survive_flush_reads_and_compaction() {
 }
 
 #[test]
+fn engine_reads_compaction_output_with_history_beyond_configured_size_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.durability = meteordb::Durability::Buffered;
+    options.memtable_bytes = 1;
+    options.target_sstable_bytes = 1;
+    options.block_bytes = 1;
+    options.restart_interval = 1;
+    options.max_key_bytes = 16;
+    options.max_value_bytes = 16;
+    options.max_batch_bytes = 64;
+    let db = Engine::open(options).unwrap();
+
+    db.put(b"history", b"oldest").unwrap();
+    db.flush().unwrap();
+    let snapshot = db.snapshot().unwrap();
+
+    for generation in 0..512 {
+        db.put(b"history", format!("{generation:04}")).unwrap();
+        db.flush().unwrap();
+    }
+
+    assert!(db.compact().unwrap());
+    assert_eq!(
+        snapshot.get(b"history").unwrap().as_deref(),
+        Some(&b"oldest"[..])
+    );
+    assert_eq!(db.get(b"history").unwrap().as_deref(), Some(&b"0511"[..]));
+}
+
+#[test]
 fn old_input_files_live_until_a_scan_releases_its_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = Options::new(dir.path());
