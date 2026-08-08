@@ -304,12 +304,24 @@ impl FaultState {
         Ok(())
     }
 
-    fn track_file(&self, path: &Path) -> std::io::Result<()> {
-        let bytes = std::fs::read(path)?;
+    fn is_tracked(&self, path: &Path) -> bool {
+        self.crash_image.lock().unwrap().tracked.contains(path)
+    }
+
+    fn seed_durable_file(&self, path: &Path, bytes: Vec<u8>) {
+        let mut image = self.crash_image.lock().unwrap();
+        if image.tracked.insert(path.to_path_buf()) {
+            image.volatile.insert(path.to_path_buf(), bytes.clone());
+            image.synced.insert(path.to_path_buf(), bytes.clone());
+            image.durable.insert(path.to_path_buf(), bytes);
+        }
+    }
+
+    fn track_new_file(&self, path: &Path) {
         let mut image = self.crash_image.lock().unwrap();
         image.tracked.insert(path.to_path_buf());
-        image.volatile.insert(path.to_path_buf(), bytes);
-        Ok(())
+        image.volatile.insert(path.to_path_buf(), Vec::new());
+        image.synced.remove(path);
     }
 
     fn record_write(&self, path: &Path, bytes: &[u8]) {
@@ -454,6 +466,21 @@ impl FaultyFs {
         self.state.restore_durable_state()
     }
 
+    fn seed_existing_file(&self, path: &Path) -> std::io::Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_file() => {
+                if !self.state.is_tracked(path) {
+                    let bytes = self.inner.read_file(path)?;
+                    self.state.seed_durable_file(path, bytes);
+                }
+                Ok(true)
+            }
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn wrap(&self, path: &Path, file: Box<dyn DurableFile>) -> Box<dyn DurableFile> {
         Box::new(FaultyFile {
             inner: file,
@@ -488,31 +515,38 @@ impl DurableFile for FaultyFile {
 impl DurableFs for FaultyFs {
     fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
         let file = self.inner.create(path)?;
-        self.state.track_file(path)?;
+        self.state.track_new_file(path);
         Ok(self.wrap(path, file))
     }
 
     fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let existed = self.seed_existing_file(path)?;
         let file = self.inner.append(path)?;
-        self.state.track_file(path)?;
+        if !existed {
+            self.state.track_new_file(path);
+        }
         Ok(self.wrap(path, file))
     }
 
     fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.seed_existing_file(path)?;
         let file = self.inner.append_existing(path)?;
-        self.state.track_file(path)?;
         Ok(self.wrap(path, file))
     }
 
     fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        self.seed_existing_file(path)?;
         self.inner.open_read(path)
     }
 
     fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        self.inner.read_file(path)
+        let bytes = self.inner.read_file(path)?;
+        self.state.seed_durable_file(path, bytes.clone());
+        Ok(bytes)
     }
 
     fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        self.seed_existing_file(path)?;
         self.state.observe(FaultOperation::SyncFile, path)?;
         self.inner.sync_file(path)?;
         self.state.record_truncate(path)?;
@@ -521,6 +555,7 @@ impl DurableFs for FaultyFs {
     }
 
     fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
+        self.seed_existing_file(path)?;
         self.state.observe(FaultOperation::Truncate, path)?;
         self.inner.truncate_file(path, length)?;
         self.state.record_truncate(path)
@@ -534,6 +569,8 @@ impl DurableFs for FaultyFs {
     }
 
     fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.seed_existing_file(source)?;
+        self.seed_existing_file(destination)?;
         self.state
             .observe(FaultOperation::AtomicReplace, destination)?;
         self.inner.atomic_replace(source, destination)?;
@@ -542,6 +579,8 @@ impl DurableFs for FaultyFs {
     }
 
     fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.seed_existing_file(source)?;
+        self.seed_existing_file(destination)?;
         self.state
             .observe(FaultOperation::AtomicInstall, destination)?;
         self.inner.atomic_install(source, destination)?;
@@ -550,6 +589,7 @@ impl DurableFs for FaultyFs {
     }
 
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.seed_existing_file(path)?;
         self.state.observe(FaultOperation::Remove, path)?;
         self.inner.remove_file(path)?;
         self.state.record_remove(path);

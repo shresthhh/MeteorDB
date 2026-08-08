@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,6 +12,28 @@ fn options(path: &Path) -> Options {
     options.target_sstable_bytes = 128;
     options.block_bytes = 64;
     options
+}
+
+fn regular_file_image(path: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| entry.file_type().unwrap().is_file())
+        .map(|entry| {
+            (
+                entry.file_name().into_string().unwrap(),
+                std::fs::read(entry.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn seed_database(path: &Path) {
+    let mut configured = options(path);
+    configured.memtable_bytes = usize::MAX;
+    let db = Engine::open(configured).unwrap();
+    db.put(b"prior", b"durable").unwrap();
+    drop(db);
 }
 
 #[test]
@@ -87,6 +109,27 @@ fn explicit_crash_preserves_acknowledged_synchronous_writes() {
     assert_eq!(
         reopened.get(b"synced").unwrap().as_deref(),
         Some(&b"preserved"[..])
+    );
+}
+
+#[test]
+fn injected_crash_during_reopen_preserves_prior_files_and_loses_new_name() {
+    let dir = tempfile::tempdir().unwrap();
+    seed_database(dir.path());
+    let durable_image = regular_file_image(dir.path());
+    let mut configured = options(dir.path());
+    configured.memtable_bytes = usize::MAX;
+    let error = match Engine::open_with_fs(configured, Arc::new(FaultyFs::fail_at(1))) {
+        Ok(_) => panic!("selected reopen crash point unexpectedly succeeded"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("injected crash"));
+    assert_eq!(regular_file_image(dir.path()), durable_image);
+
+    let reopened = Engine::open(options(dir.path())).unwrap();
+    assert_eq!(
+        reopened.get(b"prior").unwrap().as_deref(),
+        Some(&b"durable"[..])
     );
 }
 

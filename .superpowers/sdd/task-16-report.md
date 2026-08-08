@@ -7,8 +7,11 @@ All six Task 16 review findings are addressed:
 1. `FaultyFs` now keeps separate volatile, file-synchronized, and durable
    images. A simulated crash restores only file contents covered by successful
    file syncs and names/removals covered by later successful directory syncs.
-   The crash matrix uses that oracle, and focused tests prove loss of buffered
-   writes and unsynchronized truncation/rename state while preserving a
+   The first observation of an existing regular file seeds its bytes and name
+   into all three images; new files remain volatile until directory sync and
+   their bytes until file sync. The crash matrix uses that oracle, and focused
+   tests prove loss of buffered writes, new names, and unsynchronized
+   truncation/rename state while preserving prior database files and a
    synchronously acknowledged write.
 2. Reader-version registration performs bounded cleanup whenever the weak
    registry reaches 64 entries. A 10,000-read regression inspects the private
@@ -64,10 +67,20 @@ cargo test -p meteordb --test engine_model -- --nocapture
 `FaultyFs` records a one-based sequence of write, file-sync, path-sync,
 atomic-install, atomic-replace, directory-sync, truncate, and remove
 operations. It separately tracks volatile bytes, file-synchronized bytes, and
-directory-synchronized durable names. The crash suite first records a complete
-workload, then reruns it from an empty directory with an injected crash
-immediately before every recorded operation. Each crash restores the durable
-image before the failed engine is discarded and reopened normally.
+directory-synchronized durable names. Existing regular files are seeded as
+durable when first read, opened, synchronized, truncated, renamed, installed,
+or removed; exclusive creates and absent append targets start only in the
+volatile image. Rename/install move volatile and synchronized state while
+leaving the prior durable directory image intact until directory sync.
+
+The crash suite first records a complete workload, then reruns it from an empty
+directory with an injected crash immediately before every recorded operation.
+Each crash restores the durable image before the failed engine is discarded and
+reopened normally. A separate deterministic regression creates and closes a
+database, reopens it with a crash injected before the first directory sync, and
+compares every regular file byte-for-byte with the pre-reopen image. It proves
+the previously durable database survives, the newly created unsynchronized WAL
+name disappears, and a normal reopen still reads the prior acknowledged key.
 
 Assertions require:
 
@@ -179,8 +192,9 @@ cargo test --workspace
 git diff --check
 ```
 
-All five gates passed after the review fixes, including the updated crash,
-model, corruption, and reader-lease regressions.
+All five gates passed after the crash-oracle baseline fix, including the
+reopen-existing-database regression and the complete crash, model, corruption,
+and reader-lease suites.
 
 ## Concerns
 
