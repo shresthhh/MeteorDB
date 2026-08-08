@@ -6,6 +6,7 @@ Implemented in:
 
 - `11498f0` `feat: add feature and embedding adapters`
 - `766ec96` `fix: bound workload adapter memory`
+- `8972d13` `fix: bound embedding batch construction`
 
 The commits have no co-author trailers and were not pushed.
 
@@ -33,6 +34,11 @@ The commits have no co-author trailers and were not pushed.
   requested timestamp.
 - Added checked projected metadata accounting before mutation, including
   subtracting a replaced entry.
+- Changed embedding batch construction to read the engine's configured batch
+  limits, reject the first encoded operation that would exceed them, and move
+  accepted encoded buffers into the write batch without another copy.
+- Centralized the encoded batch operation-count ceiling and enforced it during
+  both incremental construction and engine validation.
 
 ## Beginner walkthrough
 
@@ -117,8 +123,13 @@ type. Raw construction verifies:
 
 Embedding `put_many` validates and encodes every item into one `WriteBatch`
 before calling the engine, so the batch is committed at one sequence or not
-written. `get_many` uses one snapshot and preserves input order and duplicates.
-Point puts support TTL, while batch puts are intentionally non-expiring.
+written. Before retaining each encoded key/value pair, it uses a crate-private
+engine limit accessor and the same key-plus-value payload accounting as
+`WriteBatch` and engine validation. It stops consuming the iterator when the
+next operation would exceed configured payload bytes or the encoded operation
+count ceiling. Accepted buffers are moved into the batch rather than copied.
+`get_many` uses one snapshot and preserves input order and duplicates. Point
+puts support TTL, while batch puts are intentionally non-expiring.
 
 Restart tests close and reopen the engine, then compare the complete embedding,
 including scalar type, little-endian bytes, model identity, and metadata.
@@ -141,6 +152,21 @@ embedding_metadata_replacement_checks_projected_total_before_mutation
 
 Both failed because the inserts incorrectly succeeded. After the checked
 projected-size validation was implemented, all 23 workload tests passed.
+
+For the remaining batch-construction issue, the lazy replacement regression was
+added first. With the configured limit set to exactly one encoded operation,
+the initial GCC run failed because `put_many` consumed all 10,000 generated
+entries instead of stopping after the second:
+
+```text
+assertion `left == right` failed
+  left: 10000
+ right: 2
+```
+
+After the fix, the same regression consumes exactly two entries, returns the
+limit error before retaining the second operation, and confirms the previously
+stored value was not replaced.
 
 GCC environment:
 
@@ -208,6 +234,31 @@ git diff --check
 exit 0
 ```
 
+Fresh GCC gates for `8972d13`:
+
+```text
+cargo fmt --all --check
+exit 0
+
+cargo test -p meteordb --test workloads
+23 passed; 0 failed
+
+cargo test --workspace
+209 passed; 0 failed
+
+cargo test --workspace --doc
+0 passed; 0 failed
+
+cargo clippy --workspace --all-targets -- -D warnings
+exit 0
+
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+exit 0
+
+git diff --check
+exit 0
+```
+
 ## Trade-offs and concerns
 
 - `latest` and `as_of` retain only one candidate, but the engine exposes only
@@ -228,6 +279,8 @@ exit 0
 - Individual feature and embedding writes support TTL. Atomic embedding batch
   writes intentionally omit relative TTL because the public engine does not
   expose its clock for one shared deadline calculation.
+- The engine's encoded write-batch format caps operation count at `u32::MAX`;
+  `put_many` now checks that ceiling incrementally as well as payload bytes.
 - Snapshot sequence consistency does not freeze wall-clock TTL evaluation,
   matching the engine's established snapshot contract.
 - This task implements storage and retrieval only. It does not perform exact
