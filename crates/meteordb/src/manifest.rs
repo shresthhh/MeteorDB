@@ -507,11 +507,18 @@ impl VersionSet {
                     directory.display()
                 )));
             }
+            validate_interrupted_bootstrap(
+                &directory,
+                manifest_number,
+                &manifest_path,
+                fs.as_ref(),
+            )?;
             remove_temporary_if_present(&current_temp, fs.as_ref())?;
             replace_current(&directory, &manifest_name, fs.as_ref())?;
             drop(lock);
             return Self::recover_with_fs(directory, fs);
         }
+
         remove_temporary_if_present(&manifest_temp, fs.as_ref())?;
         remove_temporary_if_present(&current_temp, fs.as_ref())?;
 
@@ -739,6 +746,54 @@ impl VersionSet {
     pub fn manifest_number(&self) -> u64 {
         self.manifest_number
     }
+}
+
+fn validate_interrupted_bootstrap(
+    directory: &Path,
+    manifest_number: u64,
+    manifest_path: &Path,
+    fs: &dyn DurableFs,
+) -> Result<()> {
+    let replay = replay_manifest(manifest_path, fs)?;
+    if replay.valid_bytes != replay.file_length {
+        return Err(manifest_corruption(format!(
+            "interrupted bootstrap manifest has a torn tail at byte {} of {}",
+            replay.valid_bytes, replay.file_length
+        )));
+    }
+    if replay.edits.is_empty() {
+        return Err(manifest_corruption(
+            "manifest contains no complete initial edit",
+        ));
+    }
+
+    let mut version = Version::empty();
+    let mut next_file_number = 0;
+    let mut last_sequence = 0;
+    let mut log_number = 0;
+    let mut active_log_number = 0;
+    let mut wal_sequence = 0;
+    let mut used_file_numbers = HashSet::from([manifest_number]);
+    for edit in replay.edits {
+        update_counters(
+            &edit,
+            &mut next_file_number,
+            &mut last_sequence,
+            &mut log_number,
+            &mut active_log_number,
+            &mut wal_sequence,
+            true,
+        )?;
+        validate_file_numbers(&edit, next_file_number, &used_file_numbers, true)?;
+        version = version.apply(&edit).map_err(recovery_edit_error)?;
+        used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
+    }
+    if next_file_number == 0 {
+        return Err(manifest_corruption(
+            "manifest never records the next file number",
+        ));
+    }
+    validate_referenced_files(directory, &version, fs)
 }
 
 struct DatabaseLock {

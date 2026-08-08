@@ -1291,6 +1291,12 @@ fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Res
 }
 
 fn register_reader_version(state: &mut WriteState, version: &Arc<crate::Version>) -> Arc<()> {
+    const READER_LEASE_PRUNE_INTERVAL: usize = 64;
+    if state.reader_versions.len() >= READER_LEASE_PRUNE_INTERVAL {
+        state
+            .reader_versions
+            .retain(|reader| reader.lease.strong_count() > 0 && reader.version.strong_count() > 0);
+    }
     let lease = Arc::new(());
     state.reader_versions.push(ReaderVersion {
         version: Arc::downgrade(version),
@@ -1625,6 +1631,27 @@ mod scan_setup_tests {
 
         assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
         assert_eq!(owned_entry_clone_count(), 0);
+    }
+
+    #[test]
+    fn completed_point_reads_do_not_accumulate_dead_reader_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = Options::new(dir.path());
+        options.memtable_bytes = 64;
+        let db = Engine::open(options).unwrap();
+        db.put(b"key", vec![b'v'; 128]).unwrap();
+        db.flush().unwrap();
+
+        for _ in 0..10_000 {
+            assert!(db.get(b"key").unwrap().is_some());
+        }
+
+        let state = db.lock_state();
+        assert!(
+            state.reader_versions.len() <= 64,
+            "dead reader lease registry grew to {} entries",
+            state.reader_versions.len()
+        );
     }
 
     #[derive(Default)]
