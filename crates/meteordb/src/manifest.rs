@@ -18,7 +18,7 @@ const FIRST: u8 = 2;
 const MIDDLE: u8 = 3;
 const LAST: u8 = 4;
 const CHECKSUM_MASK_DELTA: u32 = 0xa282_ead8;
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2;
 const MAX_EDIT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Owns the append-only manifest and the currently published immutable version.
@@ -37,6 +37,9 @@ pub struct VersionSet {
     used_file_numbers: HashSet<u64>,
     next_file_number: u64,
     last_sequence: SequenceNumber,
+    log_number: u64,
+    active_log_number: u64,
+    wal_sequence: SequenceNumber,
     manifest_usable: bool,
 }
 
@@ -100,6 +103,9 @@ impl VersionSet {
             used_file_numbers: HashSet::from([manifest_number]),
             next_file_number: 2,
             last_sequence: 0,
+            log_number: 0,
+            active_log_number: 0,
+            wal_sequence: 0,
             manifest_usable: true,
         })
     }
@@ -130,9 +136,20 @@ impl VersionSet {
         let mut version = Version::empty();
         let mut next_file_number = 0;
         let mut last_sequence = 0;
+        let mut log_number = 0;
+        let mut active_log_number = 0;
+        let mut wal_sequence = 0;
         let mut used_file_numbers = HashSet::from([manifest_number]);
         for edit in replay.edits {
-            update_counters(&edit, &mut next_file_number, &mut last_sequence, true)?;
+            update_counters(
+                &edit,
+                &mut next_file_number,
+                &mut last_sequence,
+                &mut log_number,
+                &mut active_log_number,
+                &mut wal_sequence,
+                true,
+            )?;
             validate_file_numbers(&edit, next_file_number, &used_file_numbers, true)?;
             let candidate = version.apply(&edit).map_err(recovery_edit_error)?;
             used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
@@ -171,6 +188,9 @@ impl VersionSet {
             used_file_numbers,
             next_file_number,
             last_sequence,
+            log_number,
+            active_log_number,
+            wal_sequence,
             manifest_usable: true,
         })
     }
@@ -184,7 +204,18 @@ impl VersionSet {
         }
         let mut next_file_number = self.next_file_number;
         let mut last_sequence = self.last_sequence;
-        update_counters(&edit, &mut next_file_number, &mut last_sequence, false)?;
+        let mut log_number = self.log_number;
+        let mut active_log_number = self.active_log_number;
+        let mut wal_sequence = self.wal_sequence;
+        update_counters(
+            &edit,
+            &mut next_file_number,
+            &mut last_sequence,
+            &mut log_number,
+            &mut active_log_number,
+            &mut wal_sequence,
+            false,
+        )?;
         validate_file_numbers(&edit, next_file_number, &self.used_file_numbers, false)?;
         let candidate = self.current.apply(&edit)?;
         let encoded = encode_edit(&edit)?;
@@ -210,6 +241,9 @@ impl VersionSet {
             .extend(edit.added_files.iter().map(|(_, file)| file.number()));
         self.next_file_number = next_file_number;
         self.last_sequence = last_sequence;
+        self.log_number = log_number;
+        self.active_log_number = active_log_number;
+        self.wal_sequence = wal_sequence;
         Ok(())
     }
 
@@ -226,6 +260,21 @@ impl VersionSet {
     /// Returns the largest durable sequence recorded by the manifest.
     pub fn last_sequence(&self) -> SequenceNumber {
         self.last_sequence
+    }
+
+    /// Returns the oldest WAL segment required to recover unflushed data.
+    pub fn log_number(&self) -> u64 {
+        self.log_number
+    }
+
+    /// Returns the WAL segment that was active at the last durable metadata edit.
+    pub fn active_log_number(&self) -> u64 {
+        self.active_log_number
+    }
+
+    /// Returns the greatest sequence known durable in the required WAL set.
+    pub fn wal_sequence(&self) -> SequenceNumber {
+        self.wal_sequence
     }
 
     /// Returns the active manifest's file number.
@@ -258,6 +307,9 @@ fn initial_edit() -> VersionEdit {
     let mut edit = VersionEdit::new();
     edit.set_next_file_number(2);
     edit.set_last_sequence(0);
+    edit.set_log_number(0);
+    edit.set_active_log_number(0);
+    edit.set_wal_sequence(0);
     edit
 }
 
@@ -265,6 +317,9 @@ fn update_counters(
     edit: &VersionEdit,
     next_file_number: &mut u64,
     last_sequence: &mut SequenceNumber,
+    log_number: &mut u64,
+    active_log_number: &mut u64,
+    wal_sequence: &mut SequenceNumber,
     recovery: bool,
 ) -> Result<()> {
     if let Some(next) = edit.next_file_number {
@@ -296,6 +351,63 @@ fn update_counters(
             ));
         }
         *last_sequence = sequence;
+    }
+    if let Some(number) = edit.log_number {
+        if number < *log_number {
+            return Err(counter_error(
+                recovery,
+                format!("log number moved backward from {} to {number}", *log_number),
+            ));
+        }
+        *log_number = number;
+    }
+    if let Some(number) = edit.active_log_number {
+        if number < *active_log_number {
+            return Err(counter_error(
+                recovery,
+                format!(
+                    "active log number moved backward from {} to {number}",
+                    *active_log_number
+                ),
+            ));
+        }
+        *active_log_number = number;
+    }
+    if let Some(sequence) = edit.wal_sequence {
+        if sequence < *wal_sequence {
+            return Err(counter_error(
+                recovery,
+                format!(
+                    "WAL sequence moved backward from {} to {sequence}",
+                    *wal_sequence
+                ),
+            ));
+        }
+        *wal_sequence = sequence;
+    }
+    if (*log_number == 0) != (*active_log_number == 0) {
+        return Err(counter_error(
+            recovery,
+            "oldest and active log numbers must either both be zero or both be nonzero".into(),
+        ));
+    }
+    if *log_number > *active_log_number {
+        return Err(counter_error(
+            recovery,
+            format!(
+                "oldest log number {} exceeds active log number {}",
+                *log_number, *active_log_number
+            ),
+        ));
+    }
+    if *active_log_number >= *next_file_number && *active_log_number != 0 {
+        return Err(counter_error(
+            recovery,
+            format!(
+                "active log number {} is not below next file number {}",
+                *active_log_number, *next_file_number
+            ),
+        ));
     }
     Ok(())
 }
@@ -607,6 +719,9 @@ fn encode_edit(edit: &VersionEdit) -> Result<Vec<u8>> {
     encoded.push(FORMAT_VERSION);
     put_optional_u64(&mut encoded, edit.next_file_number);
     put_optional_u64(&mut encoded, edit.last_sequence);
+    put_optional_u64(&mut encoded, edit.log_number);
+    put_optional_u64(&mut encoded, edit.active_log_number);
+    put_optional_u64(&mut encoded, edit.wal_sequence);
     put_count(&mut encoded, edit.deleted_files.len(), "deleted file count")?;
     for &(level, number) in &edit.deleted_files {
         put_level(&mut encoded, level)?;
@@ -636,7 +751,7 @@ fn decode_edit(encoded: &[u8]) -> Result<VersionEdit> {
     }
     let mut cursor = Cursor::new(encoded);
     let version = cursor.u8("format version")?;
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         return Err(Error::UnsupportedFormat {
             kind: "manifest",
             version: u32::from(version),
@@ -644,10 +759,22 @@ fn decode_edit(encoded: &[u8]) -> Result<VersionEdit> {
     }
     let next_file_number = cursor.optional_u64("next file number")?;
     let last_sequence = cursor.optional_u64("last sequence")?;
+    let (log_number, active_log_number, wal_sequence) = if version >= 2 {
+        (
+            cursor.optional_u64("oldest log number")?,
+            cursor.optional_u64("active log number")?,
+            cursor.optional_u64("WAL sequence")?,
+        )
+    } else {
+        (None, None, None)
+    };
     let deleted_count = cursor.count("deleted file count")?;
     let mut edit = VersionEdit::new();
     edit.next_file_number = next_file_number;
     edit.last_sequence = last_sequence;
+    edit.log_number = log_number;
+    edit.active_log_number = active_log_number;
+    edit.wal_sequence = wal_sequence;
     for _ in 0..deleted_count {
         let level = cursor.level()?;
         let number = cursor.u64("deleted file number")?;
@@ -798,11 +925,17 @@ fn parse_current(bytes: &[u8]) -> Result<String> {
 fn parse_manifest_number(name: &str) -> Result<u64> {
     let digits = name
         .strip_prefix("MANIFEST-")
-        .filter(|digits| digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_digit()))
+        .filter(|digits| digits.len() >= 6 && digits.bytes().all(|byte| byte.is_ascii_digit()))
         .ok_or_else(|| manifest_corruption("CURRENT contains an invalid manifest name"))?;
-    digits
+    let number: u64 = digits
         .parse()
-        .map_err(|_| manifest_corruption("manifest number does not fit u64"))
+        .map_err(|_| manifest_corruption("manifest number does not fit u64"))?;
+    if number == 0 || digits != format!("{number:06}") {
+        return Err(manifest_corruption(
+            "CURRENT contains a noncanonical manifest name",
+        ));
+    }
+    Ok(number)
 }
 
 fn manifest_name(number: u64) -> String {
@@ -839,5 +972,37 @@ fn manifest_corruption(detail: impl Into<String>) -> Error {
     Error::Corruption {
         context: "manifest",
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::{manifest_name, parse_manifest_number};
+
+    #[test]
+    fn canonical_manifest_names_cross_the_six_digit_boundary() {
+        assert_eq!(manifest_name(999_999), "MANIFEST-999999");
+        assert_eq!(manifest_name(1_000_000), "MANIFEST-1000000");
+        assert_eq!(
+            parse_manifest_number("MANIFEST-1000000").unwrap(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn manifest_parser_rejects_noncanonical_and_overflowing_names() {
+        for name in [
+            "MANIFEST-",
+            "MANIFEST-0",
+            "MANIFEST-000000",
+            "MANIFEST-0000001",
+            "MANIFEST-+000001",
+            "MANIFEST--000001",
+            "MANIFEST-000001.bak",
+            "MANIFEST-18446744073709551616",
+            "OTHER-000001",
+        ] {
+            assert!(parse_manifest_number(name).is_err(), "{name}");
+        }
     }
 }

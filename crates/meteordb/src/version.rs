@@ -160,15 +160,18 @@ fn validate_non_overlapping(level: usize, files: &[FileMeta]) -> Result<()> {
 
 /// A durable, atomic change to the live SSTable set and recovery counters.
 ///
-/// Deletions and additions are applied together. The optional counters are
-/// monotonic: recovery and normal application reject edits that move either
-/// the next unused file number or last committed sequence backward.
+/// Deletions and additions are applied together. Persistent allocation,
+/// sequence, and WAL-ownership counters are monotonic so recovery cannot
+/// silently reuse files or release required log segments.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VersionEdit {
     pub(crate) added_files: Vec<(usize, FileMeta)>,
     pub(crate) deleted_files: Vec<(usize, u64)>,
     pub(crate) next_file_number: Option<u64>,
     pub(crate) last_sequence: Option<SequenceNumber>,
+    pub(crate) log_number: Option<u64>,
+    pub(crate) active_log_number: Option<u64>,
+    pub(crate) wal_sequence: Option<SequenceNumber>,
 }
 
 impl VersionEdit {
@@ -198,6 +201,24 @@ impl VersionEdit {
     /// Records the greatest sequence known durable in lower storage layers.
     pub fn set_last_sequence(&mut self, sequence: SequenceNumber) -> &mut Self {
         self.last_sequence = Some(sequence);
+        self
+    }
+
+    /// Records the oldest WAL segment still required for recovery.
+    pub fn set_log_number(&mut self, number: u64) -> &mut Self {
+        self.log_number = Some(number);
+        self
+    }
+
+    /// Records the WAL segment currently accepting writes.
+    pub fn set_active_log_number(&mut self, number: u64) -> &mut Self {
+        self.active_log_number = Some(number);
+        self
+    }
+
+    /// Records the greatest sequence known to have reached a required WAL.
+    pub fn set_wal_sequence(&mut self, sequence: SequenceNumber) -> &mut Self {
+        self.wal_sequence = Some(sequence);
         self
     }
 }

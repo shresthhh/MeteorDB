@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-use meteordb::{Durability, DurableFile, DurableFs, Engine, Error, Options, OsDurableFs};
+use meteordb::{
+    Durability, DurableFile, DurableFs, Engine, Error, Options, OsDurableFs, WalWriter, WriteBatch,
+};
 
 fn options(path: &Path) -> Options {
     let mut options = Options::new(path);
@@ -44,6 +46,108 @@ fn buffered_writes_survive_restart_after_explicit_sync() {
         reopened.get(b"key").unwrap().as_deref(),
         Some(&b"value"[..])
     );
+}
+
+#[test]
+fn explicit_sync_synchronizes_every_owned_wal_after_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let fs = Arc::new(BlockingTrackingFs::new(gate.clone(), None));
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = 1;
+    configured.max_immutable_memtables = 4;
+    let db = Engine::open_with_fs(configured, fs.clone()).unwrap();
+    fs.clear();
+
+    db.put(b"first", b"value").unwrap();
+    gate.wait_until_blocked();
+    db.put(b"second", b"value").unwrap();
+    let required = database_files(dir.path(), ".wal");
+    db.sync().unwrap();
+    let events = fs.events();
+    gate.release();
+    drop(db);
+
+    for wal in required {
+        let wal = file_name(&wal);
+        assert!(
+            events.iter().any(|event| event == &format!("sync {wal}")),
+            "{wal} was not synchronized: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn explicit_sync_propagates_an_immutable_wal_sync_failure_terminally() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let fs = Arc::new(BlockingTrackingFs::new(gate.clone(), Some("000002.wal")));
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = 1;
+    let db = Engine::open_with_fs(configured, fs).unwrap();
+
+    db.put(b"first", b"value").unwrap();
+    gate.wait_until_blocked();
+    let first = db.sync().unwrap_err().to_string();
+    let later = db.put(b"later", b"value").unwrap_err().to_string();
+    gate.release();
+    drop(db);
+
+    assert!(first.contains("sync WAL"));
+    assert!(first.contains("injected WAL sync failure"));
+    assert_eq!(later, first);
+}
+
+#[test]
+fn successful_close_synchronizes_every_owned_wal_after_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let fs = Arc::new(BlockingTrackingFs::new(gate.clone(), None));
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = 1;
+    configured.max_immutable_memtables = 4;
+    let db = Engine::open_with_fs(configured, fs.clone()).unwrap();
+    fs.clear();
+
+    db.put(b"first", b"value").unwrap();
+    gate.wait_until_blocked();
+    db.put(b"second", b"value").unwrap();
+    let required = database_files(dir.path(), ".wal");
+    db.close().unwrap();
+    let events = fs.events();
+    gate.release();
+    drop(db);
+
+    for wal in required {
+        let wal = file_name(&wal);
+        assert!(
+            events.iter().any(|event| event == &format!("sync {wal}")),
+            "{wal} was not synchronized: {events:?}"
+        );
+    }
+}
+
+#[test]
+fn close_propagates_an_immutable_wal_sync_failure_terminally() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let fs = Arc::new(BlockingTrackingFs::new(gate.clone(), Some("000002.wal")));
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = 1;
+    let db = Engine::open_with_fs(configured, fs).unwrap();
+
+    db.put(b"first", b"value").unwrap();
+    gate.wait_until_blocked();
+    let error = db.close().unwrap_err().to_string();
+    gate.release();
+    drop(db);
+
+    assert!(error.contains("sync WAL"));
+    assert!(error.contains("injected WAL sync failure"));
 }
 
 #[test]
@@ -251,6 +355,82 @@ fn recovery_never_appends_after_a_torn_wal_tail() {
 }
 
 #[test]
+fn recovery_rejects_a_missing_sole_required_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let configured = options(dir.path());
+    let db = Engine::open(configured.clone()).unwrap();
+    db.put(b"key", b"value").unwrap();
+    db.close().unwrap();
+    drop(db);
+    let wal = database_files(dir.path(), ".wal").pop().unwrap();
+    std::fs::remove_file(wal).unwrap();
+
+    assert!(matches!(
+        Engine::open(configured),
+        Err(Error::Corruption {
+            context: "WAL recovery",
+            detail,
+        }) if detail.contains("missing required WAL")
+    ));
+}
+
+#[test]
+fn recovery_rejects_a_missing_middle_required_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(SyncGate::default());
+    let fs = Arc::new(BlockingTrackingFs::new(gate.clone(), None));
+    let mut configured = options(dir.path());
+    configured.memtable_bytes = 1;
+    configured.max_immutable_memtables = 4;
+    let db = Engine::open_with_fs(configured.clone(), fs).unwrap();
+
+    db.put(b"first", b"value").unwrap();
+    gate.wait_until_blocked();
+    db.put(b"second", b"value").unwrap();
+    db.put(b"third", b"value").unwrap();
+    db.close().unwrap();
+    gate.release();
+    drop(db);
+
+    let mut wals = database_files(dir.path(), ".wal");
+    wals.sort();
+    assert!(wals.len() >= 3, "expected at least three required WALs");
+    std::fs::remove_file(&wals[wals.len() - 2]).unwrap();
+    assert!(matches!(
+        Engine::open(configured),
+        Err(Error::Corruption {
+            context: "WAL recovery",
+            detail,
+        }) if detail.contains("sequence")
+    ));
+}
+
+#[test]
+fn recovery_rejects_a_sequence_gap_inside_one_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let configured = options(dir.path());
+    drop(Engine::open(configured.clone()).unwrap());
+    let wal = dir.path().join("000002.wal");
+    std::fs::remove_file(&wal).unwrap();
+    let mut writer = WalWriter::create(&wal, configured.max_batch_bytes).unwrap();
+    let mut first = WriteBatch::default();
+    first.put(b"first", b"value");
+    writer.append(1, &first, Durability::Sync).unwrap();
+    let mut third = WriteBatch::default();
+    third.put(b"third", b"value");
+    writer.append(3, &third, Durability::Sync).unwrap();
+    drop(writer);
+
+    assert!(matches!(
+        Engine::open(configured),
+        Err(Error::Corruption {
+            context: "WAL recovery",
+            detail,
+        }) if detail.contains("expected sequence 2")
+    ));
+}
+
+#[test]
 fn a_committed_write_stays_successful_when_successor_wal_creation_fails() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FailSecondWalCreateFs {
@@ -283,6 +463,118 @@ fn database_files(path: &Path, suffix: &str) -> Vec<PathBuf> {
 struct TrackingFs {
     inner: OsDurableFs,
     events: Arc<Mutex<Vec<String>>>,
+}
+
+struct BlockingTrackingFs {
+    gate: Arc<SyncGate>,
+    fail_wal_sync: Option<&'static str>,
+    inner: OsDurableFs,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl BlockingTrackingFs {
+    fn new(gate: Arc<SyncGate>, fail_wal_sync: Option<&'static str>) -> Self {
+        Self {
+            gate,
+            fail_wal_sync,
+            inner: OsDurableFs,
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn clear(&self) {
+        self.events.lock().unwrap().clear();
+    }
+
+    fn events(&self) -> Vec<String> {
+        self.events.lock().unwrap().clone()
+    }
+
+    fn tracked(&self, path: &Path, block_sync: bool) -> std::io::Result<Box<dyn DurableFile>> {
+        Ok(Box::new(BlockingTrackingFile {
+            inner: self.inner.create(path)?,
+            name: file_name(path),
+            block_sync,
+            gate: self.gate.clone(),
+            events: self.events.clone(),
+        }))
+    }
+}
+
+struct BlockingTrackingFile {
+    inner: Box<dyn DurableFile>,
+    name: String,
+    block_sync: bool,
+    gate: Arc<SyncGate>,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+impl DurableFile for BlockingTrackingFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(bytes)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("sync {}", self.name));
+        if self.block_sync {
+            self.gate.block();
+        }
+        self.inner.sync_all()
+    }
+}
+
+impl DurableFs for BlockingTrackingFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.tracked(path, file_name(path).ends_with(".sst.tmp"))
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        Ok(Box::new(BlockingTrackingFile {
+            inner: self.inner.append(path)?,
+            name: file_name(path),
+            block_sync: false,
+            gate: self.gate.clone(),
+            events: self.events.clone(),
+        }))
+    }
+
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        Ok(Box::new(BlockingTrackingFile {
+            inner: self.inner.append_existing(path)?,
+            name: file_name(path),
+            block_sync: false,
+            gate: self.gate.clone(),
+            events: self.events.clone(),
+        }))
+    }
+
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        let name = file_name(path);
+        self.events.lock().unwrap().push(format!("sync {name}"));
+        if self.fail_wal_sync == Some(name.as_str()) {
+            return Err(std::io::Error::other("injected WAL sync failure"));
+        }
+        self.inner.sync_file(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_install(source, destination)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
 }
 
 impl TrackingFs {

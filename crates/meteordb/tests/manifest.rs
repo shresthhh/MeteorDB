@@ -57,6 +57,31 @@ fn edits_publish_copy_on_write_versions_and_l0_may_overlap() {
 }
 
 #[test]
+fn wal_recovery_counters_round_trip_and_cannot_move_backward() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut edit = VersionEdit::new();
+    edit.set_next_file_number(8)
+        .set_log_number(2)
+        .set_active_log_number(7)
+        .set_wal_sequence(19);
+    versions.apply(edit).unwrap();
+    drop(versions);
+
+    let mut recovered = VersionSet::recover(dir.path()).unwrap();
+    assert_eq!(recovered.log_number(), 2);
+    assert_eq!(recovered.active_log_number(), 7);
+    assert_eq!(recovered.wal_sequence(), 19);
+
+    let mut regression = VersionEdit::new();
+    regression.set_log_number(1);
+    assert!(matches!(
+        recovered.apply(regression),
+        Err(Error::InvalidArgument(message)) if message.contains("log number moved backward")
+    ));
+}
+
+#[test]
 fn levels_one_and_above_reject_overlapping_user_key_ranges() {
     let dir = tempfile::tempdir().unwrap();
     create_sstable(dir.path(), 2);

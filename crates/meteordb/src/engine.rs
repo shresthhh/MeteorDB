@@ -122,34 +122,76 @@ impl Engine {
         };
         remove_unpublished_sstables(&options.path, &versions, fs.as_ref())?;
 
-        let wal_paths = wal_paths(&options.path)?;
+        let all_wal_paths = wal_paths(&options.path)?;
+        let legacy_wal_metadata = versions.log_number() == 0 && versions.active_log_number() == 0;
+        let (required_log_number, active_log_number) = if legacy_wal_metadata {
+            (
+                all_wal_paths.first().map(|(number, _)| *number),
+                all_wal_paths.last().map(|(number, _)| *number),
+            )
+        } else {
+            (
+                Some(versions.log_number()),
+                Some(versions.active_log_number()),
+            )
+        };
+        if let (Some(oldest), Some(active)) = (required_log_number, active_log_number) {
+            for required in [oldest, active] {
+                if !all_wal_paths.iter().any(|(number, _)| *number == required) {
+                    return Err(wal_corruption(format!(
+                        "missing required WAL {}",
+                        wal_name(required)
+                    )));
+                }
+            }
+        }
+        let wal_paths: Vec<_> = all_wal_paths
+            .iter()
+            .filter(|(number, _)| {
+                required_log_number.is_none_or(|oldest| *number >= oldest)
+                    && active_log_number.is_none_or(|active| *number <= active)
+            })
+            .cloned()
+            .collect();
         let mut wal_numbers = BTreeSet::new();
         let mut recovered = Vec::new();
         let mut largest_sequence = versions.last_sequence();
         let mut largest_file_number = versions.next_file_number().saturating_sub(1);
-        for (number, path) in &wal_paths {
+        let mut expected_sequence = largest_sequence
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidArgument("sequence number space is exhausted".into()))?;
+        for (number, _) in &all_wal_paths {
             largest_file_number = largest_file_number.max(*number);
+        }
+        for (number, path) in &wal_paths {
             wal_numbers.insert(*number);
             let mut table = MemTable::default();
             let mut table_largest = 0;
             for record in replay_wal_with_fs(path, options.max_batch_bytes, fs.clone())? {
-                if record.sequence <= versions.last_sequence() {
+                if legacy_wal_metadata && record.sequence <= versions.last_sequence() {
                     continue;
                 }
-                if record.sequence <= largest_sequence {
-                    return Err(Error::Corruption {
-                        context: "WAL recovery",
-                        detail: format!(
-                            "sequence {} does not follow recovered sequence {largest_sequence}",
-                            record.sequence
-                        ),
-                    });
+                if record.sequence != expected_sequence {
+                    return Err(wal_corruption(format!(
+                        "expected sequence {expected_sequence}, found {} in {}",
+                        record.sequence,
+                        path.display()
+                    )));
                 }
                 largest_sequence = record.sequence;
+                expected_sequence = record.sequence.checked_add(1).ok_or_else(|| {
+                    Error::InvalidArgument("sequence number space is exhausted".into())
+                })?;
                 table_largest = record.sequence;
                 table.apply(record.sequence, record.batch)?;
             }
             recovered.push((*number, table, table_largest));
+        }
+        if largest_sequence < versions.wal_sequence() {
+            return Err(wal_corruption(format!(
+                "required WALs end at sequence {largest_sequence}, before durable WAL sequence {}",
+                versions.wal_sequence()
+            )));
         }
 
         let mut next_file_number = largest_file_number
@@ -174,10 +216,41 @@ impl Engine {
             wal_number: number,
         };
 
+        for (_, required_path) in &wal_paths {
+            fs.sync_file(required_path)
+                .map_err(|source| io_error("sync WAL", required_path, source))?;
+        }
+        let oldest_recovered = immutables
+            .iter()
+            .map(|table| table.wal_number)
+            .min()
+            .unwrap_or(number);
         let mut counter_edit = VersionEdit::new();
         counter_edit.set_next_file_number(next_file_number);
         counter_edit.set_last_sequence(versions.last_sequence());
+        counter_edit.set_log_number(oldest_recovered);
+        counter_edit.set_active_log_number(number);
+        counter_edit.set_wal_sequence(largest_sequence);
         versions.apply(counter_edit)?;
+        let retained_wals: BTreeSet<_> = immutables
+            .iter()
+            .map(|table| table.wal_number)
+            .chain(std::iter::once(number))
+            .collect();
+        let obsolete_wals: Vec<_> = all_wal_paths
+            .iter()
+            .filter(|(number, _)| !retained_wals.contains(number))
+            .map(|(_, path)| path.clone())
+            .collect();
+        for obsolete in &obsolete_wals {
+            fs.remove_file(obsolete)
+                .map_err(|source| io_error("remove obsolete WAL", obsolete, source))?;
+        }
+        if !obsolete_wals.is_empty() {
+            fs.sync_directory(&options.path)
+                .map_err(|source| io_error("sync WAL retirement", &options.path, source))?;
+        }
+        wal_numbers = retained_wals;
 
         let engine = Self {
             inner: Arc::new(EngineInner {
@@ -286,11 +359,14 @@ impl Engine {
         })
     }
 
-    /// Synchronizes all buffered writes in the active WAL.
+    /// Synchronizes all buffered writes in every WAL still needed for recovery.
     pub fn sync(&self) -> Result<()> {
         let mut state = self.lock_state();
         ensure_writable(&state)?;
-        if let Err(error) = state.wal.sync() {
+        if let Err(error) = sync_owned_wals(&self.inner, &mut state) {
+            return Err(record_terminal_failure(&mut state, error));
+        }
+        if let Err(error) = persist_wal_state(&mut state) {
             return Err(record_terminal_failure(&mut state, error));
         }
         Ok(())
@@ -320,7 +396,7 @@ impl Engine {
         Ok(())
     }
 
-    /// Synchronizes the active WAL and closes this shared engine.
+    /// Synchronizes every required WAL and closes this shared engine.
     pub fn close(&self) -> Result<()> {
         let mut state = self.lock_state();
         if let Some(failure) = &state.terminal_failure {
@@ -332,7 +408,9 @@ impl Engine {
         if state.closed {
             return Ok(());
         }
-        if let Err(error) = state.wal.sync() {
+        if let Err(error) =
+            sync_owned_wals(&self.inner, &mut state).and_then(|()| persist_wal_state(&mut state))
+        {
             let error = record_terminal_failure(&mut state, error);
             state.closed = true;
             self.inner.background.wake_all();
@@ -517,6 +595,14 @@ fn background_loop(weak: Weak<EngineInner>, signal: Arc<BackgroundSignal>) {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let result = built.and_then(|built| {
+            let oldest_required_after_flush = state
+                .immutables
+                .iter()
+                .skip(1)
+                .map(|table| table.wal_number)
+                .chain(std::iter::once(state.mutable.wal_number))
+                .min()
+                .expect("the mutable memtable always owns a WAL");
             let mut edit = VersionEdit::new();
             edit.add_file(
                 0,
@@ -529,6 +615,8 @@ fn background_loop(weak: Weak<EngineInner>, signal: Arc<BackgroundSignal>) {
             );
             edit.set_next_file_number(state.next_file_number);
             edit.set_last_sequence(immutable.largest_sequence);
+            edit.set_log_number(oldest_required_after_flush);
+            edit.set_active_log_number(state.mutable.wal_number);
             state.versions.apply(edit)?;
             state.immutables.pop_front();
             retire_obsolete_wals(&inner, &mut state)
@@ -587,6 +675,13 @@ fn rotate_memtable(
     let new_path = inner.options.path.join(wal_name(new_number));
     let new_wal =
         WalWriter::create_with_fs(&new_path, inner.options.max_batch_bytes, inner.fs.clone())?;
+    let oldest_required = oldest_required_wal(state);
+    let mut edit = VersionEdit::new();
+    edit.set_next_file_number(state.next_file_number);
+    edit.set_log_number(oldest_required);
+    edit.set_active_log_number(new_number);
+    edit.set_wal_sequence(largest_sequence);
+    state.versions.apply(edit)?;
     let old = std::mem::replace(
         &mut state.mutable,
         MutableMemTable {
@@ -605,13 +700,7 @@ fn rotate_memtable(
 }
 
 fn retire_obsolete_wals(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
-    let oldest_required = state
-        .immutables
-        .iter()
-        .map(|table| table.wal_number)
-        .chain(std::iter::once(state.mutable.wal_number))
-        .min()
-        .expect("the mutable memtable always owns a WAL");
+    let oldest_required = oldest_required_wal(state);
     let obsolete: Vec<_> = state
         .wal_numbers
         .iter()
@@ -685,9 +774,11 @@ fn wal_paths(directory: &Path) -> Result<Vec<(u64, PathBuf)>> {
 
 fn parse_numbered_name(name: &str, suffix: &str) -> Option<u64> {
     let digits = name.strip_suffix(suffix)?;
-    (digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_digit()))
-        .then(|| digits.parse().ok())
-        .flatten()
+    if digits.len() < 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let number: u64 = digits.parse().ok()?;
+    (number != 0 && digits == format!("{number:06}")).then_some(number)
 }
 
 fn wal_name(number: u64) -> String {
@@ -705,6 +796,47 @@ fn allocate_file_number(next: &mut u64) -> Result<u64> {
         .checked_add(1)
         .ok_or_else(|| Error::InvalidArgument("file number space is exhausted".into()))?;
     Ok(number)
+}
+
+fn oldest_required_wal(state: &WriteState) -> u64 {
+    state
+        .immutables
+        .iter()
+        .map(|table| table.wal_number)
+        .chain(std::iter::once(state.mutable.wal_number))
+        .min()
+        .expect("the mutable memtable always owns a WAL")
+}
+
+fn sync_owned_wals(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
+    let active = state.mutable.wal_number;
+    let required: BTreeSet<_> = state
+        .immutables
+        .iter()
+        .map(|table| table.wal_number)
+        .chain(std::iter::once(active))
+        .collect();
+    for number in required {
+        if number == active {
+            state.wal.sync()?;
+        } else {
+            let path = inner.options.path.join(wal_name(number));
+            inner
+                .fs
+                .sync_file(&path)
+                .map_err(|source| io_error("sync WAL", &path, source))?;
+        }
+    }
+    Ok(())
+}
+
+fn persist_wal_state(state: &mut WriteState) -> Result<()> {
+    let mut edit = VersionEdit::new();
+    edit.set_next_file_number(state.next_file_number);
+    edit.set_log_number(oldest_required_wal(state));
+    edit.set_active_log_number(state.mutable.wal_number);
+    edit.set_wal_sequence(state.next_sequence.saturating_sub(1));
+    state.versions.apply(edit)
 }
 
 fn clone_candidate(entry: (&InternalKey, &ValueRecord)) -> (SequenceNumber, ValueRecord) {
@@ -815,5 +947,42 @@ fn io_error(operation: &'static str, path: &Path, source: io::Error) -> Error {
         operation,
         path: path.to_path_buf(),
         source,
+    }
+}
+
+fn wal_corruption(detail: impl Into<String>) -> Error {
+    Error::Corruption {
+        context: "WAL recovery",
+        detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod filename_tests {
+    use super::{parse_numbered_name, wal_name};
+
+    #[test]
+    fn canonical_numeric_names_cross_the_six_digit_boundary() {
+        assert_eq!(wal_name(999_999), "999999.wal");
+        assert_eq!(wal_name(1_000_000), "1000000.wal");
+        assert_eq!(parse_numbered_name("999999.wal", ".wal"), Some(999_999));
+        assert_eq!(parse_numbered_name("1000000.wal", ".wal"), Some(1_000_000));
+    }
+
+    #[test]
+    fn numeric_name_parser_rejects_noncanonical_and_overflowing_names() {
+        for name in [
+            ".wal",
+            "0.wal",
+            "000000.wal",
+            "0000001.wal",
+            "+000001.wal",
+            "-000001.wal",
+            "000001.wal.bak",
+            "18446744073709551616.wal",
+            "notes.txt",
+        ] {
+            assert_eq!(parse_numbered_name(name, ".wal"), None, "{name}");
+        }
     }
 }
