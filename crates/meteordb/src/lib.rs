@@ -13,10 +13,12 @@ mod engine;
 mod error;
 mod fs;
 mod internal_key;
+mod manifest;
 mod memtable;
 mod options;
 mod snapshot;
 mod sstable;
+mod version;
 mod wal;
 
 pub use batch::{WriteBatch, WriteOp};
@@ -26,6 +28,7 @@ pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
 pub use fs::{DurableFile, DurableFs, OsDurableFs};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
+pub use manifest::VersionSet;
 pub use memtable::{MemTable, ValueRecord};
 pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};
@@ -36,4 +39,5 @@ pub use sstable::{
     TableIter, TableProperties, TableReader, TableReaderOptions, decode_stored_block,
     encode_stored_block,
 };
+pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
 pub use wal::{RecoveredBatch, WalWriter, replay_wal};

@@ -45,6 +45,22 @@ pub trait DurableFs: Send + Sync {
     /// Opens `path` for appending, creating it when it does not exist.
     fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>>;
 
+    /// Opens and synchronizes an existing immutable file.
+    ///
+    /// Manifest publication uses this operation before recording an SSTable,
+    /// establishing that the referenced file exists and its bytes are durable.
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        File::open(path)?.sync_all()
+    }
+
+    /// Shortens an existing file to `length` bytes.
+    ///
+    /// Manifest recovery uses this to discard a structurally torn final
+    /// record before opening the log for later appends.
+    fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
+        OpenOptions::new().write(true).open(path)?.set_len(length)
+    }
+
     /// Requests that changes to entries in `path` reach stable storage.
     ///
     /// Syncing a file persists its bytes, but a crash can still lose a recent
