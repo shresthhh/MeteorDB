@@ -162,6 +162,7 @@ fn referenced_missing_file_fails_before_manifest_append_or_publication() {
 
     let mut edit = VersionEdit::new();
     edit.add_file(0, meta(2, b"a", b"z"));
+    edit.set_next_file_number(3);
     assert!(matches!(
         versions.apply(edit),
         Err(Error::Io {
@@ -186,6 +187,7 @@ fn failed_manifest_sync_does_not_publish_the_candidate_version() {
 
     let mut edit = VersionEdit::new();
     edit.add_file(0, meta(2, b"a", b"z"));
+    edit.set_next_file_number(3);
     assert!(matches!(
         versions.apply(edit),
         Err(Error::Io {
@@ -333,6 +335,261 @@ fn file_and_sequence_numbers_never_move_backward() {
 }
 
 #[test]
+fn added_file_must_be_below_the_resulting_high_water_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+
+    let mut edit = VersionEdit::new();
+    edit.add_file(0, meta(2, b"a", b"z"));
+    assert!(matches!(
+        versions.apply(edit),
+        Err(Error::InvalidArgument(message)) if message.contains("next file number")
+    ));
+}
+
+#[test]
+fn one_edit_cannot_delete_and_readd_or_add_a_number_twice() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    create_sstable(dir.path(), 3);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut initial = VersionEdit::new();
+    initial
+        .add_file(0, meta(2, b"a", b"m"))
+        .set_next_file_number(4);
+    versions.apply(initial).unwrap();
+
+    let mut readd = VersionEdit::new();
+    readd.delete_file(0, 2).add_file(0, meta(2, b"n", b"z"));
+    assert!(matches!(
+        versions.apply(readd),
+        Err(Error::InvalidArgument(message)) if message.contains("same edit")
+    ));
+
+    let mut duplicate = VersionEdit::new();
+    duplicate
+        .add_file(0, meta(3, b"a", b"m"))
+        .add_file(1, meta(3, b"n", b"z"));
+    assert!(matches!(
+        versions.apply(duplicate),
+        Err(Error::InvalidArgument(message)) if message.contains("more than once")
+    ));
+}
+
+#[test]
+fn deleted_file_number_can_never_be_reused() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    let mut delete = VersionEdit::new();
+    delete.delete_file(0, 2);
+    versions.apply(delete).unwrap();
+
+    let mut reuse = VersionEdit::new();
+    reuse.add_file(1, meta(2, b"a", b"z"));
+    assert!(matches!(
+        versions.apply(reuse),
+        Err(Error::InvalidArgument(message)) if message.contains("already been used")
+    ));
+}
+
+#[test]
+fn recovery_rejects_historical_high_water_and_reuse_violations() {
+    let high_water_dir = tempfile::tempdir().unwrap();
+    create_sstable(high_water_dir.path(), 2);
+    drop(VersionSet::create(high_water_dir.path()).unwrap());
+    append_raw_edit(
+        &high_water_dir.path().join("MANIFEST-000001"),
+        Some(2),
+        &[],
+        &[(0, meta(2, b"a", b"z"))],
+    );
+    assert!(matches!(
+        VersionSet::recover(high_water_dir.path()),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("next file number")
+    ));
+
+    let reuse_dir = tempfile::tempdir().unwrap();
+    create_sstable(reuse_dir.path(), 2);
+    let mut versions = VersionSet::create(reuse_dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    let mut delete = VersionEdit::new();
+    delete.delete_file(0, 2);
+    versions.apply(delete).unwrap();
+    drop(versions);
+    append_raw_edit(
+        &reuse_dir.path().join("MANIFEST-000001"),
+        None,
+        &[],
+        &[(1, meta(2, b"a", b"z"))],
+    );
+    assert!(matches!(
+        VersionSet::recover(reuse_dir.path()),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("already been used")
+    ));
+
+    let same_edit_dir = tempfile::tempdir().unwrap();
+    create_sstable(same_edit_dir.path(), 2);
+    let mut versions = VersionSet::create(same_edit_dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    drop(versions);
+    append_raw_edit(
+        &same_edit_dir.path().join("MANIFEST-000001"),
+        None,
+        &[(0, 2)],
+        &[(1, meta(2, b"a", b"z"))],
+    );
+    assert!(matches!(
+        VersionSet::recover(same_edit_dir.path()),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("same edit")
+    ));
+
+    let regression_dir = tempfile::tempdir().unwrap();
+    let mut versions = VersionSet::create(regression_dir.path()).unwrap();
+    let mut advance = VersionEdit::new();
+    advance.set_next_file_number(10);
+    versions.apply(advance).unwrap();
+    drop(versions);
+    append_raw_edit(
+        &regression_dir.path().join("MANIFEST-000001"),
+        Some(9),
+        &[],
+        &[],
+    );
+    assert!(matches!(
+        VersionSet::recover(regression_dir.path()),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("moved backward")
+    ));
+}
+
+#[test]
+fn a_second_manifest_writer_is_rejected_until_the_first_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = VersionSet::create(dir.path()).unwrap();
+    assert!(matches!(
+        VersionSet::recover(dir.path()),
+        Err(Error::Locked(path)) if path == dir.path().join("LOCK")
+    ));
+    drop(first);
+    VersionSet::recover(dir.path()).unwrap();
+}
+
+#[test]
+fn recovery_never_recreates_a_manifest_removed_before_append() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(dir.path()).unwrap());
+    let fs = Arc::new(RemoveBeforeAppendFs::default());
+
+    assert!(matches!(
+        VersionSet::recover_with_fs(dir.path(), fs),
+        Err(Error::Io {
+            operation: "open manifest for append",
+            ..
+        })
+    ));
+    assert!(!dir.path().join("MANIFEST-000001").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn recovery_rejects_symlink_current_manifest_and_sstable() {
+    use std::os::unix::fs::symlink;
+
+    let current_dir = tempfile::tempdir().unwrap();
+    std::fs::write(current_dir.path().join("target"), b"MANIFEST-000001\n").unwrap();
+    symlink("target", current_dir.path().join("CURRENT")).unwrap();
+    assert!(VersionSet::recover(current_dir.path()).is_err());
+
+    let manifest_dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(manifest_dir.path()).unwrap());
+    std::fs::rename(
+        manifest_dir.path().join("MANIFEST-000001"),
+        manifest_dir.path().join("manifest-target"),
+    )
+    .unwrap();
+    symlink(
+        "manifest-target",
+        manifest_dir.path().join("MANIFEST-000001"),
+    )
+    .unwrap();
+    assert!(VersionSet::recover(manifest_dir.path()).is_err());
+
+    let sstable_dir = tempfile::tempdir().unwrap();
+    create_sstable(sstable_dir.path(), 2);
+    let mut versions = VersionSet::create(sstable_dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    drop(versions);
+    std::fs::rename(
+        sstable_dir.path().join("000002.sst"),
+        sstable_dir.path().join("table-target"),
+    )
+    .unwrap();
+    symlink("table-target", sstable_dir.path().join("000002.sst")).unwrap();
+    assert!(VersionSet::recover(sstable_dir.path()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn manifests_and_sstables_must_be_regular_files() {
+    let current_dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(current_dir.path()).unwrap());
+    std::fs::remove_file(current_dir.path().join("CURRENT")).unwrap();
+    std::fs::create_dir(current_dir.path().join("CURRENT")).unwrap();
+    assert!(VersionSet::recover(current_dir.path()).is_err());
+
+    let manifest_dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(manifest_dir.path()).unwrap());
+    std::fs::remove_file(manifest_dir.path().join("MANIFEST-000001")).unwrap();
+    std::fs::create_dir(manifest_dir.path().join("MANIFEST-000001")).unwrap();
+    assert!(VersionSet::recover(manifest_dir.path()).is_err());
+
+    let sstable_dir = tempfile::tempdir().unwrap();
+    create_sstable(sstable_dir.path(), 2);
+    let mut versions = VersionSet::create(sstable_dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    drop(versions);
+    std::fs::remove_file(sstable_dir.path().join("000002.sst")).unwrap();
+    std::fs::create_dir(sstable_dir.path().join("000002.sst")).unwrap();
+    assert!(VersionSet::recover(sstable_dir.path()).is_err());
+
+    let special_dir = tempfile::tempdir().unwrap();
+    create_sstable(special_dir.path(), 2);
+    let mut versions = VersionSet::create(special_dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    drop(versions);
+    std::fs::remove_file(special_dir.path().join("000002.sst")).unwrap();
+    let _socket =
+        std::os::unix::net::UnixListener::bind(special_dir.path().join("000002.sst")).unwrap();
+    assert!(VersionSet::recover(special_dir.path()).is_err());
+}
+
+#[test]
 fn checksum_damage_in_a_complete_manifest_record_is_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let versions = VersionSet::create(dir.path()).unwrap();
@@ -354,6 +611,34 @@ fn checksum_damage_in_a_complete_manifest_record_is_corruption() {
             ..
         })
     ));
+}
+
+#[derive(Default)]
+struct RemoveBeforeAppendFs {
+    inner: OsDurableFs,
+}
+
+impl DurableFs for RemoveBeforeAppendFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        std::fs::remove_file(path)?;
+        self.inner.append_existing(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 struct TrackingFs {
@@ -437,6 +722,17 @@ impl DurableFs for TrackingFs {
         }))
     }
 
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let name = file_name(path);
+        self.events.lock().unwrap().push(format!("append {name}"));
+        Ok(Box::new(TrackingFile {
+            inner: self.inner.append_existing(path)?,
+            name,
+            events: self.events.clone(),
+            fail_sync_path: self.fail_sync_path.clone(),
+        }))
+    }
+
     fn sync_file(&self, path: &Path) -> std::io::Result<()> {
         self.events
             .lock()
@@ -465,4 +761,54 @@ impl DurableFs for TrackingFs {
 
 fn file_name(path: &Path) -> String {
     path.file_name().unwrap().to_string_lossy().into_owned()
+}
+
+fn append_raw_edit(
+    manifest: &Path,
+    next_file_number: Option<u64>,
+    deleted: &[(usize, u64)],
+    added: &[(usize, FileMeta)],
+) {
+    let mut edit = vec![1];
+    put_optional_u64(&mut edit, next_file_number);
+    put_optional_u64(&mut edit, None);
+    edit.extend_from_slice(&(deleted.len() as u32).to_le_bytes());
+    for &(level, number) in deleted {
+        edit.extend_from_slice(&(level as u32).to_le_bytes());
+        edit.extend_from_slice(&number.to_le_bytes());
+    }
+    edit.extend_from_slice(&(added.len() as u32).to_le_bytes());
+    for (level, file) in added {
+        edit.extend_from_slice(&(*level as u32).to_le_bytes());
+        edit.extend_from_slice(&file.number().to_le_bytes());
+        edit.extend_from_slice(&file.file_size().to_le_bytes());
+        put_bytes(&mut edit, file.smallest().as_bytes());
+        put_bytes(&mut edit, file.largest().as_bytes());
+    }
+
+    let mut record = Vec::with_capacity(7 + edit.len());
+    let checksum = crc32c::crc32c(&[&[1], edit.as_slice()].concat());
+    let masked = checksum.rotate_right(15).wrapping_add(0xa282_ead8);
+    record.extend_from_slice(&masked.to_le_bytes());
+    record.extend_from_slice(&(edit.len() as u16).to_le_bytes());
+    record.push(1);
+    record.extend_from_slice(&edit);
+    let mut file = OpenOptions::new().append(true).open(manifest).unwrap();
+    file.write_all(&record).unwrap();
+    file.sync_all().unwrap();
+}
+
+fn put_optional_u64(encoded: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            encoded.push(1);
+            encoded.extend_from_slice(&value.to_le_bytes());
+        }
+        None => encoded.push(0),
+    }
+}
+
+fn put_bytes(encoded: &mut Vec<u8>, bytes: &[u8]) {
+    encoded.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(bytes);
 }

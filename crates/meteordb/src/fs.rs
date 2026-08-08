@@ -1,6 +1,11 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
+
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 
 /// An open durable file whose writes and synchronization can be injected.
 ///
@@ -45,12 +50,38 @@ pub trait DurableFs: Send + Sync {
     /// Opens `path` for appending, creating it when it does not exist.
     fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>>;
 
+    /// Opens an existing regular file for appending without following symlinks.
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let mut options = OpenOptions::new();
+        options.append(true);
+        Ok(Box::new(OsDurableFile(open_regular(path, &mut options)?)))
+    }
+
+    /// Reads an existing regular file without following symlinks.
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = open_regular(path, &mut options)?;
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// Validates that `path` names an existing regular file without following symlinks.
+    fn validate_file(&self, path: &Path) -> std::io::Result<()> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        open_regular(path, &mut options).map(drop)
+    }
+
     /// Opens and synchronizes an existing immutable file.
     ///
     /// Manifest publication uses this operation before recording an SSTable,
     /// establishing that the referenced file exists and its bytes are durable.
     fn sync_file(&self, path: &Path) -> std::io::Result<()> {
-        File::open(path)?.sync_all()
+        let mut options = OpenOptions::new();
+        options.read(true);
+        open_regular(path, &mut options)?.sync_all()
     }
 
     /// Shortens an existing file to `length` bytes.
@@ -58,7 +89,9 @@ pub trait DurableFs: Send + Sync {
     /// Manifest recovery uses this to discard a structurally torn final
     /// record before opening the log for later appends.
     fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
-        OpenOptions::new().write(true).open(path)?.set_len(length)
+        let mut options = OpenOptions::new();
+        options.write(true);
+        open_regular(path, &mut options)?.set_len(length)
     }
 
     /// Requests that changes to entries in `path` reach stable storage.
@@ -99,4 +132,42 @@ impl DurableFs for OsDurableFs {
     fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
         std::fs::rename(source, destination)
     }
+}
+
+pub(crate) fn open_lock_file(path: &Path) -> std::io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    open_regular(path, &mut options)
+}
+
+fn open_regular(path: &Path, options: &mut OpenOptions) -> std::io::Result<File> {
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symlinks are not accepted for database files",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let file = options.open(path)?;
+    if !file.metadata()?.file_type().is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "database path is not a regular file",
+        ));
+    }
+    Ok(file)
 }

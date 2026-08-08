@@ -1,8 +1,10 @@
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use fs2::FileExt;
+
+use crate::fs::open_lock_file;
 use crate::version::NUM_LEVELS;
 use crate::{
     DurableFile, DurableFs, Error, FileMeta, InternalKey, OsDurableFs, Result, SequenceNumber,
@@ -29,8 +31,10 @@ pub struct VersionSet {
     directory: PathBuf,
     fs: Arc<dyn DurableFs>,
     manifest_number: u64,
+    _lock: DatabaseLock,
     manifest: ManifestWriter,
     current: Arc<Version>,
+    used_file_numbers: HashSet<u64>,
     next_file_number: u64,
     last_sequence: SequenceNumber,
     manifest_usable: bool,
@@ -45,6 +49,7 @@ impl VersionSet {
     /// Creates a version set with injectable crash-sensitive filesystem calls.
     pub fn create_with_fs(directory: impl AsRef<Path>, fs: Arc<dyn DurableFs>) -> Result<Self> {
         let directory = directory.as_ref().to_path_buf();
+        let lock = DatabaseLock::acquire(&directory)?;
         let manifest_number = 1;
         let manifest_name = manifest_name(manifest_number);
         let manifest_path = directory.join(&manifest_name);
@@ -79,23 +84,20 @@ impl VersionSet {
             .map_err(|source| io_error("sync manifest directory", &directory, source))?;
 
         replace_current(&directory, &manifest_name, fs.as_ref())?;
+        drop(writer);
         let manifest = fs
-            .append(&manifest_path)
+            .append_existing(&manifest_path)
             .map_err(|source| io_error("open manifest for append", &manifest_path, source))?;
-        let block_offset = usize::try_from(
-            std::fs::metadata(&manifest_path)
-                .map_err(|source| io_error("stat manifest", &manifest_path, source))?
-                .len()
-                % BLOCK_BYTES as u64,
-        )
-        .expect("physical block offset fits usize");
+        let block_offset = encoded.len() + HEADER_BYTES;
 
         Ok(Self {
             directory,
             fs,
             manifest_number,
+            _lock: lock,
             manifest: ManifestWriter::new(manifest, manifest_path, block_offset),
             current: Arc::new(Version::empty()),
+            used_file_numbers: HashSet::from([manifest_number]),
             next_file_number: 2,
             last_sequence: 0,
             manifest_usable: true,
@@ -110,13 +112,15 @@ impl VersionSet {
     /// Recovers with injectable filesystem operations for later durable edits.
     pub fn recover_with_fs(directory: impl AsRef<Path>, fs: Arc<dyn DurableFs>) -> Result<Self> {
         let directory = directory.as_ref().to_path_buf();
+        let lock = DatabaseLock::acquire(&directory)?;
         let current_path = directory.join("CURRENT");
-        let current = std::fs::read(&current_path)
+        let current = fs
+            .read_file(&current_path)
             .map_err(|source| io_error("read CURRENT", &current_path, source))?;
         let manifest_name = parse_current(&current)?;
         let manifest_number = parse_manifest_number(&manifest_name)?;
         let manifest_path = directory.join(&manifest_name);
-        let replay = replay_manifest(&manifest_path)?;
+        let replay = replay_manifest(&manifest_path, fs.as_ref())?;
         if replay.edits.is_empty() {
             return Err(manifest_corruption(
                 "manifest contains no complete initial edit",
@@ -126,9 +130,12 @@ impl VersionSet {
         let mut version = Version::empty();
         let mut next_file_number = 0;
         let mut last_sequence = 0;
+        let mut used_file_numbers = HashSet::from([manifest_number]);
         for edit in replay.edits {
-            let candidate = version.apply(&edit).map_err(recovery_edit_error)?;
             update_counters(&edit, &mut next_file_number, &mut last_sequence, true)?;
+            validate_file_numbers(&edit, next_file_number, &used_file_numbers, true)?;
+            let candidate = version.apply(&edit).map_err(recovery_edit_error)?;
+            used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
             version = candidate;
         }
         if next_file_number == 0 {
@@ -136,7 +143,7 @@ impl VersionSet {
                 "manifest never records the next file number",
             ));
         }
-        validate_referenced_files(&directory, &version)?;
+        validate_referenced_files(&directory, &version, fs.as_ref())?;
 
         if replay.valid_bytes < replay.file_length {
             fs.truncate_file(&manifest_path, replay.valid_bytes)
@@ -147,12 +154,13 @@ impl VersionSet {
                 .map_err(|source| io_error("sync truncated manifest", &manifest_path, source))?;
         }
         let manifest = fs
-            .append(&manifest_path)
+            .append_existing(&manifest_path)
             .map_err(|source| io_error("open manifest for append", &manifest_path, source))?;
         Ok(Self {
             directory,
             fs,
             manifest_number,
+            _lock: lock,
             manifest: ManifestWriter::new(
                 manifest,
                 manifest_path,
@@ -160,6 +168,7 @@ impl VersionSet {
                     .expect("physical block offset fits usize"),
             ),
             current: Arc::new(version),
+            used_file_numbers,
             next_file_number,
             last_sequence,
             manifest_usable: true,
@@ -173,10 +182,11 @@ impl VersionSet {
                 "manifest writer is unusable after a failed append or sync".into(),
             ));
         }
-        let candidate = self.current.apply(&edit)?;
         let mut next_file_number = self.next_file_number;
         let mut last_sequence = self.last_sequence;
         update_counters(&edit, &mut next_file_number, &mut last_sequence, false)?;
+        validate_file_numbers(&edit, next_file_number, &self.used_file_numbers, false)?;
+        let candidate = self.current.apply(&edit)?;
         let encoded = encode_edit(&edit)?;
 
         for (_, file) in &edit.added_files {
@@ -196,6 +206,8 @@ impl VersionSet {
         }
 
         self.current = Arc::new(candidate);
+        self.used_file_numbers
+            .extend(edit.added_files.iter().map(|(_, file)| file.number()));
         self.next_file_number = next_file_number;
         self.last_sequence = last_sequence;
         Ok(())
@@ -219,6 +231,26 @@ impl VersionSet {
     /// Returns the active manifest's file number.
     pub fn manifest_number(&self) -> u64 {
         self.manifest_number
+    }
+}
+
+struct DatabaseLock {
+    _file: std::fs::File,
+}
+
+impl DatabaseLock {
+    fn acquire(directory: &Path) -> Result<Self> {
+        let path = directory.join("LOCK");
+        let file = open_lock_file(&path)
+            .map_err(|source| io_error("open database lock", &path, source))?;
+        file.try_lock_exclusive().map_err(|source| {
+            if source.kind() == std::io::ErrorKind::WouldBlock {
+                Error::Locked(path.clone())
+            } else {
+                io_error("lock database", &path, source)
+            }
+        })?;
+        Ok(Self { _file: file })
     }
 }
 
@@ -276,6 +308,61 @@ fn counter_error(recovery: bool, detail: String) -> Error {
     }
 }
 
+fn validate_file_numbers(
+    edit: &VersionEdit,
+    next_file_number: u64,
+    used_file_numbers: &HashSet<u64>,
+    recovery: bool,
+) -> Result<()> {
+    if used_file_numbers
+        .iter()
+        .any(|number| *number >= next_file_number)
+    {
+        return Err(counter_error(
+            recovery,
+            format!(
+                "next file number {next_file_number} does not exceed every previously used file number"
+            ),
+        ));
+    }
+    let deleted: HashSet<u64> = edit
+        .deleted_files
+        .iter()
+        .map(|(_, number)| *number)
+        .collect();
+    let mut added = HashSet::new();
+    for (_, file) in &edit.added_files {
+        let number = file.number();
+        if number >= next_file_number {
+            return Err(counter_error(
+                recovery,
+                format!(
+                    "SSTable file number {number} is not below next file number {next_file_number}"
+                ),
+            ));
+        }
+        if !added.insert(number) {
+            return Err(counter_error(
+                recovery,
+                format!("SSTable file number {number} is added more than once"),
+            ));
+        }
+        if deleted.contains(&number) {
+            return Err(counter_error(
+                recovery,
+                format!("SSTable file number {number} is deleted and re-added in the same edit"),
+            ));
+        }
+        if used_file_numbers.contains(&number) {
+            return Err(counter_error(
+                recovery,
+                format!("SSTable file number {number} has already been used"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn recovery_edit_error(error: Error) -> Error {
     match error {
         Error::InvalidArgument(detail) => manifest_corruption(detail),
@@ -283,16 +370,20 @@ fn recovery_edit_error(error: Error) -> Error {
     }
 }
 
-fn validate_referenced_files(directory: &Path, version: &Version) -> Result<()> {
+fn validate_referenced_files(
+    directory: &Path,
+    version: &Version,
+    fs: &dyn DurableFs,
+) -> Result<()> {
     for level in 0..NUM_LEVELS {
         for file in version.files(level) {
             let path = directory.join(sstable_name(file.number()));
-            if !path.is_file() {
-                return Err(manifest_corruption(format!(
-                    "level {level} references missing SSTable {}",
+            fs.validate_file(&path).map_err(|source| {
+                manifest_corruption(format!(
+                    "level {level} references missing SSTable or invalid file {}: {source}",
                     path.display()
-                )));
-            }
+                ))
+            })?;
         }
     }
     Ok(())
@@ -381,14 +472,11 @@ struct ManifestReplay {
     file_length: u64,
 }
 
-fn replay_manifest(path: &Path) -> Result<ManifestReplay> {
-    let file = File::open(path).map_err(|source| io_error("open manifest", path, source))?;
-    let file_length = file
-        .metadata()
-        .map_err(|source| io_error("stat manifest", path, source))?
-        .len();
-    let mut reader = BufReader::new(file);
-    let mut block = [0_u8; BLOCK_BYTES];
+fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
+    let contents = fs
+        .read_file(path)
+        .map_err(|source| io_error("open manifest", path, source))?;
+    let file_length = contents.len() as u64;
     let mut block_start = 0_u64;
     let mut logical = Vec::new();
     let mut assembling = false;
@@ -396,11 +484,12 @@ fn replay_manifest(path: &Path) -> Result<ManifestReplay> {
     let mut edits = Vec::new();
 
     loop {
-        let block_length = read_block(&mut reader, &mut block)
-            .map_err(|source| io_error("read manifest", path, source))?;
+        let start = usize::try_from(block_start).expect("manifest length fits usize");
+        let block_length = (contents.len() - start).min(BLOCK_BYTES);
         if block_length == 0 {
             break;
         }
+        let block = &contents[start..start + block_length];
         let final_block = block_start + block_length as u64 == file_length;
         let mut offset = 0;
         while offset < block_length {
@@ -500,21 +589,6 @@ fn replay_manifest(path: &Path) -> Result<ManifestReplay> {
         },
         file_length,
     })
-}
-
-fn read_block(
-    reader: &mut BufReader<File>,
-    block: &mut [u8; BLOCK_BYTES],
-) -> std::io::Result<usize> {
-    let mut filled = 0;
-    while filled < block.len() {
-        let read = reader.read(&mut block[filled..])?;
-        if read == 0 {
-            break;
-        }
-        filled += read;
-    }
-    Ok(filled)
 }
 
 fn append_fragment(logical: &mut Vec<u8>, fragment: &[u8]) -> Result<()> {
