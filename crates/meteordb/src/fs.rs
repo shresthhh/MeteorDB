@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
@@ -274,6 +275,15 @@ struct FaultState {
     next_index: AtomicUsize,
     events: Mutex<Vec<FaultEvent>>,
     fail_at: Option<usize>,
+    crash_image: Mutex<CrashImage>,
+}
+
+#[derive(Default)]
+struct CrashImage {
+    volatile: HashMap<PathBuf, Vec<u8>>,
+    synced: HashMap<PathBuf, Vec<u8>>,
+    durable: HashMap<PathBuf, Vec<u8>>,
+    tracked: HashSet<PathBuf>,
 }
 
 impl FaultState {
@@ -285,11 +295,114 @@ impl FaultState {
             path: path.to_path_buf(),
         });
         if self.fail_at == Some(index) {
+            self.restore_durable_state()?;
             return Err(std::io::Error::other(format!(
                 "injected crash at operation {index}: {operation:?} {}",
                 path.display()
             )));
         }
+        Ok(())
+    }
+
+    fn track_file(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = std::fs::read(path)?;
+        let mut image = self.crash_image.lock().unwrap();
+        image.tracked.insert(path.to_path_buf());
+        image.volatile.insert(path.to_path_buf(), bytes);
+        Ok(())
+    }
+
+    fn record_write(&self, path: &Path, bytes: &[u8]) {
+        let mut image = self.crash_image.lock().unwrap();
+        image.tracked.insert(path.to_path_buf());
+        image
+            .volatile
+            .entry(path.to_path_buf())
+            .or_default()
+            .extend_from_slice(bytes);
+    }
+
+    fn record_file_sync(&self, path: &Path) {
+        let mut image = self.crash_image.lock().unwrap();
+        if let Some(bytes) = image.volatile.get(path).cloned() {
+            image.synced.insert(path.to_path_buf(), bytes.clone());
+            if image.durable.contains_key(path) {
+                image.durable.insert(path.to_path_buf(), bytes);
+            }
+        }
+    }
+
+    fn record_rename(&self, source: &Path, destination: &Path) {
+        let mut image = self.crash_image.lock().unwrap();
+        image.tracked.insert(source.to_path_buf());
+        image.tracked.insert(destination.to_path_buf());
+        if let Some(bytes) = image.volatile.remove(source) {
+            image.volatile.insert(destination.to_path_buf(), bytes);
+        }
+        if let Some(bytes) = image.synced.remove(source) {
+            image.synced.insert(destination.to_path_buf(), bytes);
+        }
+    }
+
+    fn record_directory_sync(&self, directory: &Path) {
+        let mut image = self.crash_image.lock().unwrap();
+        let paths = image
+            .tracked
+            .iter()
+            .filter(|path| path.parent() == Some(directory))
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            if image.volatile.contains_key(&path) {
+                let bytes = image
+                    .synced
+                    .get(&path)
+                    .or_else(|| image.durable.get(&path))
+                    .cloned()
+                    .unwrap_or_default();
+                image.durable.insert(path, bytes);
+            } else {
+                image.durable.remove(&path);
+            }
+        }
+    }
+
+    fn record_truncate(&self, path: &Path) -> std::io::Result<()> {
+        let bytes = std::fs::read(path)?;
+        let mut image = self.crash_image.lock().unwrap();
+        image.tracked.insert(path.to_path_buf());
+        image.volatile.insert(path.to_path_buf(), bytes);
+        Ok(())
+    }
+
+    fn record_remove(&self, path: &Path) {
+        let mut image = self.crash_image.lock().unwrap();
+        image.tracked.insert(path.to_path_buf());
+        image.volatile.remove(path);
+        image.synced.remove(path);
+    }
+
+    fn restore_durable_state(&self) -> std::io::Result<()> {
+        let mut image = self.crash_image.lock().unwrap();
+        let paths = image
+            .tracked
+            .iter()
+            .chain(image.durable.keys())
+            .cloned()
+            .collect::<HashSet<_>>();
+        for path in paths {
+            if let Some(bytes) = image.durable.get(&path) {
+                std::fs::write(&path, bytes)?;
+            } else {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        image.volatile = image.durable.clone();
+        image.synced = image.durable.clone();
         Ok(())
     }
 }
@@ -332,6 +445,15 @@ impl FaultyFs {
         self.state.events.lock().unwrap().clone()
     }
 
+    /// Simulates an immediate process crash by restoring only durable state.
+    ///
+    /// File contents survive only after a successful file synchronization.
+    /// New names, renames, and removals survive only after a later successful
+    /// synchronization of their containing directory.
+    pub fn crash(&self) -> std::io::Result<()> {
+        self.state.restore_durable_state()
+    }
+
     fn wrap(&self, path: &Path, file: Box<dyn DurableFile>) -> Box<dyn DurableFile> {
         Box::new(FaultyFile {
             inner: file,
@@ -350,28 +472,36 @@ struct FaultyFile {
 impl DurableFile for FaultyFile {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         self.state.observe(FaultOperation::Write, &self.path)?;
-        self.inner.write_all(bytes)
+        self.inner.write_all(bytes)?;
+        self.state.record_write(&self.path, bytes);
+        Ok(())
     }
 
     fn sync_all(&self) -> std::io::Result<()> {
         self.state.observe(FaultOperation::FileSync, &self.path)?;
-        self.inner.sync_all()
+        self.inner.sync_all()?;
+        self.state.record_file_sync(&self.path);
+        Ok(())
     }
 }
 
 impl DurableFs for FaultyFs {
     fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        self.inner.create(path).map(|file| self.wrap(path, file))
+        let file = self.inner.create(path)?;
+        self.state.track_file(path)?;
+        Ok(self.wrap(path, file))
     }
 
     fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        self.inner.append(path).map(|file| self.wrap(path, file))
+        let file = self.inner.append(path)?;
+        self.state.track_file(path)?;
+        Ok(self.wrap(path, file))
     }
 
     fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        self.inner
-            .append_existing(path)
-            .map(|file| self.wrap(path, file))
+        let file = self.inner.append_existing(path)?;
+        self.state.track_file(path)?;
+        Ok(self.wrap(path, file))
     }
 
     fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
@@ -384,34 +514,46 @@ impl DurableFs for FaultyFs {
 
     fn sync_file(&self, path: &Path) -> std::io::Result<()> {
         self.state.observe(FaultOperation::SyncFile, path)?;
-        self.inner.sync_file(path)
+        self.inner.sync_file(path)?;
+        self.state.record_truncate(path)?;
+        self.state.record_file_sync(path);
+        Ok(())
     }
 
     fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
         self.state.observe(FaultOperation::Truncate, path)?;
-        self.inner.truncate_file(path, length)
+        self.inner.truncate_file(path, length)?;
+        self.state.record_truncate(path)
     }
 
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
         self.state.observe(FaultOperation::DirectorySync, path)?;
-        self.inner.sync_directory(path)
+        self.inner.sync_directory(path)?;
+        self.state.record_directory_sync(path);
+        Ok(())
     }
 
     fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
         self.state
             .observe(FaultOperation::AtomicReplace, destination)?;
-        self.inner.atomic_replace(source, destination)
+        self.inner.atomic_replace(source, destination)?;
+        self.state.record_rename(source, destination);
+        Ok(())
     }
 
     fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
         self.state
             .observe(FaultOperation::AtomicInstall, destination)?;
-        self.inner.atomic_install(source, destination)
+        self.inner.atomic_install(source, destination)?;
+        self.state.record_rename(source, destination);
+        Ok(())
     }
 
     fn remove_file(&self, path: &Path) -> std::io::Result<()> {
         self.state.observe(FaultOperation::Remove, path)?;
-        self.inner.remove_file(path)
+        self.inner.remove_file(path)?;
+        self.state.record_remove(path);
+        Ok(())
     }
 }
 

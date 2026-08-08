@@ -26,22 +26,26 @@ struct Model {
 }
 
 impl Model {
-    fn put(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at: Option<u64>) {
+    fn apply(
+        &mut self,
+        operations: impl IntoIterator<Item = (Vec<u8>, Option<Vec<u8>>, Option<u64>)>,
+    ) {
         self.sequence += 1;
-        self.versions.entry(key).or_default().push(Version {
-            sequence: self.sequence,
-            value: Some(value),
-            expires_at,
-        });
+        for (key, value, expires_at) in operations {
+            self.versions.entry(key).or_default().push(Version {
+                sequence: self.sequence,
+                value,
+                expires_at,
+            });
+        }
+    }
+
+    fn put(&mut self, key: Vec<u8>, value: Vec<u8>, expires_at: Option<u64>) {
+        self.apply([(key, Some(value), expires_at)]);
     }
 
     fn delete(&mut self, key: Vec<u8>) {
-        self.sequence += 1;
-        self.versions.entry(key).or_default().push(Version {
-            sequence: self.sequence,
-            value: None,
-            expires_at: None,
-        });
+        self.apply([(key, None, None)]);
     }
 
     fn get(&self, key: &[u8], sequence: u64, now: u64) -> Option<Vec<u8>> {
@@ -85,6 +89,40 @@ fn deterministic_state_machine_matches_reference_mvcc_ttl_model() {
     }
 }
 
+#[test]
+fn public_snapshot_sequences_and_same_key_batches_match_atomic_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(options(dir.path())).unwrap();
+    let before = db.snapshot().unwrap();
+    assert_eq!(before.sequence(), 0);
+
+    let mut batch = WriteBatch::default();
+    batch
+        .put(b"same", b"first")
+        .put(b"other", b"batch-value")
+        .delete(b"same")
+        .put(b"same", b"final");
+    db.write(batch).unwrap();
+
+    let after = db.snapshot().unwrap();
+    assert_eq!(after.sequence(), 1);
+    assert_eq!(before.get(b"same").unwrap(), None);
+    assert_eq!(after.get(b"same").unwrap().as_deref(), Some(&b"final"[..]));
+    assert_eq!(
+        after.get(b"other").unwrap().as_deref(),
+        Some(&b"batch-value"[..])
+    );
+
+    db.delete(b"other").unwrap();
+    let second = db.snapshot().unwrap();
+    assert_eq!(second.sequence(), 2);
+    assert_eq!(
+        after.get(b"other").unwrap().as_deref(),
+        Some(&b"batch-value"[..])
+    );
+    assert_eq!(second.get(b"other").unwrap(), None);
+}
+
 fn run_seed(seed: u64) {
     let dir = tempfile::tempdir().unwrap();
     let clock = Arc::new(ManualClock::new(10_000));
@@ -115,8 +153,10 @@ fn run_seed(seed: u64) {
                 let mut batch = WriteBatch::default();
                 batch.put(&first, &first_value).put(&second, &second_value);
                 db.write(batch).unwrap();
-                model.put(first, first_value, None);
-                model.put(second, second_value, None);
+                model.apply([
+                    (first, Some(first_value), None),
+                    (second, Some(second_value), None),
+                ]);
             }
             4 => {
                 let ttl = 1 + rng.pick(20);
@@ -126,7 +166,13 @@ fn run_seed(seed: u64) {
                 model.put(key, value, Some(now + ttl));
             }
             5 if snapshots.len() < 6 => {
-                snapshots.push((db.snapshot().unwrap(), model.sequence));
+                let snapshot = db.snapshot().unwrap();
+                assert_eq!(
+                    snapshot.sequence(),
+                    model.sequence,
+                    "seed={seed:#x} step={step} public snapshot sequence"
+                );
+                snapshots.push((snapshot, model.sequence));
             }
             6 => {
                 assert_eq!(

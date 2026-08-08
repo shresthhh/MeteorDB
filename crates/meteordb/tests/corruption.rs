@@ -1,7 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use meteordb::{Error, Options, TableReader, inspect_manifest, inspect_wal, replay_wal};
+use meteordb::{
+    Durability, Error, Options, TableReader, WalWriter, WriteBatch, inspect_manifest, inspect_wal,
+    replay_wal,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum PersistedClass {
@@ -41,6 +44,61 @@ fn flips_and_truncations_cover_every_persisted_format_without_panics() {
             );
         }
     }
+}
+
+#[test]
+fn every_wal_torn_tail_recovers_the_exact_complete_atomic_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("oracle.wal");
+    let mut writer = WalWriter::create(&wal_path, 64 * 1024).unwrap();
+    let batches = [
+        batch(&[(b"a-1", b"value-a-1"), (b"a-2", b"value-a-2")]),
+        batch(&[
+            (b"b-1", b"value-b-1"),
+            (b"b-2", b"value-b-2"),
+            (b"b-3", b"value-b-3"),
+        ]),
+        batch(&[(b"c-1", b"value-c-1"), (b"c-2", b"value-c-2")]),
+    ];
+    let mut complete_ends = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        writer
+            .append(
+                u64::try_from(index + 1).unwrap(),
+                batch,
+                Durability::Buffered,
+            )
+            .unwrap();
+        complete_ends.push(std::fs::metadata(&wal_path).unwrap().len());
+    }
+    drop(writer);
+    let complete = std::fs::read(&wal_path).unwrap();
+
+    for truncated_at in 0..=complete.len() {
+        let candidate = dir.path().join("candidate.wal");
+        std::fs::write(&candidate, &complete[..truncated_at]).unwrap();
+        let recovered = replay_wal(&candidate, 64 * 1024).unwrap();
+        let expected_len = complete_ends
+            .iter()
+            .take_while(|&&end| end <= u64::try_from(truncated_at).unwrap())
+            .count();
+        assert_eq!(
+            recovered.len(),
+            expected_len,
+            "truncation at byte {truncated_at}"
+        );
+        for (actual, expected) in recovered.iter().zip(&batches) {
+            assert_eq!(&actual.batch, expected, "truncation at byte {truncated_at}");
+        }
+    }
+}
+
+fn batch(entries: &[(&[u8], &[u8])]) -> WriteBatch {
+    let mut batch = WriteBatch::default();
+    for (key, value) in entries {
+        batch.put(key, value);
+    }
+    batch
 }
 
 fn create_database(path: &Path) {

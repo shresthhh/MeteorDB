@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-use meteordb::{Engine, Error, FaultEvent, FaultOperation, FaultyFs, Options, WriteBatch};
+use meteordb::{
+    Durability, DurableFs, Engine, Error, FaultEvent, FaultOperation, FaultyFs, Options, WriteBatch,
+};
 
 fn options(path: &Path) -> Options {
     let mut options = Options::new(path);
@@ -50,6 +52,93 @@ fn faulty_fs_records_and_fails_the_selected_durable_operation() {
         Err(error) => error,
     };
     assert!(error.to_string().contains("injected crash"));
+}
+
+#[test]
+fn explicit_crash_loses_buffered_writes_without_a_successful_sync() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FaultyFs::recording());
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = usize::MAX;
+    let db = Engine::open_with_fs(configured, fs.clone()).unwrap();
+
+    db.put(b"buffered", b"lost").unwrap();
+    fs.crash().unwrap();
+    drop(db);
+
+    let reopened = Engine::open(options(dir.path())).unwrap();
+    assert_eq!(reopened.get(b"buffered").unwrap(), None);
+}
+
+#[test]
+fn explicit_crash_preserves_acknowledged_synchronous_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FaultyFs::recording());
+    let mut configured = options(dir.path());
+    configured.memtable_bytes = usize::MAX;
+    let db = Engine::open_with_fs(configured, fs.clone()).unwrap();
+
+    db.put(b"synced", b"preserved").unwrap();
+    fs.crash().unwrap();
+    drop(db);
+
+    let reopened = Engine::open(options(dir.path())).unwrap();
+    assert_eq!(
+        reopened.get(b"synced").unwrap().as_deref(),
+        Some(&b"preserved"[..])
+    );
+}
+
+#[test]
+fn explicit_crash_discards_unsynced_truncation_and_rename() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = FaultyFs::recording();
+    let data = dir.path().join("data");
+    let mut file = fs.create(&data).unwrap();
+    file.write_all(b"durable-data").unwrap();
+    file.sync_all().unwrap();
+    fs.sync_directory(dir.path()).unwrap();
+    drop(file);
+
+    fs.truncate_file(&data, 3).unwrap();
+    fs.crash().unwrap();
+    assert_eq!(std::fs::read(&data).unwrap(), b"durable-data");
+
+    let replacement = dir.path().join("replacement");
+    let mut file = fs.create(&replacement).unwrap();
+    file.write_all(b"replacement-data").unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    fs.atomic_replace(&replacement, &data).unwrap();
+    fs.crash().unwrap();
+
+    assert_eq!(std::fs::read(&data).unwrap(), b"durable-data");
+    assert!(!replacement.exists());
+}
+
+#[test]
+fn corrupt_interrupted_bootstrap_manifest_does_not_publish_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(options(dir.path())).unwrap();
+    drop(db);
+    std::fs::remove_file(dir.path().join("CURRENT")).unwrap();
+    let manifest = dir.path().join("MANIFEST-000001");
+    let mut bytes = std::fs::read(&manifest).unwrap();
+    let corrupt_at = bytes.len() / 2;
+    bytes[corrupt_at] ^= 0x80;
+    std::fs::write(&manifest, bytes).unwrap();
+
+    let error = match Engine::open(options(dir.path())) {
+        Ok(_) => panic!("corrupt interrupted bootstrap unexpectedly opened"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        Error::Corruption { .. } | Error::UnsupportedFormat { .. }
+    ));
+    assert!(!dir.path().join("CURRENT").exists());
 }
 
 #[test]

@@ -1,5 +1,35 @@
 # Task 16 Report: Reliability Validation
 
+## Review follow-up
+
+All six Task 16 review findings are addressed:
+
+1. `FaultyFs` now keeps separate volatile, file-synchronized, and durable
+   images. A simulated crash restores only file contents covered by successful
+   file syncs and names/removals covered by later successful directory syncs.
+   The crash matrix uses that oracle, and focused tests prove loss of buffered
+   writes and unsynchronized truncation/rename state while preserving a
+   synchronously acknowledged write.
+2. Reader-version registration performs bounded cleanup whenever the weak
+   registry reaches 64 entries. A 10,000-read regression inspects the private
+   registry and verifies dead leases remain bounded without requiring
+   compaction.
+3. Missing-`CURRENT` bootstrap recovery now fully replays the installed initial
+   manifest, validates counters, file-number history, version edits, referenced
+   files, and the absence of a torn tail before publishing `CURRENT`.
+   Checksum corruption returns typed corruption and leaves `CURRENT` absent;
+   the crash matrix continues to cover valid interrupted publication.
+4. The reference model assigns one sequence to every atomic batch. It compares
+   `Snapshot::sequence()` with the model and includes a same-key
+   put/delete/put batch with before/after snapshot visibility checks.
+5. The WAL torn-tail regression writes distinguishable multi-operation batches
+   and truncates at every byte offset, requiring replay to equal the exact
+   complete atomic prefix.
+6. `.github/workflows/fuzz-smoke.yml` uses nightly Rust and cargo-fuzz 0.12.0
+   to build and smoke each of the four targets in a matrix. Every run has
+   `-max_len=65536`, `-runs=10000`, `-max_total_time=15`, and a ten-minute job
+   timeout. Path filters keep the normal workspace test workflow unaffected.
+
 ## Test strategy
 
 ### Reference MVCC/TTL model
@@ -33,9 +63,11 @@ cargo test -p meteordb --test engine_model -- --nocapture
 
 `FaultyFs` records a one-based sequence of write, file-sync, path-sync,
 atomic-install, atomic-replace, directory-sync, truncate, and remove
-operations. The crash suite first records a complete workload, then reruns it
-from an empty directory with an injected I/O failure immediately before every
-recorded operation. Each run discards the failed engine and reopens normally.
+operations. It separately tracks volatile bytes, file-synchronized bytes, and
+directory-synchronized durable names. The crash suite first records a complete
+workload, then reruns it from an empty directory with an injected crash
+immediately before every recorded operation. Each crash restores the durable
+image before the failed engine is discarded and reopened normally.
 
 Assertions require:
 
@@ -94,10 +126,13 @@ bounded retained metadata, and composite/internal-key decoding. It is not a
 member of the normal workspace, so normal tests do not require nightly Rust or
 libFuzzer.
 
-Default ASan fuzzing could not link on this host because it has no system C++
-development toolchain. Bounded coverage-guided smoke runs therefore used
-nightly Rust, cargo-fuzz 0.12.0, the locally installed compiler, and
-`--sanitizer none`; all four completed 10-second budgets:
+CI now builds and bounded-smoke-runs every target on `ubuntu-latest` with
+nightly Rust, cargo-fuzz 0.12.0, the default sanitizer, a 65,536-byte maximum
+input, 10,000-run maximum, 15-second maximum, and ten-minute job timeout.
+
+This host still has no C++ compiler, so a fresh local cargo-fuzz build stops in
+`libfuzzer-sys` before target compilation. Earlier Task 16 bounded runs used
+nightly Rust and `--sanitizer none`; all four completed 10-second budgets:
 
 ```bash
 cargo +nightly fuzz run wal_decode --sanitizer none -- -max_total_time=10
@@ -144,12 +179,14 @@ cargo test --workspace
 git diff --check
 ```
 
-All five gates passed after the final reader-lifetime refactor.
+All five gates passed after the review fixes, including the updated crash,
+model, corruption, and reader-lease regressions.
 
 ## Concerns
 
 - CURRENT replacement remains untestable until manifest rotation exists;
   initial CURRENT installation is fully crash-injected.
-- The smoke fuzz runs exercised libFuzzer coverage but not ASan. Run the brief's
-  original commands on a host with nightly Rust and a complete C/C++ toolchain
-  before release.
+- Fresh local fuzz build/smoke validation is blocked because this host has no
+  `c++`, `g++`, or `clang++`. The new GitHub Actions matrix provides the
+  sanitizer-enabled build and bounded smoke gate on a complete hosted
+  toolchain.
