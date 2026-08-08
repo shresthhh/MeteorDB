@@ -90,13 +90,20 @@ impl FeatureRecord {
 
     /// Adds or replaces a named value and returns this row for chaining.
     pub fn insert(&mut self, name: impl AsRef<[u8]>, value: FeatureValue) -> Result<&mut Self> {
-        validate_feature(name.as_ref(), &value)?;
-        if !self.features.contains_key(name.as_ref()) && self.features.len() >= MAX_FEATURE_COUNT {
+        let name = name.as_ref();
+        validate_feature(name, &value)?;
+        if !self.features.contains_key(name) && self.features.len() >= MAX_FEATURE_COUNT {
             return Err(Error::InvalidArgument(format!(
                 "feature count exceeds the {MAX_FEATURE_COUNT} limit"
             )));
         }
-        self.features.insert(name.as_ref().to_vec(), value);
+        let projected_size = projected_record_encoded_upper_bound(self, name, &value)?;
+        if projected_size > MAX_FEATURE_VALUE_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "encoded feature row may require {projected_size} bytes, exceeding the {MAX_FEATURE_VALUE_BYTES} limit"
+            )));
+        }
+        self.features.insert(name.to_vec(), value);
         Ok(self)
     }
 
@@ -173,8 +180,12 @@ impl FeatureStore {
         entity_id: impl AsRef<[u8]>,
         feature_group: impl AsRef<[u8]>,
     ) -> Result<Option<(FeatureKey, FeatureRecord)>> {
-        self.scan_group(entity_type, entity_id, feature_group)
-            .map(|rows| rows.into_iter().last())
+        self.newest_in_range(
+            entity_type.as_ref(),
+            entity_id.as_ref(),
+            feature_group.as_ref(),
+            i64::MIN..=i64::MAX,
+        )
     }
 
     /// Returns the newest live row whose event time is at most `event_time`.
@@ -185,34 +196,81 @@ impl FeatureStore {
         feature_group: impl AsRef<[u8]>,
         event_time: i64,
     ) -> Result<Option<(FeatureKey, FeatureRecord)>> {
-        self.history(entity_type, entity_id, feature_group, i64::MIN..=event_time)
-            .map(|rows| rows.into_iter().last())
+        self.newest_in_range(
+            entity_type.as_ref(),
+            entity_id.as_ref(),
+            feature_group.as_ref(),
+            i64::MIN..=event_time,
+        )
     }
 
-    /// Scans all live versions in one entity's feature group chronologically.
+    /// Scans at most `limit` live versions in one entity's feature group chronologically.
     pub fn scan_group(
         &self,
         entity_type: impl AsRef<[u8]>,
         entity_id: impl AsRef<[u8]>,
         feature_group: impl AsRef<[u8]>,
+        limit: usize,
     ) -> Result<Vec<(FeatureKey, FeatureRecord)>> {
-        self.history(entity_type, entity_id, feature_group, i64::MIN..=i64::MAX)
+        self.history(
+            entity_type,
+            entity_id,
+            feature_group,
+            i64::MIN..=i64::MAX,
+            limit,
+        )
     }
 
-    /// Scans an inclusive event-time range in chronological order.
+    /// Scans at most `limit` rows in an inclusive event-time range chronologically.
     pub fn history(
         &self,
         entity_type: impl AsRef<[u8]>,
         entity_id: impl AsRef<[u8]>,
         feature_group: impl AsRef<[u8]>,
         event_times: RangeInclusive<i64>,
+        limit: usize,
     ) -> Result<Vec<(FeatureKey, FeatureRecord)>> {
-        if event_times.is_empty() {
+        if event_times.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
         let entity_type = entity_type.as_ref();
         let entity_id = entity_id.as_ref();
         let feature_group = feature_group.as_ref();
+        self.scan_range(entity_type, entity_id, feature_group, event_times, limit)?
+            .map(|entry| self.decode_history_entry(entity_type, entity_id, feature_group, entry?))
+            .collect()
+    }
+
+    fn newest_in_range(
+        &self,
+        entity_type: &[u8],
+        entity_id: &[u8],
+        feature_group: &[u8],
+        event_times: RangeInclusive<i64>,
+    ) -> Result<Option<(FeatureKey, FeatureRecord)>> {
+        let mut newest = None;
+        for entry in self.scan_range(
+            entity_type,
+            entity_id,
+            feature_group,
+            event_times,
+            usize::MAX,
+        )? {
+            newest = Some(entry?);
+        }
+        newest
+            .map(|entry| self.decode_history_entry(entity_type, entity_id, feature_group, entry))
+            .transpose()
+    }
+
+    fn scan_range(
+        &self,
+        entity_type: &[u8],
+        entity_id: &[u8],
+        feature_group: &[u8],
+        event_times: RangeInclusive<i64>,
+        limit: usize,
+    ) -> Result<crate::KvIterator> {
         let prefix = self.encode_group_prefix(entity_type, entity_id, feature_group)?;
         let start_time = *event_times.start();
         let end_time = *event_times.end();
@@ -221,43 +279,48 @@ impl FeatureStore {
         let mut end = prefix;
         end.extend_from_slice(&encode_time(end_time));
 
-        self.engine
-            .scan(
-                ScanBounds::new(Bound::Included(start), Bound::Included(end)),
-                usize::MAX,
-            )?
-            .map(|entry| {
-                let (encoded_key, encoded_record) = entry?;
-                let expected_key_len = KEY_PREFIX.len()
-                    + 1
-                    + escaped_len(&self.namespace)
-                    + escaped_len(entity_type)
-                    + escaped_len(entity_id)
-                    + escaped_len(feature_group)
-                    + 8;
-                if encoded_key.len() != expected_key_len {
-                    return Err(Error::Corruption {
-                        context: "feature-store key",
-                        detail: format!(
-                            "expected {expected_key_len} bytes, got {}",
-                            encoded_key.len()
-                        ),
-                    });
-                }
-                let time_bytes: [u8; 8] = encoded_key[encoded_key.len() - 8..]
-                    .try_into()
-                    .expect("feature keys always end in an eight-byte time");
-                Ok((
-                    FeatureKey::new(
-                        entity_type,
-                        entity_id,
-                        feature_group,
-                        decode_time(time_bytes),
-                    ),
-                    decode_record(&encoded_record)?,
-                ))
-            })
-            .collect()
+        self.engine.scan(
+            ScanBounds::new(Bound::Included(start), Bound::Included(end)),
+            limit,
+        )
+    }
+
+    fn decode_history_entry(
+        &self,
+        entity_type: &[u8],
+        entity_id: &[u8],
+        feature_group: &[u8],
+        entry: (Vec<u8>, Vec<u8>),
+    ) -> Result<(FeatureKey, FeatureRecord)> {
+        let (encoded_key, encoded_record) = entry;
+        let expected_key_len = KEY_PREFIX.len()
+            + 1
+            + escaped_len(&self.namespace)
+            + escaped_len(entity_type)
+            + escaped_len(entity_id)
+            + escaped_len(feature_group)
+            + 8;
+        if encoded_key.len() != expected_key_len {
+            return Err(Error::Corruption {
+                context: "feature-store key",
+                detail: format!(
+                    "expected {expected_key_len} bytes, got {}",
+                    encoded_key.len()
+                ),
+            });
+        }
+        let time_bytes: [u8; 8] = encoded_key[encoded_key.len() - 8..]
+            .try_into()
+            .expect("feature keys always end in an eight-byte time");
+        Ok((
+            FeatureKey::new(
+                entity_type,
+                entity_id,
+                feature_group,
+                decode_time(time_bytes),
+            ),
+            decode_record(&encoded_record)?,
+        ))
     }
 
     fn encode_key(&self, key: &FeatureKey) -> Result<Vec<u8>> {
@@ -342,7 +405,90 @@ fn validate_record(record: &FeatureRecord) -> Result<()> {
     for (name, value) in &record.features {
         validate_feature(name, value)?;
     }
+    let encoded_upper_bound = record_encoded_upper_bound(record)?;
+    if encoded_upper_bound > MAX_FEATURE_VALUE_BYTES {
+        return Err(Error::InvalidArgument(format!(
+            "encoded feature row may require {encoded_upper_bound} bytes, exceeding the {MAX_FEATURE_VALUE_BYTES} limit"
+        )));
+    }
     Ok(())
+}
+
+fn projected_record_encoded_upper_bound(
+    record: &FeatureRecord,
+    inserted_name: &[u8],
+    inserted_value: &FeatureValue,
+) -> Result<usize> {
+    let replacing = record.features.contains_key(inserted_name);
+    let feature_count = record
+        .features
+        .len()
+        .checked_add(usize::from(!replacing))
+        .ok_or_else(|| Error::InvalidArgument("feature count overflow".into()))?;
+    let mut size = postcard_varint_len(feature_count);
+    for (name, value) in &record.features {
+        size = checked_feature_size_add(
+            size,
+            name,
+            if name.as_slice() == inserted_name {
+                inserted_value
+            } else {
+                value
+            },
+        )?;
+    }
+    if !replacing {
+        size = checked_feature_size_add(size, inserted_name, inserted_value)?;
+    }
+    Ok(size)
+}
+
+fn record_encoded_upper_bound(record: &FeatureRecord) -> Result<usize> {
+    let mut size = postcard_varint_len(record.features.len());
+    for (name, value) in &record.features {
+        size = checked_feature_size_add(size, name, value)?;
+    }
+    Ok(size)
+}
+
+fn checked_feature_size_add(current: usize, name: &[u8], value: &FeatureValue) -> Result<usize> {
+    let value_size = feature_value_encoded_upper_bound(value)?;
+    current
+        .checked_add(postcard_varint_len(name.len()))
+        .and_then(|size| size.checked_add(name.len()))
+        .and_then(|size| size.checked_add(1))
+        .and_then(|size| size.checked_add(value_size))
+        .ok_or_else(|| Error::InvalidArgument("encoded feature row size overflow".into()))
+}
+
+fn feature_value_encoded_upper_bound(value: &FeatureValue) -> Result<usize> {
+    let fixed_size = match value {
+        FeatureValue::Null => Some(0),
+        FeatureValue::Bool(_) => Some(1),
+        FeatureValue::I64(_) => Some(10),
+        FeatureValue::F64(_) => Some(8),
+        FeatureValue::Bytes(_) | FeatureValue::String(_) => None,
+    };
+    if let Some(size) = fixed_size {
+        return Ok(size);
+    }
+    let length = match value {
+        FeatureValue::Bytes(value) => value.len(),
+        FeatureValue::String(value) => value.len(),
+        _ => unreachable!("fixed-size variants returned above"),
+    };
+    postcard_varint_len(length)
+        .checked_add(length)
+        .ok_or_else(|| Error::InvalidArgument("encoded feature row size overflow".into()))
+}
+
+fn postcard_varint_len(mut value: usize) -> usize {
+    let mut bytes = 1;
+    while value >= 0x80 {
+        value >>= 7;
+        bytes += 1;
+    }
+    bytes
 }
 
 fn validate_feature(name: &[u8], value: &FeatureValue) -> Result<()> {

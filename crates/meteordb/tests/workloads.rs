@@ -532,7 +532,16 @@ fn feature_store_latest_as_of_and_history_follow_signed_event_time() {
     );
     assert_eq!(
         store
-            .history(b"user", b"42", b"ranking", -10..=0)
+            .history(b"user", b"42", b"ranking", -10..=0, 10)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.event_time())
+            .collect::<Vec<_>>(),
+        vec![-10, 0]
+    );
+    assert_eq!(
+        store
+            .history(b"user", b"42", b"ranking", i64::MIN..=i64::MAX, 2)
             .unwrap()
             .into_iter()
             .map(|(key, _)| key.event_time())
@@ -555,7 +564,7 @@ fn feature_store_group_scan_and_batch_read_use_complete_atomic_rows() {
         .put(&second, &feature_record(2.0, b"second"), None)
         .unwrap();
 
-    let rows = store.scan_group(b"user", b"1", b"profile").unwrap();
+    let rows = store.scan_group(b"user", b"1", b"profile", 10).unwrap();
     assert_eq!(
         rows.iter()
             .map(|(key, _)| key.event_time())
@@ -599,6 +608,24 @@ fn feature_store_ttl_and_typed_encoding_are_validated() {
 }
 
 #[test]
+fn feature_record_rejects_projected_aggregate_over_encoded_limit_before_mutation() {
+    let mut record = FeatureRecord::new();
+    record
+        .insert(b"first", FeatureValue::Bytes(vec![0; 8 * 1024 * 1024]))
+        .unwrap();
+
+    assert!(matches!(
+        record.insert(b"second", FeatureValue::Bytes(vec![0; 8 * 1024 * 1024])),
+        Err(Error::InvalidArgument(message)) if message.contains("encoded feature row")
+    ));
+    assert!(record.get(b"second").is_none());
+    assert!(matches!(
+        record.get(b"first"),
+        Some(FeatureValue::Bytes(bytes)) if bytes.len() == 8 * 1024 * 1024
+    ));
+}
+
+#[test]
 fn embedding_validates_lengths_dimensions_finiteness_and_little_endian_bytes() {
     assert!(matches!(
         Embedding::from_bytes(0, ScalarType::F32, Vec::new()),
@@ -633,6 +660,28 @@ fn embedding_validates_lengths_dimensions_finiteness_and_little_endian_bytes() {
         embedding.to_f16_bits(),
         Err(Error::InvalidArgument(message)) if message.contains("F16")
     ));
+}
+
+#[test]
+fn embedding_metadata_replacement_checks_projected_total_before_mutation() {
+    let mut embedding = Embedding::from_f32(&[1.0]).unwrap();
+    for index in 0_u8..16 {
+        embedding
+            .insert_metadata([index], vec![0; 1024 * 1024 - 1])
+            .unwrap();
+    }
+
+    embedding
+        .insert_metadata([0], vec![1; 1024 * 1024 - 1])
+        .unwrap();
+    assert!(matches!(
+        embedding.insert_metadata([0], vec![2; 1024 * 1024]),
+        Err(Error::InvalidArgument(message)) if message.contains("metadata")
+    ));
+    assert_eq!(
+        embedding.metadata().get(&[0][..]).unwrap(),
+        &vec![1; 1024 * 1024 - 1]
+    );
 }
 
 #[test]

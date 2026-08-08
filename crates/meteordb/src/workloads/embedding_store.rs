@@ -150,16 +150,22 @@ impl Embedding {
         name: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
     ) -> Result<&mut Self> {
-        validate_metadata_component("metadata name", name.as_ref())?;
-        validate_metadata_component("metadata value", value.as_ref())?;
-        if !self.metadata.contains_key(name.as_ref()) && self.metadata.len() >= MAX_METADATA_ENTRIES
-        {
+        let name = name.as_ref();
+        let value = value.as_ref();
+        validate_metadata_component("metadata name", name)?;
+        validate_metadata_component("metadata value", value)?;
+        if !self.metadata.contains_key(name) && self.metadata.len() >= MAX_METADATA_ENTRIES {
             return Err(Error::InvalidArgument(format!(
                 "metadata entry count exceeds the {MAX_METADATA_ENTRIES} limit"
             )));
         }
-        self.metadata
-            .insert(name.as_ref().to_vec(), value.as_ref().to_vec());
+        let projected_size = projected_metadata_bytes(&self.metadata, name, value)?;
+        if projected_size > MAX_METADATA_TOTAL_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "embedding metadata is {projected_size} bytes, exceeding the {MAX_METADATA_TOTAL_BYTES} limit"
+            )));
+        }
+        self.metadata.insert(name.to_vec(), value.to_vec());
         Ok(self)
     }
 
@@ -414,21 +420,44 @@ fn validate_embedding(embedding: &Embedding) -> Result<()> {
             "embedding metadata has too many entries".into(),
         ));
     }
-    let mut metadata_bytes = 0usize;
     for (name, value) in &embedding.metadata {
         validate_metadata_component("metadata name", name)?;
         validate_metadata_component("metadata value", value)?;
-        metadata_bytes = metadata_bytes
-            .checked_add(name.len())
-            .and_then(|size| size.checked_add(value.len()))
-            .ok_or_else(|| Error::InvalidArgument("embedding metadata size overflow".into()))?;
     }
+    let metadata_bytes = metadata_bytes(&embedding.metadata)?;
     if metadata_bytes > MAX_METADATA_TOTAL_BYTES {
         return Err(Error::InvalidArgument(format!(
             "embedding metadata is {metadata_bytes} bytes, exceeding the {MAX_METADATA_TOTAL_BYTES} limit"
         )));
     }
     Ok(())
+}
+
+fn projected_metadata_bytes(
+    metadata: &BTreeMap<Vec<u8>, Vec<u8>>,
+    name: &[u8],
+    value: &[u8],
+) -> Result<usize> {
+    let current = metadata_bytes(metadata)?;
+    let without_replaced = match metadata.get(name) {
+        Some(previous) => current
+            .checked_sub(name.len())
+            .and_then(|size| size.checked_sub(previous.len()))
+            .ok_or_else(|| Error::InvalidArgument("embedding metadata size overflow".into()))?,
+        None => current,
+    };
+    without_replaced
+        .checked_add(name.len())
+        .and_then(|size| size.checked_add(value.len()))
+        .ok_or_else(|| Error::InvalidArgument("embedding metadata size overflow".into()))
+}
+
+fn metadata_bytes(metadata: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<usize> {
+    metadata.iter().try_fold(0usize, |size, (name, value)| {
+        size.checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+            .ok_or_else(|| Error::InvalidArgument("embedding metadata size overflow".into()))
+    })
 }
 
 fn validate_optional_identity(
