@@ -278,48 +278,48 @@ fn compaction_syncs_outputs_before_manifest_install_and_reclaims_inputs_afterwar
 }
 
 #[test]
-fn failed_output_sync_removes_temporary_sstables_and_allows_retry() {
+fn failed_output_sync_removes_temporary_sstables_and_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FailingCompactionFs::default());
     let db = compaction_database(dir.path(), fs.clone());
     let original_files = sstable_numbers(dir.path());
     fs.fail_next_temp_sync();
 
-    assert!(db.compact().is_err());
+    let stored = db.compact().unwrap_err().to_string();
     assert_eq!(sstable_numbers(dir.path()), original_files);
     assert!(temporary_sstable_numbers(dir.path()).is_empty());
 
-    assert!(db.compact().unwrap());
+    assert_eq!(db.compact().unwrap_err().to_string(), stored);
 }
 
 #[test]
-fn failed_manifest_file_sync_removes_unpublished_outputs_and_allows_retry() {
+fn failed_manifest_file_sync_removes_unpublished_outputs_and_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FailingCompactionFs::default());
     let db = compaction_database(dir.path(), fs.clone());
     let original_files = sstable_numbers(dir.path());
     fs.fail_next_manifest_sstable_sync();
 
-    assert!(db.compact().is_err());
+    let stored = db.compact().unwrap_err().to_string();
     assert_eq!(sstable_numbers(dir.path()), original_files);
     assert!(temporary_sstable_numbers(dir.path()).is_empty());
 
-    assert!(db.compact().unwrap());
+    assert_eq!(db.compact().unwrap_err().to_string(), stored);
 }
 
 #[test]
-fn partial_atomic_install_removes_unpublished_destination_and_allows_retry() {
+fn partial_atomic_install_removes_unpublished_destination_and_is_terminal() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FailingCompactionFs::default());
     let db = compaction_database(dir.path(), fs.clone());
     let original_files = sstable_numbers(dir.path());
     fs.fail_next_atomic_install_after_link();
 
-    assert!(db.compact().is_err());
+    let stored = db.compact().unwrap_err().to_string();
     assert_eq!(sstable_numbers(dir.path()), original_files);
     assert!(temporary_sstable_numbers(dir.path()).is_empty());
 
-    assert!(db.compact().unwrap());
+    assert_eq!(db.compact().unwrap_err().to_string(), stored);
 }
 
 #[test]

@@ -27,6 +27,7 @@ pub struct Engine {
 struct EngineInner {
     options: Options,
     fs: Arc<dyn DurableFs>,
+    clock: Arc<dyn Clock>,
     write_state: Mutex<WriteState>,
     background: Arc<BackgroundSignal>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -112,11 +113,29 @@ impl TerminalFailure {
 impl Engine {
     /// Opens or recovers an engine using the operating system's durable filesystem.
     pub fn open(options: Options) -> Result<Self> {
-        Self::open_with_fs(options, Arc::new(OsDurableFs))
+        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
     }
 
     /// Opens or recovers an engine with injectable crash-sensitive filesystem operations.
     pub fn open_with_fs(options: Options, fs: Arc<dyn DurableFs>) -> Result<Self> {
+        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock))
+    }
+
+    /// Opens or recovers an engine with an injectable wall clock.
+    ///
+    /// The clock controls TTL deadline creation and expiration checks. MVCC
+    /// snapshots still freeze only their sequence number; they do not freeze
+    /// wall-clock time.
+    pub fn open_with_clock(options: Options, clock: Arc<dyn Clock>) -> Result<Self> {
+        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), clock)
+    }
+
+    /// Opens or recovers an engine with injectable filesystem and wall-clock operations.
+    pub fn open_with_fs_and_clock(
+        options: Options,
+        fs: Arc<dyn DurableFs>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         options.validate()?;
         std::fs::create_dir_all(&options.path).map_err(|source| Error::Io {
             operation: "create database directory",
@@ -270,6 +289,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 options,
                 fs,
+                clock,
                 write_state: Mutex::new(WriteState {
                     versions,
                     wal,
@@ -311,6 +331,32 @@ impl Engine {
     pub fn put(&self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Result<()> {
         let mut batch = WriteBatch::default();
         batch.put(key, value);
+        self.write(batch)
+    }
+
+    /// Stores `value` under `key` until `ttl_ms` wall-clock milliseconds elapse.
+    ///
+    /// The duration is converted once, at write time, to a persisted absolute
+    /// Unix-millisecond deadline. Zero is valid and makes the new version
+    /// immediately invisible. Negative durations and deadlines beyond
+    /// [`u64::MAX`] are rejected without writing.
+    pub fn put_with_ttl(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_ms: i64,
+    ) -> Result<()> {
+        ensure_writable(&self.lock_state())?;
+        let ttl_ms = u64::try_from(ttl_ms)
+            .map_err(|_| Error::InvalidArgument("ttl_ms must not be negative".into()))?;
+        let expires_at_unix_ms = self
+            .inner
+            .clock
+            .now_unix_ms()
+            .checked_add(ttl_ms)
+            .ok_or_else(|| Error::InvalidArgument("TTL expiration timestamp overflow".into()))?;
+        let mut batch = WriteBatch::default();
+        batch.put_with_expiration(key, value, Some(expires_at_unix_ms));
         self.write(batch)
     }
 
@@ -363,16 +409,16 @@ impl Engine {
     /// Returns the current value for `key`, or `None` for absence or deletion.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let key = key.as_ref();
+        let state = self.lock_state();
+        ensure_readable(&state)?;
         validate_length(
             "key",
             key.len(),
             "max_key_bytes",
             self.inner.options.max_key_bytes,
         )?;
-        let read_time_unix_ms = SystemClock.now_unix_ms();
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
         self.inner.read_stats.record_point_read();
-        let state = self.lock_state();
-        ensure_readable(&state)?;
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
         self.run_implicit_read_sequence_hook();
         let _guard = self.inner.snapshots.acquire(sequence);
@@ -389,6 +435,7 @@ impl Engine {
     /// Scans visible keys beginning with `prefix` in ascending byte order.
     pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>, limit: usize) -> Result<KvIterator> {
         let prefix = prefix.as_ref();
+        ensure_readable(&self.lock_state())?;
         validate_length(
             "prefix",
             prefix.len(),
@@ -488,6 +535,17 @@ impl Engine {
     }
 
     pub(crate) fn execute_compaction_plan(&self, plan: crate::CompactionPlan) -> Result<()> {
+        let result = self.execute_compaction_plan_inner(plan);
+        if let Err(error) = result {
+            let mut state = self.lock_state();
+            let error = record_background_failure(&mut state, error);
+            self.inner.background.wake_all();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn execute_compaction_plan_inner(&self, plan: crate::CompactionPlan) -> Result<()> {
         let mut state = self.lock_state();
         ensure_writable(&state)?;
         if !state.immutables.is_empty() || state.flush_running {
@@ -507,6 +565,7 @@ impl Engine {
                 read_stats: self.inner.read_stats.clone(),
                 version: &old_version,
                 oldest_active_snapshot: self.inner.snapshots.oldest_active(),
+                read_time_unix_ms: self.inner.clock.now_unix_ms(),
                 next_file_number: state.next_file_number,
             },
         )?;
@@ -603,16 +662,16 @@ impl Engine {
     fn run_implicit_read_sequence_hook(&self) {}
 
     fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
+        let state = self.lock_state();
+        ensure_readable(&state)?;
         validate_length(
             "key",
             key.len(),
             "max_key_bytes",
             self.inner.options.max_key_bytes,
         )?;
-        let read_time_unix_ms = SystemClock.now_unix_ms();
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
         self.inner.read_stats.record_point_read();
-        let state = self.lock_state();
-        ensure_readable(&state)?;
         self.get_from_state(key, sequence, read_time_unix_ms, state)
     }
 
@@ -665,14 +724,15 @@ impl Engine {
     }
 
     fn scan_current(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        let state = self.lock_state();
+        ensure_no_background_failure(&state)?;
         validate_scan_bounds(&self.inner.options, &bounds)?;
-        let read_time_unix_ms = SystemClock.now_unix_ms();
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
         if limit == 0 {
             let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
             return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
         }
-        let state = self.lock_state();
-        ensure_readable(&state)?;
+        ensure_open(&state)?;
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
         self.run_implicit_read_sequence_hook();
         let guard = self.inner.snapshots.acquire(sequence);
@@ -685,13 +745,14 @@ impl Engine {
         limit: usize,
         sequence: SequenceNumber,
     ) -> Result<KvIterator> {
+        let state = self.lock_state();
+        ensure_no_background_failure(&state)?;
         validate_scan_bounds(&self.inner.options, &bounds)?;
-        let read_time_unix_ms = SystemClock.now_unix_ms();
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
         if limit == 0 {
             return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
         }
-        let state = self.lock_state();
-        ensure_readable(&state)?;
+        ensure_open(&state)?;
         let guard = self.inner.snapshots.acquire(sequence);
         self.scan_from_state(bounds, limit, sequence, read_time_unix_ms, state, guard)
     }
@@ -1279,6 +1340,11 @@ fn ensure_writable(state: &WriteState) -> Result<()> {
 }
 
 fn ensure_readable(state: &WriteState) -> Result<()> {
+    ensure_no_background_failure(state)?;
+    ensure_open(state)
+}
+
+fn ensure_no_background_failure(state: &WriteState) -> Result<()> {
     if state.background_failure {
         Err(state
             .terminal_failure
@@ -1286,11 +1352,14 @@ fn ensure_readable(state: &WriteState) -> Result<()> {
             .expect("a background failure stores its diagnostic")
             .to_error())
     } else {
-        ensure_open(state)
+        Ok(())
     }
 }
 
 fn record_terminal_failure(state: &mut WriteState, error: Error) -> Error {
+    if let Some(failure) = &state.terminal_failure {
+        return failure.to_error();
+    }
     let failure = TerminalFailure::from_error(error);
     let returned = failure.to_error();
     state.terminal_failure = Some(failure);

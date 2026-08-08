@@ -1,3 +1,5 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Supplies wall-clock Unix time for expiration decisions.
@@ -28,5 +30,35 @@ impl Clock for SystemClock {
             .unwrap_or_default()
             .as_millis();
         u64::try_from(milliseconds).unwrap_or(u64::MAX)
+    }
+}
+
+/// A deterministic wall clock whose Unix-millisecond value tests can replace.
+///
+/// Clones share one atomic value, so an engine can own one clone while a test
+/// advances another. This clock models wall-clock time, not MVCC sequence time:
+/// snapshots freeze a sequence number but consult the clock again on each read.
+#[derive(Clone, Debug)]
+pub struct ManualClock {
+    now_unix_ms: Arc<AtomicU64>,
+}
+
+impl ManualClock {
+    /// Creates a clock fixed initially at `now_unix_ms`.
+    pub fn new(now_unix_ms: u64) -> Self {
+        Self {
+            now_unix_ms: Arc::new(AtomicU64::new(now_unix_ms)),
+        }
+    }
+
+    /// Replaces the wall-clock value returned by [`Clock::now_unix_ms`].
+    pub fn set(&self, now_unix_ms: u64) {
+        self.now_unix_ms.store(now_unix_ms, Ordering::Release);
+    }
+}
+
+impl Clock for ManualClock {
+    fn now_unix_ms(&self) -> u64 {
+        self.now_unix_ms.load(Ordering::Acquire)
     }
 }

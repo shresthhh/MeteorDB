@@ -29,7 +29,7 @@ mod wal;
 pub use batch::{WriteBatch, WriteOp};
 pub use bloom::BloomFilter;
 pub use cache::{BlockCache, BlockKind, CachePartition, CachePartitionSnapshot, CacheSnapshot};
-pub use clock::{Clock, SystemClock};
+pub use clock::{Clock, ManualClock, SystemClock};
 pub use compaction::{
     CompactionJob, CompactionPicker, CompactionPlan, DEFAULT_L0_COMPACTION_TRIGGER,
 };

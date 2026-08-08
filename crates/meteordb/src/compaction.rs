@@ -5,7 +5,7 @@ use crate::iter::{ChildIterator, InternalEntry, InternalMergingIterator, disk_en
 use crate::stats::ReadStats;
 use crate::{
     BlockCache, DurableFs, Error, FileMeta, NUM_LEVELS, Options, Result, SequenceNumber,
-    TableBuilder, TableReader, TableReaderOptions, ValueKind, Version,
+    TableBuilder, TableReader, TableReaderOptions, ValueKind, ValueRecord, Version,
 };
 
 /// Default number of level-zero files tolerated before compaction is selected.
@@ -206,6 +206,7 @@ pub(crate) struct CompactionContext<'a> {
     pub(crate) read_stats: Arc<ReadStats>,
     pub(crate) version: &'a Version,
     pub(crate) oldest_active_snapshot: Option<SequenceNumber>,
+    pub(crate) read_time_unix_ms: u64,
     pub(crate) next_file_number: u64,
 }
 
@@ -253,6 +254,7 @@ pub(crate) fn run(
             std::mem::take(&mut pending),
             context.oldest_active_snapshot,
             key_may_exist_below(context.version, plan.output_level, &user_key),
+            context.read_time_unix_ms,
         );
         if retained.is_empty() {
             continue;
@@ -304,10 +306,28 @@ pub(crate) fn run(
 }
 
 fn retain_versions(
-    entries: Vec<InternalEntry>,
+    mut entries: Vec<InternalEntry>,
     oldest_snapshot: Option<SequenceNumber>,
     key_may_exist_below: bool,
+    read_time_unix_ms: u64,
 ) -> Vec<InternalEntry> {
+    for entry in &mut entries {
+        if matches!(
+            entry.record,
+            ValueRecord::Value {
+                expires_at_unix_ms: Some(expires),
+                ..
+            } if expires <= read_time_unix_ms
+        ) {
+            entry.key = crate::InternalKey::try_new(
+                entry.key.user_key(),
+                entry.key.sequence(),
+                ValueKind::Deletion,
+            )
+            .expect("an existing internal key remains valid when changed to a tombstone");
+            entry.record = ValueRecord::Tombstone;
+        }
+    }
     let mut retained = Vec::new();
     let mut kept_snapshot_base = false;
     for entry in entries {
