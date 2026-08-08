@@ -73,63 +73,20 @@ impl PartialOrd for HeapEntry {
     }
 }
 
-/// Lazy merged iterator yielding visible `(user_key, value)` pairs in key order.
-///
-/// Each item can fail because SSTable data blocks are checksummed and decoded
-/// lazily. After yielding one error the iterator is exhausted.
-pub struct KvIterator {
+pub(crate) struct InternalMergingIterator {
     children: Vec<ChildIterator>,
     heap: BinaryHeap<HeapEntry>,
-    bounds: ScanBounds,
-    sequence: SequenceNumber,
-    read_time_unix_ms: u64,
-    remaining: usize,
     failed: bool,
     pending_error: Option<Error>,
-    _version: Option<Arc<Version>>,
-    _snapshot_guard: Option<SnapshotGuard>,
 }
 
-impl KvIterator {
-    pub(crate) fn empty(
-        bounds: ScanBounds,
-        sequence: SequenceNumber,
-        read_time_unix_ms: u64,
-    ) -> Self {
-        Self {
-            children: Vec::new(),
-            heap: BinaryHeap::new(),
-            bounds,
-            sequence,
-            read_time_unix_ms,
-            remaining: 0,
-            failed: false,
-            pending_error: None,
-            _version: None,
-            _snapshot_guard: None,
-        }
-    }
-
-    pub(crate) fn new(
-        children: Vec<ChildIterator>,
-        bounds: ScanBounds,
-        sequence: SequenceNumber,
-        read_time_unix_ms: u64,
-        limit: usize,
-        version: Arc<Version>,
-        snapshot_guard: SnapshotGuard,
-    ) -> Self {
+impl InternalMergingIterator {
+    pub(crate) fn new(children: Vec<ChildIterator>) -> Self {
         let mut iterator = Self {
             heap: BinaryHeap::new(),
             children,
-            bounds,
-            sequence,
-            read_time_unix_ms,
-            remaining: limit,
             failed: false,
             pending_error: None,
-            _version: Some(version),
-            _snapshot_guard: Some(snapshot_guard),
         };
         for child in 0..iterator.children.len() {
             if !iterator.advance_child(child) {
@@ -152,10 +109,85 @@ impl KvIterator {
             None => true,
         }
     }
+}
+
+impl Iterator for InternalMergingIterator {
+    type Item = Result<InternalEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.failed {
+            return None;
+        }
+        if let Some(error) = self.pending_error.take() {
+            self.failed = true;
+            self.heap.clear();
+            return Some(Err(error));
+        }
+        let next = self.heap.pop()?;
+        self.advance_child(next.child);
+        Some(Ok(next.entry))
+    }
+}
+
+/// Lazy merged iterator yielding visible `(user_key, value)` pairs in key order.
+///
+/// Each item can fail because SSTable data blocks are checksummed and decoded
+/// lazily. After yielding one error the iterator is exhausted.
+pub struct KvIterator {
+    merged: InternalMergingIterator,
+    bounds: ScanBounds,
+    sequence: SequenceNumber,
+    read_time_unix_ms: u64,
+    remaining: usize,
+    failed: bool,
+    pending: Option<InternalEntry>,
+    _version: Option<Arc<Version>>,
+    _snapshot_guard: Option<SnapshotGuard>,
+}
+
+impl KvIterator {
+    pub(crate) fn empty(
+        bounds: ScanBounds,
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+    ) -> Self {
+        Self {
+            merged: InternalMergingIterator::new(Vec::new()),
+            bounds,
+            sequence,
+            read_time_unix_ms,
+            remaining: 0,
+            failed: false,
+            pending: None,
+            _version: None,
+            _snapshot_guard: None,
+        }
+    }
+
+    pub(crate) fn new(
+        children: Vec<ChildIterator>,
+        bounds: ScanBounds,
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+        limit: usize,
+        version: Arc<Version>,
+        snapshot_guard: SnapshotGuard,
+    ) -> Self {
+        Self {
+            merged: InternalMergingIterator::new(children),
+            bounds,
+            sequence,
+            read_time_unix_ms,
+            remaining: limit,
+            failed: false,
+            pending: None,
+            _version: Some(version),
+            _snapshot_guard: Some(snapshot_guard),
+        }
+    }
 
     fn fail(&mut self, error: Error) -> Option<Result<(Vec<u8>, Vec<u8>)>> {
         self.failed = true;
-        self.heap.clear();
         Some(Err(error))
     }
 }
@@ -167,36 +199,25 @@ impl Iterator for KvIterator {
         if self.failed || self.remaining == 0 {
             return None;
         }
-        if let Some(error) = self.pending_error.take() {
-            return self.fail(error);
-        }
-
         loop {
-            let first = self.heap.pop()?;
-            let user_key = first.entry.key.user_key().to_vec();
+            let first = match self.pending.take().map(Ok).or_else(|| self.merged.next())? {
+                Ok(entry) => entry,
+                Err(error) => return self.fail(error),
+            };
+            let user_key = first.key.user_key().to_vec();
             let mut newest: Option<(SequenceNumber, ValueRecord)> = None;
-            consider_visible(&mut newest, first.entry, self.sequence);
-            if !self.advance_child(first.child) {
-                let error = self
-                    .pending_error
-                    .take()
-                    .expect("a failed child stores its error");
-                return self.fail(error);
-            }
-
-            while self
-                .heap
-                .peek()
-                .is_some_and(|entry| entry.entry.key.user_key() == user_key)
-            {
-                let next = self.heap.pop().expect("peeked heap entry exists");
-                consider_visible(&mut newest, next.entry, self.sequence);
-                if !self.advance_child(next.child) {
-                    let error = self
-                        .pending_error
-                        .take()
-                        .expect("a failed child stores its error");
-                    return self.fail(error);
+            consider_visible(&mut newest, first, self.sequence);
+            loop {
+                match self.merged.next() {
+                    Some(Ok(entry)) if entry.key.user_key() == user_key => {
+                        consider_visible(&mut newest, entry, self.sequence);
+                    }
+                    Some(Ok(entry)) => {
+                        self.pending = Some(entry);
+                        break;
+                    }
+                    Some(Err(error)) => return self.fail(error),
+                    None => break,
                 }
             }
 
@@ -204,7 +225,6 @@ impl Iterator for KvIterator {
                 continue;
             }
             if !upper_allows(&self.bounds, &user_key) {
-                self.heap.clear();
                 return None;
             }
 

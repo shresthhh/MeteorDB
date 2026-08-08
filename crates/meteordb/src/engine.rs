@@ -5,7 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
-use crate::background::BackgroundSignal;
+use crate::background::{BackgroundSignal, ObsoleteSstables};
+use crate::compaction::{CompactionContext, CompactionPicker, DEFAULT_L0_COMPACTION_TRIGGER};
 use crate::iter::{
     ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds, user_key_in_bounds,
 };
@@ -46,6 +47,7 @@ struct WriteState {
     next_file_number: u64,
     next_sequence: SequenceNumber,
     flush_running: bool,
+    obsolete_sstables: VecDeque<ObsoleteSstables>,
     closed: bool,
     terminal_failure: Option<TerminalFailure>,
     background_failure: bool,
@@ -275,6 +277,7 @@ impl Engine {
                         Error::InvalidArgument("sequence number space is exhausted".into())
                     })?,
                     flush_running: false,
+                    obsolete_sstables: VecDeque::new(),
                     closed: false,
                     terminal_failure: None,
                     background_failure: false,
@@ -430,6 +433,78 @@ impl Engine {
             ensure_writable(&state)?;
         }
         Ok(())
+    }
+
+    /// Runs one highest-priority leveled compaction, if any level is overfull.
+    ///
+    /// Outputs are synchronized before one manifest edit atomically publishes
+    /// them and removes all inputs. Input files remain on disk while a scan or
+    /// point read still retains the previous immutable version.
+    pub fn compact(&self) -> Result<bool> {
+        self.flush()?;
+        let plan = {
+            let mut state = self.lock_state();
+            ensure_writable(&state)?;
+            reclaim_obsolete_sstables(&self.inner, &mut state)?;
+            let level_base =
+                u64::try_from(self.inner.options.target_sstable_bytes).unwrap_or(u64::MAX);
+            CompactionPicker::new(DEFAULT_L0_COMPACTION_TRIGGER, level_base)
+                .pick(&state.versions.current())
+        };
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+        self.execute_compaction_plan(plan)?;
+        Ok(true)
+    }
+
+    pub(crate) fn execute_compaction_plan(&self, plan: crate::CompactionPlan) -> Result<()> {
+        let mut state = self.lock_state();
+        ensure_writable(&state)?;
+        if !state.immutables.is_empty() || state.flush_running {
+            return Err(Error::Background(
+                "cannot compact while a memtable flush is running".into(),
+            ));
+        }
+        let old_version = state.versions.current();
+        validate_compaction_plan(&plan, &old_version)?;
+        let output = crate::compaction::run(
+            &plan,
+            CompactionContext {
+                directory: &self.inner.options.path,
+                options: &self.inner.options,
+                fs: self.inner.fs.clone(),
+                block_cache: self.inner.block_cache.clone(),
+                read_stats: self.inner.read_stats.clone(),
+                version: &old_version,
+                oldest_active_snapshot: self.inner.snapshots.oldest_active(),
+                next_file_number: state.next_file_number,
+            },
+        )?;
+        let obsolete = plan
+            .input_files()
+            .iter()
+            .chain(plan.overlap_files())
+            .map(FileMeta::number)
+            .collect::<VecDeque<_>>();
+        let mut edit = VersionEdit::new();
+        for file in plan.input_files() {
+            edit.delete_file(plan.input_level(), file.number());
+        }
+        for file in plan.overlap_files() {
+            edit.delete_file(plan.output_level(), file.number());
+        }
+        for file in output.files {
+            edit.add_file(plan.output_level(), file);
+        }
+        edit.set_next_file_number(output.next_file_number);
+        state.versions.apply(edit)?;
+        state.next_file_number = output.next_file_number;
+        state.obsolete_sstables.push_back(ObsoleteSstables {
+            version: old_version,
+            files: obsolete,
+        });
+        reclaim_obsolete_sstables(&self.inner, &mut state)
     }
 
     /// Synchronizes every required WAL and closes this shared engine.
@@ -862,6 +937,75 @@ fn retire_obsolete_wals(inner: &EngineInner, state: &mut WriteState) -> Result<(
             .fs
             .sync_directory(&inner.options.path)
             .map_err(|source| io_error("sync WAL retirement", &inner.options.path, source))?;
+    }
+    Ok(())
+}
+
+fn validate_compaction_plan(plan: &crate::CompactionPlan, version: &crate::Version) -> Result<()> {
+    let inputs_are_live = plan
+        .input_files()
+        .iter()
+        .all(|input| version.files(plan.input_level()).contains(input));
+    let overlaps_are_live = plan
+        .overlap_files()
+        .iter()
+        .all(|input| version.files(plan.output_level()).contains(input));
+    if !inputs_are_live || !overlaps_are_live {
+        return Err(Error::InvalidArgument(
+            "compaction plan no longer matches the current version".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
+    let protected: BTreeSet<_> = state
+        .obsolete_sstables
+        .iter()
+        .filter(|obsolete| !obsolete.is_unreferenced())
+        .flat_map(|obsolete| {
+            (0..crate::NUM_LEVELS)
+                .flat_map(|level| obsolete.version.files(level).iter().map(FileMeta::number))
+        })
+        .collect();
+    let mut removed = false;
+    let mut retained = VecDeque::new();
+    while let Some(mut obsolete) = state.obsolete_sstables.pop_front() {
+        let mut still_protected = VecDeque::new();
+        while let Some(number) = obsolete.files.pop_front() {
+            if protected.contains(&number) {
+                still_protected.push_back(number);
+                continue;
+            }
+            let path = inner.options.path.join(format!("{number:06}.sst"));
+            if let Err(source) = inner.fs.remove_file(&path) {
+                still_protected.push_front(number);
+                still_protected.append(&mut obsolete.files);
+                obsolete.files = still_protected;
+                retained.push_front(obsolete);
+                retained.append(&mut state.obsolete_sstables);
+                state.obsolete_sstables = retained;
+                return Err(io_error("remove obsolete SSTable", &path, source));
+            }
+            removed = true;
+        }
+        if !still_protected.is_empty() {
+            obsolete.files = still_protected;
+            retained.push_back(obsolete);
+        }
+    }
+    state.obsolete_sstables = retained;
+    if removed {
+        inner
+            .fs
+            .sync_directory(&inner.options.path)
+            .map_err(|source| {
+                io_error(
+                    "sync obsolete SSTable retirement",
+                    &inner.options.path,
+                    source,
+                )
+            })?;
     }
     Ok(())
 }

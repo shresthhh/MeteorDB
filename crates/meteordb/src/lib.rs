@@ -11,6 +11,7 @@ mod batch;
 mod bloom;
 mod cache;
 mod clock;
+mod compaction;
 mod engine;
 mod error;
 mod fs;
@@ -29,6 +30,9 @@ pub use batch::{WriteBatch, WriteOp};
 pub use bloom::BloomFilter;
 pub use cache::{BlockCache, BlockKind, CachePartition, CachePartitionSnapshot, CacheSnapshot};
 pub use clock::{Clock, SystemClock};
+pub use compaction::{
+    CompactionJob, CompactionPicker, CompactionPlan, DEFAULT_L0_COMPACTION_TRIGGER,
+};
 pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
 pub use fs::{DurableFile, DurableFs, OsDurableFs};
