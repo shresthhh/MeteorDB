@@ -143,6 +143,7 @@ pub struct KvIterator {
     pending: Option<InternalEntry>,
     _version: Option<Arc<Version>>,
     _snapshot_guard: Option<SnapshotGuard>,
+    _reader_lease: Option<Arc<()>>,
 }
 
 impl KvIterator {
@@ -161,6 +162,7 @@ impl KvIterator {
             pending: None,
             _version: None,
             _snapshot_guard: None,
+            _reader_lease: None,
         }
     }
 
@@ -172,6 +174,7 @@ impl KvIterator {
         limit: usize,
         version: Arc<Version>,
         snapshot_guard: SnapshotGuard,
+        reader_lease: Arc<()>,
     ) -> Self {
         Self {
             merged: InternalMergingIterator::new(children),
@@ -183,6 +186,7 @@ impl KvIterator {
             pending: None,
             _version: Some(version),
             _snapshot_guard: Some(snapshot_guard),
+            _reader_lease: Some(reader_lease),
         }
     }
 

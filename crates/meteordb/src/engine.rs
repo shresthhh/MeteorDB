@@ -88,7 +88,7 @@ struct WriteState {
     next_sequence: SequenceNumber,
     flush_running: bool,
     obsolete_sstables: VecDeque<ObsoleteSstables>,
-    reader_versions: Vec<Weak<crate::Version>>,
+    reader_versions: Vec<ReaderVersion>,
     closed: bool,
     terminal_failure: Option<TerminalFailure>,
     background_failure: bool,
@@ -110,6 +110,11 @@ struct TerminalFailure {
     path: Option<PathBuf>,
     source_kind: Option<io::ErrorKind>,
     message: String,
+}
+
+struct ReaderVersion {
+    version: Weak<crate::Version>,
+    lease: Weak<()>,
 }
 
 impl TerminalFailure {
@@ -793,7 +798,7 @@ impl Engine {
         }
 
         let version = state.versions.current();
-        state.reader_versions.push(Arc::downgrade(&version));
+        let _reader_lease = register_reader_version(&mut state, &version);
         drop(state);
         for file in version.files(0).iter().filter(|file| overlaps(file, key)) {
             if let Some(value) =
@@ -865,7 +870,7 @@ impl Engine {
             push_memtable_child(&mut children, &immutable.table, &bounds);
         }
         let version = state.versions.current();
-        state.reader_versions.push(Arc::downgrade(&version));
+        let reader_lease = register_reader_version(&mut state, &version);
         drop(state);
 
         for level in 0..crate::NUM_LEVELS {
@@ -906,6 +911,7 @@ impl Engine {
             limit,
             version,
             guard,
+            reader_lease,
         ))
     }
 
@@ -1224,13 +1230,19 @@ fn validate_compaction_plan(plan: &crate::CompactionPlan, version: &crate::Versi
 fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
     state
         .reader_versions
-        .retain(|version| version.strong_count() > 0);
+        .retain(|reader| reader.lease.strong_count() > 0 && reader.version.strong_count() > 0);
     let protected_versions = state
         .obsolete_sstables
         .iter()
         .filter(|obsolete| !obsolete.is_unreferenced())
         .map(|obsolete| obsolete.version.clone())
-        .chain(state.reader_versions.iter().filter_map(Weak::upgrade));
+        .chain(
+            state
+                .reader_versions
+                .iter()
+                .filter(|reader| reader.lease.strong_count() > 0)
+                .filter_map(|reader| reader.version.upgrade()),
+        );
     let mut protected = BTreeSet::new();
     for version in protected_versions {
         for level in 0..crate::NUM_LEVELS {
@@ -1277,6 +1289,15 @@ fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Res
             })?;
     }
     Ok(())
+}
+
+fn register_reader_version(state: &mut WriteState, version: &Arc<crate::Version>) -> Arc<()> {
+    let lease = Arc::new(());
+    state.reader_versions.push(ReaderVersion {
+        version: Arc::downgrade(version),
+        lease: Arc::downgrade(&lease),
+    });
+    lease
 }
 
 fn remove_unpublished_sstables(
