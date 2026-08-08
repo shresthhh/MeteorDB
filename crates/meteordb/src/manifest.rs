@@ -55,11 +55,11 @@ impl VersionSet {
         let manifest_path = directory.join(&manifest_name);
         let manifest_temp = directory.join(format!("{manifest_name}.tmp"));
         let current_path = directory.join("CURRENT");
-        if current_path
-            .try_exists()
+        if fs
+            .entry_exists(&current_path)
             .map_err(|source| io_error("check CURRENT", &current_path, source))?
-            || manifest_path
-                .try_exists()
+            || fs
+                .entry_exists(&manifest_path)
                 .map_err(|source| io_error("check manifest", &manifest_path, source))?
         {
             return Err(Error::InvalidArgument(format!(
@@ -76,9 +76,9 @@ impl VersionSet {
         let mut writer = ManifestWriter::new(file, manifest_temp.clone(), 0);
         writer.append(&encoded)?;
         writer.sync("sync new manifest")?;
-        fs.atomic_replace(&manifest_temp, &manifest_path)
+        fs.atomic_install(&manifest_temp, &manifest_path)
             .map_err(|source| {
-                io_error("replace manifest temporary file", &manifest_path, source)
+                io_error("install manifest temporary file", &manifest_path, source)
             })?;
         fs.sync_directory(&directory)
             .map_err(|source| io_error("sync manifest directory", &directory, source))?;
@@ -400,8 +400,8 @@ fn replace_current(directory: &Path, manifest_name: &str, fs: &dyn DurableFs) ->
     file.sync_all()
         .map_err(|source| io_error("sync CURRENT temporary file", &current_temp, source))?;
     drop(file);
-    fs.atomic_replace(&current_temp, &current_path)
-        .map_err(|source| io_error("replace CURRENT", &current_path, source))?;
+    fs.atomic_install(&current_temp, &current_path)
+        .map_err(|source| io_error("install CURRENT", &current_path, source))?;
     fs.sync_directory(directory)
         .map_err(|source| io_error("sync CURRENT directory", directory, source))
 }

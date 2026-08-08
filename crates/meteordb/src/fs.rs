@@ -40,6 +40,15 @@ impl DurableFile for OsDurableFile {
 /// [`DurableFs::sync_directory`] separately persists directory-entry changes
 /// such as a newly created or renamed file.
 pub trait DurableFs: Send + Sync {
+    /// Reports whether any directory entry exists at `path` without following symlinks.
+    fn entry_exists(&self, path: &Path) -> std::io::Result<bool> {
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Exclusively creates `path` and opens it for writing.
     ///
     /// This fails with [`std::io::ErrorKind::AlreadyExists`] when `path`
@@ -106,6 +115,15 @@ pub trait DurableFs: Send + Sync {
     /// never a partially copied file. Call [`DurableFs::sync_directory`]
     /// afterward when the rename itself must survive a crash.
     fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()>;
+
+    /// Atomically installs `source` at an absent `destination` without replacement.
+    ///
+    /// The destination link is created exclusively, so any existing directory
+    /// entry, including a dangling symlink, makes the operation fail.
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        std::fs::hard_link(source, destination)?;
+        std::fs::remove_file(source)
+    }
 }
 
 /// The durable-filesystem implementation backed by Rust's standard library.

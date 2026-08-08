@@ -97,12 +97,12 @@ fn create_replaces_current_only_after_manifest_and_directory_are_durable() {
             "write MANIFEST-000001.tmp",
             "write MANIFEST-000001.tmp",
             "sync MANIFEST-000001.tmp",
-            "replace MANIFEST-000001.tmp -> MANIFEST-000001",
+            "install MANIFEST-000001.tmp -> MANIFEST-000001",
             "sync directory",
             "create CURRENT.tmp",
             "write CURRENT.tmp",
             "sync CURRENT.tmp",
-            "replace CURRENT.tmp -> CURRENT",
+            "install CURRENT.tmp -> CURRENT",
             "sync directory",
             "append MANIFEST-000001",
         ]
@@ -125,6 +125,54 @@ fn create_does_not_replace_an_existing_database() {
     ));
     assert_eq!(std::fs::read(current_path).unwrap(), current_before);
     assert_eq!(std::fs::read(manifest_path).unwrap(), manifest_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn create_rejects_a_dangling_current_symlink_without_replacing_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let current_path = dir.path().join("CURRENT");
+    let target = Path::new("missing-current-target");
+    symlink(target, &current_path).unwrap();
+
+    assert!(matches!(
+        VersionSet::create(dir.path()),
+        Err(Error::InvalidArgument(message)) if message.contains("already exists")
+    ));
+    assert!(
+        std::fs::symlink_metadata(&current_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_link(&current_path).unwrap(), target);
+    assert!(!dir.path().join(target).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn create_rejects_a_dangling_initial_manifest_symlink_without_replacing_it() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let manifest_path = dir.path().join("MANIFEST-000001");
+    let target = Path::new("missing-manifest-target");
+    symlink(target, &manifest_path).unwrap();
+
+    assert!(matches!(
+        VersionSet::create(dir.path()),
+        Err(Error::InvalidArgument(message)) if message.contains("already exists")
+    ));
+    assert!(
+        std::fs::symlink_metadata(&manifest_path)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(std::fs::read_link(&manifest_path).unwrap(), target);
+    assert!(!dir.path().join(target).exists());
 }
 
 #[test]
@@ -756,6 +804,15 @@ impl DurableFs for TrackingFs {
             file_name(destination)
         ));
         self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.events.lock().unwrap().push(format!(
+            "install {} -> {}",
+            file_name(source),
+            file_name(destination)
+        ));
+        self.inner.atomic_install(source, destination)
     }
 }
 
