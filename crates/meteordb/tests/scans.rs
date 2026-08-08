@@ -3,10 +3,12 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Bound;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use meteordb::{
-    Compression, DurableFile, DurableFs, Engine, Error, FileMeta, InternalKey, Options,
-    OsDurableFs, ScanBounds, TableBuilder, ValueKind, VersionEdit, VersionSet, WriteBatch,
+    Clock, Compression, DurableFile, DurableFs, Engine, Error, FileMeta, InternalKey, Options,
+    OsDurableFs, ScanBounds, SystemClock, TableBuilder, ValueKind, VersionEdit, VersionSet,
+    WriteBatch,
 };
 
 #[test]
@@ -67,6 +69,54 @@ fn scan_deduplicates_versions_and_hides_tombstones_and_expired_values() {
         collect(db.scan(ScanBounds::all(), usize::MAX).unwrap()).unwrap(),
         vec![(b"replaced".to_vec(), b"new".to_vec())]
     );
+}
+
+#[test]
+fn flushed_expiration_hides_the_disk_value_without_exposing_an_older_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(Options::new(dir.path())).unwrap();
+    db.put(b"k", b"older").unwrap();
+    db.flush().unwrap();
+
+    let expires_at = SystemClock.now_unix_ms().saturating_add(500);
+    let mut batch = WriteBatch::default();
+    batch.put_with_expiration(b"k", b"expiring", Some(expires_at));
+    db.write(batch).unwrap();
+    db.flush().unwrap();
+    drop(db);
+
+    let db = Engine::open(Options::new(dir.path())).unwrap();
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"expiring"[..]));
+    while SystemClock.now_unix_ms() <= expires_at {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    assert_eq!(db.get(b"k").unwrap(), None);
+    assert!(
+        collect(db.scan(ScanBounds::all(), usize::MAX).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn zero_limit_avoids_engine_state_and_sstable_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Engine::open(Options::new(dir.path())).unwrap();
+    db.put(b"k", b"value").unwrap();
+    db.flush().unwrap();
+    let table = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "sst"))
+        .unwrap();
+    std::fs::remove_file(table).unwrap();
+
+    assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
+    assert!(db.scan(ScanBounds::all(), 1).is_err());
+
+    db.close().unwrap();
+    assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
 }
 
 #[test]

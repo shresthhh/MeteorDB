@@ -3,9 +3,7 @@ use std::collections::BinaryHeap;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crate::{
-    Error, InternalKey, Result, SequenceNumber, SnapshotGuard, ValueKind, ValueRecord, Version,
-};
+use crate::{Error, InternalKey, Result, SequenceNumber, SnapshotGuard, ValueRecord, Version};
 
 /// Owned lower and upper user-key bounds for a forward scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,11 +86,30 @@ pub struct KvIterator {
     remaining: usize,
     failed: bool,
     pending_error: Option<Error>,
-    _version: Arc<Version>,
-    _snapshot_guard: SnapshotGuard,
+    _version: Option<Arc<Version>>,
+    _snapshot_guard: Option<SnapshotGuard>,
 }
 
 impl KvIterator {
+    pub(crate) fn empty(
+        bounds: ScanBounds,
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+    ) -> Self {
+        Self {
+            children: Vec::new(),
+            heap: BinaryHeap::new(),
+            bounds,
+            sequence,
+            read_time_unix_ms,
+            remaining: 0,
+            failed: false,
+            pending_error: None,
+            _version: None,
+            _snapshot_guard: None,
+        }
+    }
+
     pub(crate) fn new(
         children: Vec<ChildIterator>,
         bounds: ScanBounds,
@@ -111,8 +128,8 @@ impl KvIterator {
             remaining: limit,
             failed: false,
             pending_error: None,
-            _version: version,
-            _snapshot_guard: snapshot_guard,
+            _version: Some(version),
+            _snapshot_guard: Some(snapshot_guard),
         };
         for child in 0..iterator.children.len() {
             if !iterator.advance_child(child) {
@@ -223,13 +240,13 @@ fn consider_visible(
     }
 }
 
-pub(crate) fn disk_entry(key: InternalKey, value: Vec<u8>) -> InternalEntry {
-    let record = if key.kind() == ValueKind::Deletion {
-        ValueRecord::Tombstone
-    } else {
-        ValueRecord::value(value, None)
-    };
-    InternalEntry { key, record }
+pub(crate) fn disk_entry(
+    key: InternalKey,
+    value: Vec<u8>,
+    engine_encoded: bool,
+) -> Result<InternalEntry> {
+    let record = ValueRecord::decode_sstable(key.kind(), value, engine_encoded)?;
+    Ok(InternalEntry { key, record })
 }
 
 pub(crate) fn prefix_bounds(prefix: &[u8]) -> ScanBounds {
@@ -277,4 +294,8 @@ fn upper_allows(bounds: &ScanBounds, key: &[u8]) -> bool {
         Bound::Excluded(end) => key < end,
         Bound::Unbounded => true,
     }
+}
+
+pub(crate) fn user_key_in_bounds(bounds: &ScanBounds, key: &[u8]) -> bool {
+    lower_allows(bounds, key) && upper_allows(bounds, key)
 }

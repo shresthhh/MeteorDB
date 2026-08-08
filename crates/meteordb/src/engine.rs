@@ -6,15 +6,16 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
 use crate::background::BackgroundSignal;
-use crate::iter::{ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds};
+use crate::iter::{
+    ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds, user_key_in_bounds,
+};
 use crate::sstable::TableLookup;
 use crate::stats::ReadStats;
 use crate::{
     BlockCache, Clock, DurableFs, Error, FileMeta, InternalKey, KvIterator, MemTable, Options,
     OsDurableFs, Result, ScanBounds, SequenceNumber, SnapshotGuard, SnapshotRegistry,
     StatsSnapshot, SystemClock, TableBuildResult, TableBuilder, TableReader, TableReaderOptions,
-    ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter, WriteBatch, WriteOp,
-    replay_wal_with_fs,
+    ValueRecord, VersionEdit, VersionSet, WalWriter, WriteBatch, WriteOp, replay_wal_with_fs,
 };
 
 /// A cloneable handle to MeteorDB's durable engine.
@@ -483,6 +484,7 @@ impl Engine {
                 self.inner.options.max_key_bytes
             )));
         }
+        let read_time_unix_ms = SystemClock.now_unix_ms();
         self.inner.read_stats.record_point_read();
         let state = self.lock_state();
         ensure_readable(&state)?;
@@ -492,7 +494,7 @@ impl Engine {
             .get_entry(key, sequence)?
             .map(clone_candidate)
         {
-            return Ok(record_into_value(record));
+            return Ok(record_into_value(record, read_time_unix_ms));
         }
         for immutable in state.immutables.iter().rev() {
             if let Some((_, record)) = immutable
@@ -500,14 +502,16 @@ impl Engine {
                 .get_entry(key, sequence)?
                 .map(clone_candidate)
             {
-                return Ok(record_into_value(record));
+                return Ok(record_into_value(record, read_time_unix_ms));
             }
         }
 
         let version = state.versions.current();
         drop(state);
         for file in version.files(0).iter().filter(|file| overlaps(file, key)) {
-            if let Some(value) = self.read_table_candidate(file, 0, key, sequence)? {
+            if let Some(value) =
+                self.read_table_candidate(file, 0, key, sequence, read_time_unix_ms)?
+            {
                 return Ok(value);
             }
         }
@@ -516,7 +520,8 @@ impl Engine {
             let index = files.partition_point(|file| file.largest().user_key() < key);
             let candidate = files.get(index).filter(|file| overlaps(file, key));
             if let Some(file) = candidate
-                && let Some(value) = self.read_table_candidate(file, level, key, sequence)?
+                && let Some(value) =
+                    self.read_table_candidate(file, level, key, sequence, read_time_unix_ms)?
             {
                 return Ok(value);
             }
@@ -531,56 +536,53 @@ impl Engine {
         sequence: SequenceNumber,
     ) -> Result<KvIterator> {
         validate_scan_bounds(&self.inner.options, &bounds)?;
+        let read_time_unix_ms = SystemClock.now_unix_ms();
+        if limit == 0 {
+            return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
+        }
         let (mut children, version) = {
             let state = self.lock_state();
             ensure_readable(&state)?;
             let mut children = Vec::with_capacity(1 + state.immutables.len());
-            push_memtable_child(&mut children, &state.mutable.table);
+            push_memtable_child(&mut children, &state.mutable.table, &bounds);
             for immutable in state.immutables.iter().rev() {
-                push_memtable_child(&mut children, &immutable.table);
+                push_memtable_child(&mut children, &immutable.table, &bounds);
             }
             (children, state.versions.current())
         };
 
-        if limit != 0 {
-            for level in 0..crate::NUM_LEVELS {
-                for file in version.files(level).iter().filter(|file| {
-                    overlaps_bounds(
-                        file.smallest().user_key(),
-                        file.largest().user_key(),
-                        &bounds,
-                    )
-                }) {
-                    let reader = TableReader::open_cached(
-                        self.inner
-                            .options
-                            .path
-                            .join(format!("{:06}.sst", file.number())),
-                        file.number(),
-                        self.inner.block_cache.clone(),
-                        self.inner.read_stats.clone(),
-                        TableReaderOptions {
-                            max_uncompressed_data_block_bytes: reader_block_limit(
-                                &self.inner.options,
-                            ),
-                        },
-                    )?;
-                    children.push(Box::new(
-                        reader
-                            .into_iter()
-                            .map(|entry| entry.map(|(key, value)| disk_entry(key, value))),
-                    ));
-                }
+        for level in 0..crate::NUM_LEVELS {
+            for file in version.files(level).iter().filter(|file| {
+                overlaps_bounds(
+                    file.smallest().user_key(),
+                    file.largest().user_key(),
+                    &bounds,
+                )
+            }) {
+                let reader = TableReader::open_cached(
+                    self.inner
+                        .options
+                        .path
+                        .join(format!("{:06}.sst", file.number())),
+                    file.number(),
+                    self.inner.block_cache.clone(),
+                    self.inner.read_stats.clone(),
+                    TableReaderOptions {
+                        max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+                    },
+                )?;
+                let engine_encoded = reader.properties().engine_value_encoding;
+                children.push(Box::new(reader.into_iter().map(move |entry| {
+                    entry.and_then(|(key, value)| disk_entry(key, value, engine_encoded))
+                })));
             }
-        } else {
-            children.clear();
         }
 
         Ok(KvIterator::new(
             children,
             bounds,
             sequence,
-            SystemClock.now_unix_ms(),
+            read_time_unix_ms,
             limit,
             version,
             self.inner.snapshots.acquire(sequence),
@@ -593,6 +595,7 @@ impl Engine {
         level: usize,
         key: &[u8],
         sequence: SequenceNumber,
+        read_time_unix_ms: u64,
     ) -> Result<Option<Option<Vec<u8>>>> {
         self.inner.read_stats.record_table_probe(level);
         let reader = TableReader::open_cached(
@@ -610,11 +613,10 @@ impl Engine {
         match reader.get_visible(key, sequence)? {
             TableLookup::BloomNegative | TableLookup::Absent => Ok(None),
             TableLookup::Found(internal_key, value) => {
-                if internal_key.kind() == ValueKind::Deletion {
-                    Ok(Some(None))
-                } else {
-                    Ok(Some(Some(value)))
-                }
+                let engine_encoded = reader.properties().engine_value_encoding;
+                let record =
+                    ValueRecord::decode_sstable(internal_key.kind(), value, engine_encoded)?;
+                Ok(Some(record_into_value(record, read_time_unix_ms)))
             }
         }
     }
@@ -790,12 +792,9 @@ fn build_sstable(
         crate::Compression::None,
         inner.fs.clone(),
     )?;
+    builder.use_engine_value_encoding();
     for (key, record) in table.iter() {
-        let value = match record {
-            ValueRecord::Value { value, .. } => value.as_slice(),
-            ValueRecord::Tombstone => &[],
-        };
-        builder.add(key, value)?;
+        builder.add(key, &record.encode_engine_value())?;
     }
     let built = builder.finish()?;
     inner
@@ -986,9 +985,9 @@ fn clone_candidate(entry: (&InternalKey, &ValueRecord)) -> (SequenceNumber, Valu
     (entry.0.sequence(), entry.1.clone())
 }
 
-fn push_memtable_child(children: &mut Vec<ChildIterator>, table: &MemTable) {
+fn push_memtable_child(children: &mut Vec<ChildIterator>, table: &MemTable, bounds: &ScanBounds) {
     let entries = table
-        .owned_entries()
+        .owned_entries_matching(|key| user_key_in_bounds(bounds, key.user_key()))
         .into_iter()
         .map(|(key, record)| Ok(InternalEntry { key, record }));
     children.push(Box::new(entries));
@@ -1007,9 +1006,13 @@ fn validate_scan_bounds(options: &Options, bounds: &ScanBounds) -> Result<()> {
     Ok(())
 }
 
-fn record_into_value(record: ValueRecord) -> Option<Vec<u8>> {
+fn record_into_value(record: ValueRecord, read_time_unix_ms: u64) -> Option<Vec<u8>> {
     match record {
-        ValueRecord::Value { value, .. } => Some(value),
+        ValueRecord::Value {
+            value,
+            expires_at_unix_ms,
+        } if expires_at_unix_ms.is_none_or(|expires| expires > read_time_unix_ms) => Some(value),
+        ValueRecord::Value { .. } => None,
         ValueRecord::Tombstone => None,
     }
 }
@@ -1156,5 +1159,39 @@ mod filename_tests {
         ] {
             assert_eq!(parse_numbered_name(name, ".wal"), None, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_setup_tests {
+    use super::*;
+    use crate::memtable::{owned_entry_clone_count, reset_owned_entry_clone_count};
+
+    #[test]
+    fn zero_limit_does_not_copy_any_memtable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(Options::new(dir.path())).unwrap();
+        db.put(b"a", b"value").unwrap();
+        reset_owned_entry_clone_count();
+
+        assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
+        assert_eq!(owned_entry_clone_count(), 0);
+    }
+
+    #[test]
+    fn scan_bounds_only_copy_relevant_memtable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(Options::new(dir.path())).unwrap();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            db.put(key, key).unwrap();
+        }
+        reset_owned_entry_clone_count();
+
+        let bounds = ScanBounds::new(
+            std::ops::Bound::Included(b"b".to_vec()),
+            std::ops::Bound::Excluded(b"d".to_vec()),
+        );
+        assert_eq!(db.scan(bounds, usize::MAX).unwrap().count(), 2);
+        assert_eq!(owned_entry_clone_count(), 2);
     }
 }

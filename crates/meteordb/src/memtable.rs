@@ -1,6 +1,20 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 
-use crate::{InternalKey, Result, SequenceNumber, ValueKind, WriteBatch, WriteOp};
+use crate::{Error, InternalKey, Result, SequenceNumber, ValueKind, WriteBatch, WriteOp};
+
+const ENGINE_VALUE_MAGIC: [u8; 3] = *b"MEV";
+const ENGINE_VALUE_VERSION: u8 = 1;
+const VALUE_TAG: u8 = 0;
+const TOMBSTONE_TAG: u8 = 1;
+const EXPIRATION_FLAG: u8 = 1;
+const ENGINE_VALUE_HEADER_BYTES: usize = 6;
+
+#[cfg(test)]
+thread_local! {
+    static OWNED_ENTRY_CLONES: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The payload stored beside an [`InternalKey`] in a [`MemTable`].
 ///
@@ -56,6 +70,118 @@ impl ValueRecord {
             } => *expires_at_unix_ms,
             Self::Tombstone => None,
         }
+    }
+
+    pub(crate) fn encode_engine_value(&self) -> Vec<u8> {
+        let (tag, flags, expiration, value) = match self {
+            Self::Value {
+                value,
+                expires_at_unix_ms,
+            } => (
+                VALUE_TAG,
+                u8::from(expires_at_unix_ms.is_some()) * EXPIRATION_FLAG,
+                *expires_at_unix_ms,
+                value.as_slice(),
+            ),
+            Self::Tombstone => (TOMBSTONE_TAG, 0, None, &[][..]),
+        };
+        let mut encoded = Vec::with_capacity(
+            ENGINE_VALUE_HEADER_BYTES
+                .saturating_add(expiration.map_or(0, |_| 8))
+                .saturating_add(value.len()),
+        );
+        encoded.extend_from_slice(&ENGINE_VALUE_MAGIC);
+        encoded.push(ENGINE_VALUE_VERSION);
+        encoded.push(tag);
+        encoded.push(flags);
+        if let Some(expiration) = expiration {
+            encoded.extend_from_slice(&expiration.to_le_bytes());
+        }
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
+    pub(crate) fn decode_sstable(
+        internal_kind: ValueKind,
+        encoded: Vec<u8>,
+        engine_encoded: bool,
+    ) -> Result<Self> {
+        if !engine_encoded {
+            return Ok(if internal_kind == ValueKind::Deletion {
+                Self::Tombstone
+            } else {
+                Self::value(encoded, None)
+            });
+        }
+        if encoded.len() < ENGINE_VALUE_HEADER_BYTES {
+            return Err(engine_value_corruption("header is truncated"));
+        }
+        if encoded[..3] != ENGINE_VALUE_MAGIC {
+            return Err(engine_value_corruption("magic is not MEV"));
+        }
+        if encoded[3] != ENGINE_VALUE_VERSION {
+            return Err(engine_value_corruption(format!(
+                "unsupported encoding version {}",
+                encoded[3]
+            )));
+        }
+        let tag = encoded[4];
+        let flags = encoded[5];
+        if flags & !EXPIRATION_FLAG != 0 {
+            return Err(engine_value_corruption(format!(
+                "unknown flags {flags:#04x}"
+            )));
+        }
+        match tag {
+            VALUE_TAG => {
+                if internal_kind != ValueKind::Value {
+                    return Err(engine_value_corruption(
+                        "value payload has a deletion internal key",
+                    ));
+                }
+                let (expires_at_unix_ms, value_start) = if flags & EXPIRATION_FLAG == 0 {
+                    (None, ENGINE_VALUE_HEADER_BYTES)
+                } else {
+                    let end = ENGINE_VALUE_HEADER_BYTES + 8;
+                    let expiration = encoded
+                        .get(ENGINE_VALUE_HEADER_BYTES..end)
+                        .ok_or_else(|| engine_value_corruption("expiration is truncated"))?;
+                    (
+                        Some(u64::from_le_bytes(
+                            expiration
+                                .try_into()
+                                .expect("checked expiration has eight bytes"),
+                        )),
+                        end,
+                    )
+                };
+                Ok(Self::Value {
+                    value: encoded[value_start..].to_vec(),
+                    expires_at_unix_ms,
+                })
+            }
+            TOMBSTONE_TAG => {
+                if internal_kind != ValueKind::Deletion {
+                    return Err(engine_value_corruption(
+                        "tombstone payload has a value internal key",
+                    ));
+                }
+                if flags != 0 || encoded.len() != ENGINE_VALUE_HEADER_BYTES {
+                    return Err(engine_value_corruption(
+                        "tombstone carries flags or trailing bytes",
+                    ));
+                }
+                Ok(Self::Tombstone)
+            }
+            _ => Err(engine_value_corruption(format!("unknown record tag {tag}"))),
+        }
+    }
+}
+
+fn engine_value_corruption(detail: impl Into<String>) -> Error {
+    Error::Corruption {
+        context: "SSTable engine value",
+        detail: detail.into(),
     }
 }
 
@@ -172,10 +298,68 @@ impl MemTable {
         self.entries.iter()
     }
 
-    pub(crate) fn owned_entries(&self) -> Vec<(InternalKey, ValueRecord)> {
+    pub(crate) fn owned_entries_matching(
+        &self,
+        mut include: impl FnMut(&InternalKey) -> bool,
+    ) -> Vec<(InternalKey, ValueRecord)> {
         self.entries
             .iter()
-            .map(|(key, record)| (key.clone(), record.clone()))
+            .filter(|(key, _)| include(key))
+            .map(|(key, record)| {
+                #[cfg(test)]
+                OWNED_ENTRY_CLONES.set(OWNED_ENTRY_CLONES.get().saturating_add(1));
+                (key.clone(), record.clone())
+            })
             .collect()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_owned_entry_clone_count() {
+    OWNED_ENTRY_CLONES.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn owned_entry_clone_count() -> usize {
+    OWNED_ENTRY_CLONES.get()
+}
+
+#[cfg(test)]
+mod engine_value_tests {
+    use super::ValueRecord;
+    use crate::{Error, ValueKind};
+
+    #[test]
+    fn checked_engine_value_round_trips_expiration_and_tombstones() {
+        for (kind, record) in [
+            (ValueKind::Value, ValueRecord::value(b"value", Some(42))),
+            (ValueKind::Value, ValueRecord::value(b"plain", None)),
+            (ValueKind::Deletion, ValueRecord::Tombstone),
+        ] {
+            let encoded = record.encode_engine_value();
+            assert_eq!(
+                ValueRecord::decode_sstable(kind, encoded, true).unwrap(),
+                record
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_engine_value_metadata_is_corruption() {
+        for (kind, encoded) in [
+            (ValueKind::Value, b"short".to_vec()),
+            (ValueKind::Value, b"BAD\x01\0\0".to_vec()),
+            (ValueKind::Value, b"MEV\x02\0\0".to_vec()),
+            (ValueKind::Value, b"MEV\x01\0\x80".to_vec()),
+            (ValueKind::Value, b"MEV\x01\0\x01tiny".to_vec()),
+            (ValueKind::Deletion, b"MEV\x01\0\0".to_vec()),
+            (ValueKind::Value, b"MEV\x01\x01\0".to_vec()),
+            (ValueKind::Deletion, b"MEV\x01\x01\0extra".to_vec()),
+        ] {
+            assert!(matches!(
+                ValueRecord::decode_sstable(kind, encoded, true),
+                Err(Error::Corruption { .. })
+            ));
+        }
     }
 }

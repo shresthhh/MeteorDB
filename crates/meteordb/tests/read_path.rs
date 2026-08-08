@@ -320,6 +320,33 @@ fn legacy_v1_tables_skip_unsafe_user_key_bloom_negatives() {
     assert_eq!(db.stats().bloom_checks, 0);
 }
 
+#[test]
+fn legacy_v2_raw_engine_values_remain_readable_by_points_and_scans() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = build_table(
+        dir.path(),
+        2,
+        &[(b"k".as_slice(), 1, b"legacy-v2".as_slice())],
+    );
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut edit = VersionEdit::new();
+    edit.add_file(1, file)
+        .set_next_file_number(3)
+        .set_last_sequence(1);
+    versions.apply(edit).unwrap();
+    drop(versions);
+
+    let db = Engine::open(Options::new(dir.path())).unwrap();
+    assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"legacy-v2"[..]));
+    assert_eq!(
+        db.scan(meteordb::ScanBounds::all(), usize::MAX)
+            .unwrap()
+            .collect::<meteordb::Result<Vec<_>>>()
+            .unwrap(),
+        vec![(b"k".to_vec(), b"legacy-v2".to_vec())]
+    );
+}
+
 fn build_table(path: &Path, number: u64, entries: &[(&[u8], u64, &[u8])]) -> FileMeta {
     let table_path = path.join(format!("{number:06}.sst"));
     let mut builder =

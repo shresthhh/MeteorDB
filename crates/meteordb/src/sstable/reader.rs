@@ -657,9 +657,19 @@ fn decode_properties(encoded: &[u8]) -> Result<TableProperties> {
         read_property_varint(encoded, &mut cursor, "maximum data block bytes")?;
     let smallest = read_property_key(encoded, &mut cursor, "smallest key")?;
     let largest = read_property_key(encoded, &mut cursor, "largest key")?;
-    if cursor != encoded.len() {
-        return Err(properties_corruption("trailing bytes after properties"));
-    }
+    let remaining = encoded
+        .get(cursor..)
+        .ok_or_else(|| properties_corruption("property cursor exceeds encoded bytes"))?;
+    let engine_value_encoding = match remaining {
+        [] => false,
+        [0xe1, 1] => true,
+        [0xe1, version] => {
+            return Err(properties_corruption(format!(
+                "unsupported engine value property version {version}"
+            )));
+        }
+        _ => return Err(properties_corruption("malformed engine value property")),
+    };
     if smallest > largest {
         return Err(properties_corruption(
             "smallest internal key is greater than largest",
@@ -678,6 +688,7 @@ fn decode_properties(encoded: &[u8]) -> Result<TableProperties> {
         smallest,
         largest,
         max_data_block_bytes,
+        engine_value_encoding,
     })
 }
 
