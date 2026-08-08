@@ -42,7 +42,7 @@ flowchart TB
     App --> Open
     Open --> API
     Open --> Versions
-    Open -->|acquires and holds for writer lifetime| Lock
+    Open -->|held until all handles and snapshots drop| Lock
     API --> Writer
     Writer --> WAL
     Writer --> Mutable
@@ -169,7 +169,7 @@ partial logical write.
 
 | File | Owner and lifetime |
 | --- | --- |
-| `LOCK` | Acquired during `Engine::open` and held exclusively by its `VersionSet` for the writer lifetime |
+| `LOCK` | Acquired during `Engine::open` and held by the shared `VersionSet` until every `Engine` clone and `Snapshot` is dropped; `Engine::close` alone does not release it |
 | `CURRENT` | Names the active manifest |
 | `MANIFEST-NNNNNN` | Append-only version edits and recovery counters |
 | `NNNNNN.wal` | Owned by one mutable or immutable memtable until flush is durable |
