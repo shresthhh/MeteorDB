@@ -3,7 +3,7 @@ use std::sync::Mutex;
 use crate::{BlockCache, CacheSnapshot, NUM_LEVELS};
 
 /// An owned, structured view of engine read-path activity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct StatsSnapshot {
     /// Valid point reads, including snapshot reads and misses.
     pub point_reads: u64,
@@ -106,6 +106,49 @@ mod tests {
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn snapshot_json_has_stable_field_order_and_names() {
+        let snapshot = StatsSnapshot {
+            point_reads: 3,
+            sstable_probes: 4,
+            bloom_checks: 5,
+            bloom_useful_negatives: 2,
+            cache: CacheSnapshot {
+                metadata: crate::CachePartitionSnapshot {
+                    capacity_bytes: 10,
+                    usage_bytes: 4,
+                    entries: 1,
+                    hits: 6,
+                    misses: 7,
+                    admissions: 8,
+                    evictions: 9,
+                },
+                data: crate::CachePartitionSnapshot {
+                    capacity_bytes: 40,
+                    usage_bytes: 20,
+                    entries: 2,
+                    hits: 10,
+                    misses: 11,
+                    admissions: 12,
+                    evictions: 13,
+                },
+            },
+            level_table_probes: [1, 1, 1, 1, 0, 0, 0],
+        };
+
+        assert_eq!(
+            serde_json::to_string(&snapshot).unwrap(),
+            concat!(
+                r#"{"point_reads":3,"sstable_probes":4,"bloom_checks":5,"#,
+                r#""bloom_useful_negatives":2,"cache":{"metadata":{"capacity_bytes":10,"#,
+                r#""usage_bytes":4,"entries":1,"hits":6,"misses":7,"admissions":8,"#,
+                r#""evictions":9},"data":{"capacity_bytes":40,"usage_bytes":20,"entries":2,"#,
+                r#""hits":10,"misses":11,"admissions":12,"evictions":13}},"#,
+                r#""level_table_probes":[1,1,1,1,0,0,0]}"#
+            )
+        );
+    }
 
     #[test]
     fn related_statistics_remain_coherent_during_concurrent_updates() {

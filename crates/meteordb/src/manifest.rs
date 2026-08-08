@@ -21,6 +21,195 @@ const CHECKSUM_MASK_DELTA: u32 = 0xa282_ead8;
 const FORMAT_VERSION: u8 = 2;
 const MAX_EDIT_BYTES: usize = 64 * 1024 * 1024;
 
+/// Read-only, fully checked view of one manifest edit.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ManifestEditInspection {
+    /// Zero-based edit position in the manifest.
+    pub index: usize,
+    /// SSTables added by this edit.
+    pub added_files: Vec<ManifestFileInspection>,
+    /// `(level, file number)` pairs removed by this edit.
+    pub deleted_files: Vec<(usize, u64)>,
+    /// Next unallocated persistent file number, when changed by this edit.
+    pub next_file_number: Option<u64>,
+    /// Greatest sequence durable below the WAL, when changed by this edit.
+    pub last_sequence: Option<SequenceNumber>,
+    /// Oldest required WAL number, when changed by this edit.
+    pub log_number: Option<u64>,
+    /// Active WAL number, when changed by this edit.
+    pub active_log_number: Option<u64>,
+    /// Greatest sequence durable in the required WAL set, when changed by this edit.
+    pub wal_sequence: Option<SequenceNumber>,
+}
+
+/// Stable, display-safe metadata for one manifest-referenced SSTable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ManifestFileInspection {
+    /// Level containing the table.
+    pub level: usize,
+    /// Persistent table number.
+    pub number: u64,
+    /// Manifest-recorded complete file length.
+    pub file_size: u64,
+    /// Smallest internal key encoded as lowercase hexadecimal.
+    pub smallest_key_hex: String,
+    /// Largest internal key encoded as lowercase hexadecimal.
+    pub largest_key_hex: String,
+}
+
+/// Read-only manifest replay and resulting live-file layout.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct ManifestInspection {
+    /// Version of this inspection document schema.
+    pub format_version: u32,
+    /// Canonical manifest filename named by `CURRENT`.
+    pub manifest: String,
+    /// Complete manifest length in bytes.
+    pub file_bytes: u64,
+    /// Every validated edit in append order.
+    pub edits: Vec<ManifestEditInspection>,
+    /// Resulting live SSTables, grouped into exactly [`NUM_LEVELS`] levels.
+    pub levels: Vec<Vec<ManifestFileInspection>>,
+    /// Next unallocated persistent file number.
+    pub next_file_number: u64,
+    /// Greatest durable sequence below the WAL.
+    pub last_sequence: SequenceNumber,
+    /// Oldest required WAL number.
+    pub log_number: u64,
+    /// Active WAL number.
+    pub active_log_number: u64,
+    /// Greatest sequence durable in the required WAL set.
+    pub wal_sequence: SequenceNumber,
+}
+
+/// Replays and validates a database manifest without locking or modifying any file.
+///
+/// Unlike writer recovery, inspection rejects a torn tail instead of truncating
+/// it. Referenced SSTables must exist and match their manifest-recorded lengths.
+pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspection> {
+    let directory = directory.as_ref();
+    let fs = OsDurableFs;
+    let current_path = directory.join("CURRENT");
+    let current = fs
+        .read_file(&current_path)
+        .map_err(|source| io_error("read CURRENT", &current_path, source))?;
+    let manifest_name = parse_current(&current)?;
+    let manifest_number = parse_manifest_number(&manifest_name)?;
+    let manifest_path = directory.join(&manifest_name);
+    let replay = replay_manifest(&manifest_path, &fs)?;
+    if replay.valid_bytes != replay.file_length {
+        return Err(manifest_corruption(format!(
+            "manifest has a torn tail at byte {} of {}",
+            replay.valid_bytes, replay.file_length
+        )));
+    }
+    if replay.edits.is_empty() {
+        return Err(manifest_corruption(
+            "manifest contains no complete initial edit",
+        ));
+    }
+
+    let mut version = Version::empty();
+    let mut next_file_number = 0;
+    let mut last_sequence = 0;
+    let mut log_number = 0;
+    let mut active_log_number = 0;
+    let mut wal_sequence = 0;
+    let mut used_file_numbers = HashSet::from([manifest_number]);
+    let mut edits = Vec::with_capacity(replay.edits.len());
+    for (index, edit) in replay.edits.into_iter().enumerate() {
+        update_counters(
+            &edit,
+            &mut next_file_number,
+            &mut last_sequence,
+            &mut log_number,
+            &mut active_log_number,
+            &mut wal_sequence,
+            true,
+        )?;
+        validate_file_numbers(&edit, next_file_number, &used_file_numbers, true)?;
+        version = version.apply(&edit).map_err(recovery_edit_error)?;
+        used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
+        edits.push(inspect_edit(index, &edit));
+    }
+    if next_file_number == 0 {
+        return Err(manifest_corruption(
+            "manifest never records the next file number",
+        ));
+    }
+    validate_referenced_files(directory, &version, &fs)?;
+
+    let mut levels = Vec::with_capacity(NUM_LEVELS);
+    for level in 0..NUM_LEVELS {
+        let mut files = Vec::with_capacity(version.files(level).len());
+        for file in version.files(level) {
+            let path = directory.join(sstable_name(file.number()));
+            let actual = std::fs::metadata(&path)
+                .map_err(|source| io_error("stat referenced SSTable", &path, source))?
+                .len();
+            if actual != file.file_size() {
+                return Err(manifest_corruption(format!(
+                    "referenced SSTable {} has length {actual}, expected {}",
+                    path.display(),
+                    file.file_size()
+                )));
+            }
+            files.push(inspect_file(level, file));
+        }
+        levels.push(files);
+    }
+
+    Ok(ManifestInspection {
+        format_version: 1,
+        manifest: manifest_name,
+        file_bytes: replay.file_length,
+        edits,
+        levels,
+        next_file_number,
+        last_sequence,
+        log_number,
+        active_log_number,
+        wal_sequence,
+    })
+}
+
+fn inspect_edit(index: usize, edit: &VersionEdit) -> ManifestEditInspection {
+    ManifestEditInspection {
+        index,
+        added_files: edit
+            .added_files
+            .iter()
+            .map(|(level, file)| inspect_file(*level, file))
+            .collect(),
+        deleted_files: edit.deleted_files.clone(),
+        next_file_number: edit.next_file_number,
+        last_sequence: edit.last_sequence,
+        log_number: edit.log_number,
+        active_log_number: edit.active_log_number,
+        wal_sequence: edit.wal_sequence,
+    }
+}
+
+fn inspect_file(level: usize, file: &FileMeta) -> ManifestFileInspection {
+    ManifestFileInspection {
+        level,
+        number: file.number(),
+        file_size: file.file_size(),
+        smallest_key_hex: encode_hex(file.smallest().as_bytes()),
+        largest_key_hex: encode_hex(file.largest().as_bytes()),
+    }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 /// Owns the append-only manifest and the currently published immutable version.
 ///
 /// Applying an edit first validates a copy of the current version. Every added

@@ -56,6 +56,65 @@ pub struct TableReader {
     user_key_filter: bool,
 }
 
+/// Stable metadata for one checked SSTable block.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableBlockInspection {
+    /// Zero-based data-block position.
+    pub index: usize,
+    /// Byte offset of the stored block.
+    pub offset: u64,
+    /// Stored payload bytes, excluding its trailer.
+    pub size: u64,
+}
+
+/// Bounded display record from a fully checked SSTable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableEntryInspection {
+    /// Internal key encoded as lowercase hexadecimal.
+    pub key_hex: String,
+    /// User key encoded as lowercase hexadecimal.
+    pub user_key_hex: String,
+    /// MVCC sequence number.
+    pub sequence: SequenceNumber,
+    /// `value` or `deletion`.
+    pub kind: String,
+    /// Stored value length in bytes.
+    pub value_bytes: usize,
+}
+
+/// Read-only SSTable metadata produced by the checked table reader.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableInspection {
+    /// Version of this inspection document schema.
+    pub format_version: u32,
+    /// Complete immutable file length.
+    pub file_bytes: u64,
+    /// Persistent file number from the properties block.
+    pub file_number: u64,
+    /// Number of checked records.
+    pub entries: u64,
+    /// Number of independently checked data blocks.
+    pub data_blocks: u64,
+    /// Compression name.
+    pub compression: String,
+    /// Smallest internal key in lowercase hexadecimal.
+    pub smallest_key_hex: String,
+    /// Largest internal key in lowercase hexadecimal.
+    pub largest_key_hex: String,
+    /// Largest declared uncompressed data-block payload.
+    pub max_data_block_bytes: u64,
+    /// Whether values use engine-record encoding.
+    pub engine_value_encoding: bool,
+    /// Checked data-block locations.
+    pub blocks: Vec<SstableBlockInspection>,
+    /// Whether additional checked blocks were omitted.
+    pub blocks_truncated: bool,
+    /// First records, bounded by the caller.
+    pub shown: Vec<SstableEntryInspection>,
+    /// Whether additional records were checked but omitted.
+    pub truncated: bool,
+}
+
 pub(crate) enum TableLookup {
     BloomNegative,
     Absent,
@@ -261,6 +320,65 @@ impl TableReader {
         self.file_size
     }
 
+    /// Checks every data block and returns bounded, stable inspection metadata.
+    pub fn inspect(&self, max_entries: usize, max_blocks: usize) -> Result<SstableInspection> {
+        let mut shown = Vec::with_capacity(max_entries.min(self.index.len()));
+        let mut checked_entries = 0_u64;
+        for entry in self.iter() {
+            let (key, value) = entry?;
+            checked_entries = checked_entries.saturating_add(1);
+            if shown.len() < max_entries {
+                shown.push(SstableEntryInspection {
+                    key_hex: encode_hex(key.as_bytes()),
+                    user_key_hex: encode_hex(key.user_key()),
+                    sequence: key.sequence(),
+                    kind: match key.kind() {
+                        crate::ValueKind::Value => "value",
+                        crate::ValueKind::Deletion => "deletion",
+                    }
+                    .to_owned(),
+                    value_bytes: value.len(),
+                });
+            }
+        }
+        if checked_entries != self.properties.entries {
+            return Err(properties_corruption(format!(
+                "record count {checked_entries} does not match declared {}",
+                self.properties.entries
+            )));
+        }
+        Ok(SstableInspection {
+            format_version: 1,
+            file_bytes: self.file_size,
+            file_number: self.properties.file_number,
+            entries: checked_entries,
+            data_blocks: self.properties.data_blocks,
+            compression: match self.properties.compression {
+                Compression::None => "none",
+                Compression::Snappy => "snappy",
+            }
+            .to_owned(),
+            smallest_key_hex: encode_hex(self.properties.smallest.as_bytes()),
+            largest_key_hex: encode_hex(self.properties.largest.as_bytes()),
+            max_data_block_bytes: self.properties.max_data_block_bytes,
+            engine_value_encoding: self.properties.engine_value_encoding,
+            blocks: self
+                .index
+                .iter()
+                .take(max_blocks)
+                .enumerate()
+                .map(|(index, (_, handle))| SstableBlockInspection {
+                    index,
+                    offset: handle.offset(),
+                    size: handle.size(),
+                })
+                .collect(),
+            blocks_truncated: self.index.len() > max_blocks,
+            truncated: checked_entries > shown.len() as u64,
+            shown,
+        })
+    }
+
     /// Reports the Bloom filter's answer for an internal key's user key.
     ///
     /// Version 1 tables retain exact-internal-key filters for compatibility;
@@ -436,6 +554,16 @@ impl TableReader {
         }
         Ok(block)
     }
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
 }
 
 fn maximum_stored_data_block_bytes(uncompressed_limit: usize) -> Result<u64> {

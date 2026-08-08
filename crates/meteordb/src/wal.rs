@@ -29,6 +29,68 @@ pub struct RecoveredBatch {
     pub batch: WriteBatch,
 }
 
+/// Read-only summary of a fully checksummed WAL segment.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct WalInspection {
+    /// Version of this inspection document schema.
+    pub format_version: u32,
+    /// Complete segment length in bytes.
+    pub file_bytes: u64,
+    /// Number of complete logical batches.
+    pub batches: usize,
+    /// Total operations across complete batches.
+    pub operations: usize,
+    /// First recovered sequence, when any batch exists.
+    pub first_sequence: Option<SequenceNumber>,
+    /// Last recovered sequence, when any batch exists.
+    pub last_sequence: Option<SequenceNumber>,
+    #[serde(skip)]
+    sequences: Vec<SequenceNumber>,
+}
+
+impl WalInspection {
+    /// Borrows recovered batch sequences for cross-segment continuity checks.
+    pub fn sequences(&self) -> &[SequenceNumber] {
+        &self.sequences
+    }
+}
+
+/// Checks a WAL segment without opening it for append or modifying a torn tail.
+pub fn inspect_wal(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<WalInspection> {
+    let path = path.as_ref();
+    let file_bytes = std::fs::metadata(path)
+        .map_err(|source| io_error("stat WAL", path, source))?
+        .len();
+    let recovered = replay_wal(path, max_batch_bytes)?;
+    for records in recovered.windows(2) {
+        let expected = records[0]
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| wal_corruption("sequence number space is exhausted"))?;
+        if records[1].sequence != expected {
+            return Err(wal_corruption(format!(
+                "expected sequence {expected}, found {} in {}",
+                records[1].sequence,
+                path.display()
+            )));
+        }
+    }
+    let operations = recovered.iter().try_fold(0_usize, |total, record| {
+        total
+            .checked_add(record.batch.len())
+            .ok_or_else(|| wal_corruption("WAL operation count exceeds usize"))
+    })?;
+    Ok(WalInspection {
+        format_version: 1,
+        file_bytes,
+        batches: recovered.len(),
+        operations,
+        first_sequence: recovered.first().map(|record| record.sequence),
+        last_sequence: recovered.last().map(|record| record.sequence),
+        sequences: recovered.iter().map(|record| record.sequence).collect(),
+    })
+}
+
 /// Appends atomic, checksummed batches to one write-ahead-log segment.
 ///
 /// Each batch is one *logical record*. Records larger than the space left in a

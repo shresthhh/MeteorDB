@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use meteordb::{
     Durability, DurableFile, DurableFs, Error, OsDurableFs, WalWriter, WriteBatch, WriteOp,
-    replay_wal,
+    inspect_wal, replay_wal,
 };
 
 const BLOCK_BYTES: usize = 32 * 1024;
@@ -56,6 +56,26 @@ fn replay_returns_only_complete_batches() {
             expires_at_unix_ms: None,
         }]
     );
+}
+
+#[test]
+fn inspection_rejects_a_sequence_gap_inside_one_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000001.wal");
+    let mut wal = WalWriter::create(&path, 128).unwrap();
+    wal.append(1, &batch_with_put(b"a", b"1"), Durability::Sync)
+        .unwrap();
+    wal.append(3, &batch_with_put(b"b", b"2"), Durability::Sync)
+        .unwrap();
+    drop(wal);
+
+    assert!(matches!(
+        inspect_wal(&path, 128),
+        Err(Error::Corruption {
+            context: "WAL",
+            detail,
+        }) if detail.contains("expected sequence 2, found 3")
+    ));
 }
 
 #[test]

@@ -39,20 +39,25 @@ pub use error::{Error, Result};
 pub use fs::{DurableFile, DurableFs, OsDurableFs};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
 pub use iter::{KvIterator, ScanBounds};
-pub use manifest::VersionSet;
+pub use manifest::{
+    ManifestEditInspection, ManifestFileInspection, ManifestInspection, VersionSet,
+    inspect_manifest,
+};
 pub use memtable::{MemTable, ValueRecord};
 pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};
 pub use sstable::{
     BLOCK_TRAILER_BYTES, Block, BlockBuilder, BlockHandle, BlockIter,
     DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES, NO_COMPRESSION, SNAPPY_COMPRESSION,
-    SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, TableBuildResult, TableBuilder,
-    TableIter, TableProperties, TableReader, TableReaderOptions, decode_stored_block,
-    encode_stored_block,
+    SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, SstableBlockInspection,
+    SstableEntryInspection, SstableInspection, TableBuildResult, TableBuilder, TableIter,
+    TableProperties, TableReader, TableReaderOptions, decode_stored_block, encode_stored_block,
 };
 pub use stats::StatsSnapshot;
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
-pub use wal::{RecoveredBatch, WalWriter, replay_wal, replay_wal_with_fs};
+pub use wal::{
+    RecoveredBatch, WalInspection, WalWriter, inspect_wal, replay_wal, replay_wal_with_fs,
+};
 pub use workloads::{
     CacheLookup, Embedding, EmbeddingKey, EmbeddingStore, FeatureKey, FeatureRecord, FeatureStore,
     FeatureValue, InferenceCache, InferenceEntry, InferenceKey, ScalarType,
