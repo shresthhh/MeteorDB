@@ -9,30 +9,34 @@ use crate::{Error, Result};
 /// The trait keeps time-dependent engine code deterministic in tests: production
 /// uses [`SystemClock`], while tests can provide a fixed implementation.
 /// Implementations must be thread-safe because database work may use the clock
-/// from foreground and background threads. Within one clock instance, returned
-/// values must never decrease.
+/// from foreground and background threads. Custom implementations must not
+/// decrease while an engine is open or when the same clock is reused to reopen
+/// an engine.
 pub trait Clock: Send + Sync {
     /// Returns the current wall-clock time in milliseconds since the Unix epoch.
     ///
     /// This value is intended for persisted expiration timestamps, not
-    /// elapsed-time measurement. Implementations clamp or reject wall-clock
-    /// rollback so expiration decisions cannot reverse during one engine
-    /// process.
+    /// elapsed-time measurement. Implementations must clamp or reject rollback
+    /// over the lifetime in which an engine uses them.
     fn now_unix_ms(&self) -> u64;
 }
 
 /// A [`Clock`] backed by the operating system's wall clock.
 ///
 /// Times before the Unix epoch map to zero, and timestamps too large for `u64`
-/// saturate at [`u64::MAX`], keeping the infallible [`Clock`] contract. Each
-/// instance clamps observed rollback to its highest value. That high-water mark
-/// is process-local and is not persisted: after restart, persisted TTL deadlines
-/// assume the host wall clock has not moved behind time observed by the previous
-/// process.
-#[derive(Clone, Debug, Default)]
-pub struct SystemClock {
-    high_water_unix_ms: Arc<AtomicU64>,
-}
+/// saturate at [`u64::MAX`], keeping the infallible [`Clock`] contract. All
+/// instances share a process-global high-water mark, so same-process engine
+/// reopens cannot observe rollback.
+///
+/// The high-water mark is intentionally not persisted. Host wall-clock rollback
+/// across process restarts is unsupported: persisted TTL deadlines assume a new
+/// process does not start behind wall time observed by the previous process.
+/// MeteorDB does not add hidden durable writes to reads to enforce that
+/// environmental assumption.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemClock;
+
+static SYSTEM_HIGH_WATER_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 
 impl Clock for SystemClock {
     fn now_unix_ms(&self) -> u64 {
@@ -41,7 +45,13 @@ impl Clock for SystemClock {
             .unwrap_or_default()
             .as_millis();
         let observed = u64::try_from(milliseconds).unwrap_or(u64::MAX);
-        self.high_water_unix_ms
+        Self::clamp_observed(observed)
+    }
+}
+
+impl SystemClock {
+    fn clamp_observed(observed: u64) -> u64 {
+        SYSTEM_HIGH_WATER_UNIX_MS
             .fetch_max(observed, Ordering::AcqRel)
             .max(observed)
     }
@@ -86,5 +96,19 @@ impl ManualClock {
 impl Clock for ManualClock {
     fn now_unix_ms(&self) -> u64 {
         self.now_unix_ms.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn system_clock_clamps_rollback_across_same_process_reconstruction() {
+        let first_instance = SystemClock;
+        let high_water = first_instance.now_unix_ms();
+        let _reopened_instance = SystemClock;
+
+        assert!(SystemClock::clamp_observed(high_water.saturating_sub(1)) >= high_water);
     }
 }

@@ -41,6 +41,8 @@ struct EngineInner {
     snapshot_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     implicit_read_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    write_state_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct WriteState {
@@ -113,26 +115,25 @@ impl TerminalFailure {
 impl Engine {
     /// Opens or recovers an engine using the operating system's durable filesystem.
     pub fn open(options: Options) -> Result<Self> {
-        Self::open_with_fs_and_clock(
-            options,
-            Arc::new(OsDurableFs),
-            Arc::new(SystemClock::default()),
-        )
+        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
     }
 
     /// Opens or recovers an engine with injectable crash-sensitive filesystem operations.
     pub fn open_with_fs(options: Options, fs: Arc<dyn DurableFs>) -> Result<Self> {
-        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock::default()))
+        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock))
     }
 
     /// Opens or recovers an engine with an injectable wall clock.
     ///
     /// The clock controls TTL deadline creation and expiration checks. MVCC
     /// snapshots still freeze only their sequence number; they do not freeze
-    /// wall-clock time. Its values must not decrease while this engine is open.
-    /// Persisted deadlines remain absolute Unix timestamps across restart, so
-    /// callers must also avoid reopening with a clock behind time observed by
-    /// the previous process.
+    /// wall-clock time. Custom clock values must not decrease while this engine
+    /// is open or when that clock is reused for a same-process reopen.
+    ///
+    /// Persisted deadlines remain absolute Unix timestamps across process
+    /// restart. Host wall-clock rollback between processes is unsupported; the
+    /// new process must not start behind wall time observed by the previous
+    /// process. MeteorDB deliberately does not persist a watermark during reads.
     pub fn open_with_clock(options: Options, clock: Arc<dyn Clock>) -> Result<Self> {
         Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), clock)
     }
@@ -328,6 +329,8 @@ impl Engine {
                 snapshot_sequence_hook: Mutex::new(None),
                 #[cfg(test)]
                 implicit_read_sequence_hook: Mutex::new(None),
+                #[cfg(test)]
+                write_state_lock_hook: Mutex::new(None),
             }),
         };
         engine.start_background_worker()?;
@@ -356,18 +359,23 @@ impl Engine {
         value: impl AsRef<[u8]>,
         ttl_ms: i64,
     ) -> Result<()> {
-        ensure_writable(&self.lock_state())?;
-        let ttl_ms = u64::try_from(ttl_ms)
-            .map_err(|_| Error::InvalidArgument("ttl_ms must not be negative".into()))?;
-        let expires_at_unix_ms = self
-            .inner
-            .clock
-            .now_unix_ms()
-            .checked_add(ttl_ms)
-            .ok_or_else(|| Error::InvalidArgument("TTL expiration timestamp overflow".into()))?;
-        let mut batch = WriteBatch::default();
-        batch.put_with_expiration(key, value, Some(expires_at_unix_ms));
-        self.write(batch)
+        let key = key.as_ref().to_vec();
+        let value = value.as_ref().to_vec();
+        self.write_serialized(move || {
+            let ttl_ms = u64::try_from(ttl_ms)
+                .map_err(|_| Error::InvalidArgument("ttl_ms must not be negative".into()))?;
+            let expires_at_unix_ms = self
+                .inner
+                .clock
+                .now_unix_ms()
+                .checked_add(ttl_ms)
+                .ok_or_else(|| {
+                    Error::InvalidArgument("TTL expiration timestamp overflow".into())
+                })?;
+            let mut batch = WriteBatch::default();
+            batch.put_with_expiration(key, value, Some(expires_at_unix_ms));
+            Ok(batch)
+        })
     }
 
     /// Writes a tombstone for `key`.
@@ -379,8 +387,14 @@ impl Engine {
 
     /// Commits every operation in `batch` at one sequence number.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
+        self.write_serialized(|| Ok(batch))
+    }
+
+    fn write_serialized(&self, prepare: impl FnOnce() -> Result<WriteBatch>) -> Result<()> {
+        self.run_write_state_lock_hook();
         let mut state = self.lock_state();
         ensure_writable(&state)?;
+        let batch = prepare()?;
         validate_batch(&self.inner.options, &batch)?;
         if state.immutables.len() >= self.inner.options.max_immutable_memtables {
             return Err(Error::WriteStall {
@@ -676,6 +690,22 @@ impl Engine {
 
     #[cfg(not(test))]
     fn run_implicit_read_sequence_hook(&self) {}
+
+    #[cfg(test)]
+    fn run_write_state_lock_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .write_state_lock_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_write_state_lock_hook(&self) {}
 
     fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
         let state = self.lock_state();
@@ -1482,6 +1512,7 @@ mod filename_tests {
 mod scan_setup_tests {
     use super::*;
     use crate::memtable::{owned_entry_clone_count, reset_owned_entry_clone_count};
+    use std::sync::{Condvar, mpsc};
 
     #[test]
     fn zero_limit_does_not_copy_any_memtable_entries() {
@@ -1494,10 +1525,68 @@ mod scan_setup_tests {
         assert_eq!(owned_entry_clone_count(), 0);
     }
 
+    #[derive(Default)]
+    struct WriteLockGate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl WriteLockGate {
+        fn pause(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn wait_until_paused(&self) {
+            let mut state = self.state.lock().unwrap();
+            while !state.0 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn ttl_starts_when_the_serialized_write_path_acquires_write_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::ManualClock::new(1_000));
+        let db = Engine::open_with_clock(Options::new(dir.path()), clock.clone()).unwrap();
+        let gate = Arc::new(WriteLockGate::default());
+        *db.inner
+            .write_state_lock_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+            let gate = gate.clone();
+            Arc::new(move || gate.pause())
+        });
+
+        let writer_db = db.clone();
+        let writer = thread::spawn(move || {
+            writer_db.put_with_ttl(b"key", b"value", 10).unwrap();
+        });
+        gate.wait_until_paused();
+        clock.set(2_000).unwrap();
+        gate.release();
+        writer.join().unwrap();
+
+        clock.set(2_009).unwrap();
+        assert_eq!(db.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
+        clock.set(2_010).unwrap();
+        assert_eq!(db.get(b"key").unwrap(), None);
+    }
+
     #[cfg(test)]
     mod snapshot_registration_tests {
         use super::*;
-        use std::sync::{Condvar, mpsc};
         use std::time::Duration;
 
         #[derive(Default)]

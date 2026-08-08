@@ -78,7 +78,7 @@ fn flushed_expiration_hides_the_disk_value_without_exposing_an_older_value() {
     db.put(b"k", b"older").unwrap();
     db.flush().unwrap();
 
-    let clock = SystemClock::default();
+    let clock = SystemClock;
     let expires_at = clock.now_unix_ms().saturating_add(500);
     let mut batch = WriteBatch::default();
     batch.put_with_expiration(b"k", b"expiring", Some(expires_at));
