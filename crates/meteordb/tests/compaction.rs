@@ -143,6 +143,50 @@ fn compact_merges_versions_preserves_snapshot_history_and_splits_outputs() {
 }
 
 #[test]
+fn tiny_blocks_and_many_small_records_survive_flush_reads_and_compaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut options = Options::new(dir.path());
+    options.memtable_bytes = 256;
+    options.target_sstable_bytes = 128;
+    options.block_bytes = 1;
+    options.restart_interval = 1;
+    options.max_key_bytes = 32;
+    options.max_value_bytes = 32;
+    options.max_batch_bytes = 4096;
+    let db = Engine::open(options).unwrap();
+
+    for generation in 0..5 {
+        let mut batch = meteordb::WriteBatch::default();
+        for index in 0..128 {
+            batch.put(
+                format!("key-{index:03}"),
+                format!("value-{generation}-{index:03}"),
+            );
+        }
+        db.write(batch).unwrap();
+        db.flush().unwrap();
+    }
+
+    for index in 0..128 {
+        assert_eq!(
+            db.get(format!("key-{index:03}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(format!("value-4-{index:03}").as_bytes())
+        );
+    }
+    assert!(db.compact().unwrap());
+    for index in 0..128 {
+        assert_eq!(
+            db.get(format!("key-{index:03}").as_bytes())
+                .unwrap()
+                .as_deref(),
+            Some(format!("value-4-{index:03}").as_bytes())
+        );
+    }
+}
+
+#[test]
 fn old_input_files_live_until_a_scan_releases_its_version() {
     let dir = tempfile::tempdir().unwrap();
     let mut options = Options::new(dir.path());

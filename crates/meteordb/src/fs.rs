@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, Write};
+use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -36,6 +36,7 @@ pub trait DurableReadFile: Read + Seek + Send {
 
 struct OsDurableFile(File);
 struct OsDurableReadFile(File);
+struct OwnedDurableReadFile(Cursor<Vec<u8>>);
 
 impl DurableFile for OsDurableFile {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -62,6 +63,25 @@ impl Seek for OsDurableReadFile {
 impl DurableReadFile for OsDurableReadFile {
     fn len(&self) -> std::io::Result<u64> {
         self.0.metadata().map(|metadata| metadata.len())
+    }
+}
+
+impl Read for OwnedDurableReadFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl Seek for OwnedDurableReadFile {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+impl DurableReadFile for OwnedDurableReadFile {
+    fn len(&self) -> std::io::Result<u64> {
+        u64::try_from(self.0.get_ref().len())
+            .map_err(|_| std::io::Error::other("read buffer length exceeds u64"))
     }
 }
 
@@ -99,19 +119,25 @@ pub trait DurableFs: Send + Sync {
         Ok(Box::new(OsDurableFile(open_regular(path, &mut options)?)))
     }
 
-    /// Opens an existing regular file for reading without following symlinks.
+    /// Opens an existing regular file for random-access reading.
+    ///
+    /// The compatibility default owns the bytes returned by [`Self::read_file`],
+    /// so implementations that intercept only that method continue to affect
+    /// manifest, WAL, and SSTable readers.
     fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        Ok(Box::new(OsDurableReadFile(open_regular(
-            path,
-            &mut options,
-        )?)))
+        Ok(Box::new(OwnedDurableReadFile(Cursor::new(
+            self.read_file(path)?,
+        ))))
     }
 
     /// Reads an existing regular file without following symlinks.
+    ///
+    /// This default performs the OS read directly rather than calling
+    /// [`Self::open_read`], avoiding recursion with its compatibility adapter.
     fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
-        let mut file = self.open_read(path)?;
+        let mut options = OpenOptions::new();
+        options.read(true);
+        let mut file = open_regular(path, &mut options)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -188,6 +214,15 @@ impl DurableFs for OsDurableFs {
         Ok(Box::new(OsDurableFile(
             OpenOptions::new().create(true).append(true).open(path)?,
         )))
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        Ok(Box::new(OsDurableReadFile(open_regular(
+            path,
+            &mut options,
+        )?)))
     }
 
     fn sync_directory(&self, path: &Path) -> std::io::Result<()> {

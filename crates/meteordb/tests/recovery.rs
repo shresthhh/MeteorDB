@@ -49,6 +49,33 @@ fn buffered_writes_survive_restart_after_explicit_sync() {
 }
 
 #[test]
+fn read_file_only_filesystems_intercept_manifest_wal_and_sstable_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let configured = options(dir.path());
+    let db = Engine::open(configured.clone()).unwrap();
+    db.put(b"table-key", b"table-value").unwrap();
+    db.flush().unwrap();
+    db.put(b"wal-key", b"wal-value").unwrap();
+    drop(db);
+
+    let fs = Arc::new(ReadFileInterceptFs::default());
+    let reopened = Engine::open_with_fs(configured, fs.clone()).unwrap();
+    assert_eq!(
+        reopened.get(b"table-key").unwrap().as_deref(),
+        Some(&b"table-value"[..])
+    );
+    assert_eq!(
+        reopened.get(b"wal-key").unwrap().as_deref(),
+        Some(&b"wal-value"[..])
+    );
+
+    let reads = fs.reads.lock().unwrap();
+    assert!(reads.iter().any(|name| name.starts_with("MANIFEST-")));
+    assert!(reads.iter().any(|name| name.ends_with(".wal")));
+    assert!(reads.iter().any(|name| name.ends_with(".sst")));
+}
+
+#[test]
 fn explicit_sync_synchronizes_every_owned_wal_after_rotation() {
     let dir = tempfile::tempdir().unwrap();
     let gate = Arc::new(SyncGate::default());
@@ -591,6 +618,35 @@ struct TrackingFile {
     inner: Box<dyn DurableFile>,
     name: String,
     events: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Default)]
+struct ReadFileInterceptFs {
+    inner: OsDurableFs,
+    reads: Mutex<Vec<String>>,
+}
+
+impl DurableFs for ReadFileInterceptFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.reads.lock().unwrap().push(file_name(path));
+        self.inner.read_file(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 impl DurableFile for TrackingFile {

@@ -497,9 +497,7 @@ fn reader_block_limit(options: &Options) -> usize {
 }
 
 fn reader_metadata_limit(options: &Options) -> usize {
-    options
-        .target_sstable_bytes
-        .max(options.max_key_bytes.saturating_mul(2).saturating_add(128))
+    options.sstable_metadata_bytes_limit()
 }
 
 fn io_error(operation: &'static str, path: &Path, source: std::io::Error) -> Error {

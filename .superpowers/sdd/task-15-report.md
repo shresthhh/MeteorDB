@@ -5,8 +5,36 @@
 - `82fa15a` — `fix: harden task 15 inspection and benchmarks`
 - Documentation/report commit: the commit containing this updated report.
 - Remaining review fixes: the commit containing this updated report.
+- Final review fixes: the commit containing this updated report.
 
 ## Review findings fixed
+
+### Final Task 15 review fixes
+
+- Engine SSTable readers no longer use `target_sstable_bytes` as a metadata
+  ceiling. `Options::sstable_metadata_bytes_limit` is the single engine and
+  compaction calculation, preventing the two read paths from drifting.
+- The trusted calculation covers the active memtable's one-batch overshoot,
+  `max_batch_bytes`, zero-byte internal-key expansion, engine-value headers,
+  next-fit data-block fragmentation (including tiny blocks), Bloom-filter
+  bits, index separators/varints/handles/restarts, properties keys, and all
+  metadata block trailers. Checked ceiling division and saturating arithmetic
+  keep extreme trusted configurations defined without wrapping.
+- The ceiling remains finite for finite configured limits. Footer metadata
+  handles are still summed and compared with it before a metadata payload is
+  allocated; the sparse crafted oversized-metadata regression continues to
+  prove early rejection.
+- `DurableFs::open_read` is again a compatibility adapter over the
+  implementer's `read_file`, retaining those owned bytes in a seekable handle.
+  The default `read_file` performs a direct same-call no-follow OS read, so the
+  defaults cannot recurse. `OsDurableFs` overrides `open_read` to preserve lazy
+  same-handle I/O.
+- A virtual filesystem overriding only `read_file` now demonstrably
+  intercepts manifest replay, WAL recovery, and lazy SSTable access.
+- An extreme regression uses one-byte block targets, restart interval one, 128
+  small records per flush, five generations, point reads before and after
+  compaction, and a deliberately tiny table target. The previous ceiling
+  rejected 3,808 valid metadata bytes against a 192-byte limit.
 
 ### Remaining Task 15 review fixes
 
@@ -132,6 +160,13 @@ After implementation, the manifest, SSTable, and CLI focused suites pass 26,
 18, and 15 tests respectively. The SSTable suite includes sparse oversized
 metadata handles and a `u64::MAX` property-key length declaration without
 constructing corresponding payload buffers.
+
+The final regressions were also run red first. The tiny-block engine test
+failed with `metadata handle bytes 3808 exceed metadata allocation limit 192`.
+The compatibility filesystem test failed because no `MANIFEST-*` read reached
+its `read_file` override. After implementation, the affected compaction,
+recovery, manifest, WAL, SSTable, and read-path suites pass 14, 21, 26, 20, 18,
+and 16 tests respectively.
 
 ## Full GCC validation
 
