@@ -140,36 +140,33 @@ impl BlockCache {
         value: Arc<[u8]>,
     ) -> Result<bool> {
         let mut state = self.lock_result()?;
-        let stamp = state.bump_stamp();
         let key = CacheKey {
             file_number,
             block_offset,
             kind,
         };
-        let partition = state.partition_mut(kind.partition());
-        if value.len() > partition.capacity_bytes {
+        let partition_kind = kind.partition();
+        if value.len() > state.partition(partition_kind).capacity_bytes {
             return Ok(false);
         }
+        let stamp = state.bump_stamp();
+        let partition = state.partition_mut(partition_kind);
         if let Some(replaced) = partition.entries.remove(&key) {
-            partition.usage_bytes -= replaced.value.len();
+            partition.usage_bytes = partition
+                .usage_bytes
+                .checked_sub(replaced.value.len())
+                .expect("cache usage includes every retained entry");
         }
-        partition.usage_bytes += value.len();
-        partition.entries.insert(key, CacheEntry { value, stamp });
-        partition.admissions = partition.admissions.saturating_add(1);
-        while partition.usage_bytes > partition.capacity_bytes {
-            let oldest = partition
-                .entries
-                .iter()
-                .min_by_key(|(key, entry)| (entry.stamp, **key))
-                .map(|(key, _)| *key)
-                .expect("an over-budget partition contains an entry");
-            let removed = partition
-                .entries
-                .remove(&oldest)
-                .expect("selected cache entry still exists");
-            partition.usage_bytes -= removed.value.len();
+        while !fits_in_budget(partition.usage_bytes, value.len(), partition.capacity_bytes) {
+            partition.evict_oldest();
             partition.evictions = partition.evictions.saturating_add(1);
         }
+        partition.usage_bytes = partition
+            .usage_bytes
+            .checked_add(value.len())
+            .expect("cache admission was checked against partition capacity");
+        partition.entries.insert(key, CacheEntry { value, stamp });
+        partition.admissions = partition.admissions.saturating_add(1);
         Ok(true)
     }
 
@@ -188,9 +185,42 @@ impl BlockCache {
 
 impl CacheState {
     fn bump_stamp(&mut self) -> u64 {
+        if self.next_stamp == u64::MAX {
+            self.renormalize_stamps();
+        }
         let stamp = self.next_stamp;
-        self.next_stamp = self.next_stamp.wrapping_add(1);
+        self.next_stamp = self.next_stamp.saturating_add(1);
         stamp
+    }
+
+    fn renormalize_stamps(&mut self) {
+        let mut ordered = self
+            .metadata
+            .entries
+            .iter()
+            .map(|(key, entry)| (entry.stamp, CachePartition::Metadata, *key))
+            .chain(
+                self.data
+                    .entries
+                    .iter()
+                    .map(|(key, entry)| (entry.stamp, CachePartition::Data, *key)),
+            )
+            .collect::<Vec<_>>();
+        ordered.sort_unstable();
+        for (stamp, (_, partition, key)) in ordered.into_iter().enumerate() {
+            self.partition_mut(partition)
+                .entries
+                .get_mut(&key)
+                .expect("ranked cache entry still exists")
+                .stamp = u64::try_from(stamp).unwrap_or(u64::MAX);
+        }
+        self.next_stamp = u64::try_from(
+            self.metadata
+                .entries
+                .len()
+                .saturating_add(self.data.entries.len()),
+        )
+        .unwrap_or(u64::MAX);
     }
 
     fn partition(&self, partition: CachePartition) -> &PartitionState {
@@ -222,6 +252,13 @@ impl PartitionState {
     }
 
     fn snapshot(&self) -> CachePartitionSnapshot {
+        debug_assert_eq!(
+            self.usage_bytes,
+            self.entries
+                .values()
+                .try_fold(0_usize, |total, entry| total.checked_add(entry.value.len()))
+                .expect("retained cache entry sizes fit in the partition budget")
+        );
         CachePartitionSnapshot {
             capacity_bytes: self.capacity_bytes,
             usage_bytes: self.usage_bytes,
@@ -232,6 +269,27 @@ impl PartitionState {
             evictions: self.evictions,
         }
     }
+
+    fn evict_oldest(&mut self) {
+        let oldest = self
+            .entries
+            .iter()
+            .min_by_key(|(key, entry)| (entry.stamp, **key))
+            .map(|(key, _)| *key)
+            .expect("a partition needing room contains an entry");
+        let removed = self
+            .entries
+            .remove(&oldest)
+            .expect("selected cache entry still exists");
+        self.usage_bytes = self
+            .usage_bytes
+            .checked_sub(removed.value.len())
+            .expect("cache usage includes every retained entry");
+    }
+}
+
+fn fits_in_budget(usage_bytes: usize, entry_bytes: usize, capacity_bytes: usize) -> bool {
+    entry_bytes <= capacity_bytes.saturating_sub(usage_bytes)
 }
 
 /// Owned statistics for one independently budgeted cache partition.
@@ -260,4 +318,60 @@ pub struct CacheSnapshot {
     pub metadata: CachePartitionSnapshot,
     /// Data-block partition.
     pub data: CachePartitionSnapshot,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn value(byte: u8, len: usize) -> Arc<[u8]> {
+        vec![byte; len].into()
+    }
+
+    fn assert_exact_usage(partition: &PartitionState) {
+        assert_eq!(
+            partition.usage_bytes,
+            partition
+                .entries
+                .values()
+                .try_fold(0_usize, |total, entry| total.checked_add(entry.value.len()))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn near_overflow_recency_keeps_new_and_recent_entries() {
+        let cache = BlockCache::new(15).unwrap();
+        cache.insert(1, 1, BlockKind::Data, value(1, 4)).unwrap();
+        cache.insert(1, 2, BlockKind::Data, value(2, 4)).unwrap();
+        {
+            let mut state = cache.lock();
+            state.next_stamp = u64::MAX;
+        }
+
+        assert!(cache.get(1, 1, BlockKind::Data).unwrap().is_some());
+        cache.insert(1, 3, BlockKind::Data, value(3, 5)).unwrap();
+
+        assert!(cache.get(1, 1, BlockKind::Data).unwrap().is_some());
+        assert!(cache.get(1, 2, BlockKind::Data).unwrap().is_none());
+        assert!(cache.get(1, 3, BlockKind::Data).unwrap().is_some());
+    }
+
+    #[test]
+    fn accounting_stays_exact_across_replacement_and_eviction() {
+        let cache = BlockCache::new(10).unwrap();
+        cache.insert(1, 1, BlockKind::Data, value(1, 3)).unwrap();
+        cache.insert(1, 2, BlockKind::Data, value(2, 4)).unwrap();
+        cache.insert(1, 1, BlockKind::Data, value(3, 6)).unwrap();
+
+        let state = cache.lock();
+        assert_exact_usage(&state.data);
+        assert!(state.data.usage_bytes <= state.data.capacity_bytes);
+    }
+
+    #[test]
+    fn near_max_accounting_rejects_addition_that_cannot_fit() {
+        assert!(!fits_in_budget(usize::MAX - 1, 2, usize::MAX));
+        assert!(fits_in_budget(usize::MAX - 1, 1, usize::MAX));
+    }
 }

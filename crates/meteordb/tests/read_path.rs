@@ -34,6 +34,33 @@ fn cache_partitions_reserve_independent_twenty_eighty_budgets() {
 }
 
 #[test]
+fn cache_handles_small_capacities_and_oversized_entries_without_eviction() {
+    let cache = BlockCache::new(4).unwrap();
+    assert_eq!(cache.capacity_bytes(CachePartition::Metadata), 0);
+    assert_eq!(cache.capacity_bytes(CachePartition::Data), 4);
+
+    assert!(
+        !cache
+            .insert(1, 1, BlockKind::Filter, Arc::from([1_u8]))
+            .unwrap()
+    );
+    assert!(
+        cache
+            .insert(1, 2, BlockKind::Data, Arc::from([2_u8; 4]))
+            .unwrap()
+    );
+    assert!(
+        !cache
+            .insert(1, 3, BlockKind::Data, Arc::from([3_u8; 5]))
+            .unwrap()
+    );
+
+    assert!(cache.get(1, 2, BlockKind::Data).unwrap().is_some());
+    assert_eq!(cache.usage_bytes(CachePartition::Metadata), 0);
+    assert_eq!(cache.usage_bytes(CachePartition::Data), 4);
+}
+
+#[test]
 fn cache_hits_refresh_deterministic_lru_recency() {
     let cache = BlockCache::new(10).unwrap();
     cache

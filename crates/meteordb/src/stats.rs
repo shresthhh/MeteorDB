@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::{BlockCache, CacheSnapshot, NUM_LEVELS};
 
@@ -7,7 +7,7 @@ use crate::{BlockCache, CacheSnapshot, NUM_LEVELS};
 pub struct StatsSnapshot {
     /// Valid point reads, including snapshot reads and misses.
     pub point_reads: u64,
-    /// Total SSTables opened and queried by those reads.
+    /// Saturating sum of SSTables opened and queried across all levels.
     pub sstable_probes: u64,
     /// Bloom-filter queries performed by point reads.
     pub bloom_checks: u64,
@@ -31,49 +31,133 @@ impl StatsSnapshot {
 }
 
 pub(crate) struct ReadStats {
-    point_reads: AtomicU64,
-    bloom_checks: AtomicU64,
-    bloom_useful_negatives: AtomicU64,
-    level_table_probes: [AtomicU64; NUM_LEVELS],
+    state: Mutex<ReadStatsState>,
+}
+
+#[derive(Default)]
+struct ReadStatsState {
+    point_reads: u64,
+    bloom_checks: u64,
+    bloom_useful_negatives: u64,
+    level_table_probes: [u64; NUM_LEVELS],
+}
+
+impl ReadStats {
+    pub(crate) fn record_point_read(&self) {
+        let mut state = self.lock();
+        state.point_reads = state.point_reads.saturating_add(1);
+    }
+
+    pub(crate) fn record_bloom_check(&self, useful_negative: bool) {
+        let mut state = self.lock();
+        state.bloom_checks = state.bloom_checks.saturating_add(1);
+        if useful_negative {
+            state.bloom_useful_negatives = state.bloom_useful_negatives.saturating_add(1);
+        }
+    }
+
+    pub(crate) fn record_table_probe(&self, level: usize) {
+        let mut state = self.lock();
+        state.level_table_probes[level] = state.level_table_probes[level].saturating_add(1);
+    }
+
+    pub(crate) fn snapshot(&self, cache: &BlockCache) -> StatsSnapshot {
+        let (point_reads, bloom_checks, bloom_useful_negatives, level_table_probes) = {
+            let state = self.lock();
+            (
+                state.point_reads,
+                state.bloom_checks,
+                state.bloom_useful_negatives,
+                state.level_table_probes,
+            )
+        };
+        StatsSnapshot {
+            point_reads,
+            sstable_probes: level_table_probes
+                .iter()
+                .copied()
+                .fold(0_u64, u64::saturating_add),
+            bloom_checks,
+            bloom_useful_negatives,
+            cache: cache.snapshot(),
+            level_table_probes,
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadStatsState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 impl Default for ReadStats {
     fn default() -> Self {
         Self {
-            point_reads: AtomicU64::new(0),
-            bloom_checks: AtomicU64::new(0),
-            bloom_useful_negatives: AtomicU64::new(0),
-            level_table_probes: std::array::from_fn(|_| AtomicU64::new(0)),
+            state: Mutex::new(ReadStatsState::default()),
         }
     }
 }
 
-impl ReadStats {
-    pub(crate) fn record_point_read(&self) {
-        self.point_reads.fetch_add(1, Ordering::Relaxed);
-    }
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread;
 
-    pub(crate) fn record_bloom_check(&self, useful_negative: bool) {
-        self.bloom_checks.fetch_add(1, Ordering::Relaxed);
-        if useful_negative {
-            self.bloom_useful_negatives.fetch_add(1, Ordering::Relaxed);
+    use super::*;
+
+    #[test]
+    fn related_statistics_remain_coherent_during_concurrent_updates() {
+        let stats = Arc::new(ReadStats::default());
+        let cache = Arc::new(BlockCache::new(10).unwrap());
+        let done = Arc::new(AtomicBool::new(false));
+        let writer_stats = stats.clone();
+        let writer_done = done.clone();
+        let writer = thread::spawn(move || {
+            for index in 0..250_000 {
+                writer_stats.record_bloom_check(true);
+                writer_stats.record_table_probe(index % NUM_LEVELS);
+            }
+            writer_done.store(true, Ordering::Release);
+        });
+
+        while !done.load(Ordering::Acquire) {
+            let snapshot = stats.snapshot(&cache);
+            assert!(snapshot.bloom_useful_negatives <= snapshot.bloom_checks);
+            assert_eq!(
+                snapshot.sstable_probes,
+                snapshot
+                    .level_table_probes
+                    .iter()
+                    .copied()
+                    .fold(0_u64, u64::saturating_add)
+            );
         }
+        writer.join().unwrap();
     }
 
-    pub(crate) fn record_table_probe(&self, level: usize) {
-        self.level_table_probes[level].fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub(crate) fn snapshot(&self, cache: &BlockCache) -> StatsSnapshot {
-        let level_table_probes =
-            std::array::from_fn(|level| self.level_table_probes[level].load(Ordering::Relaxed));
-        StatsSnapshot {
-            point_reads: self.point_reads.load(Ordering::Relaxed),
-            sstable_probes: level_table_probes.iter().sum(),
-            bloom_checks: self.bloom_checks.load(Ordering::Relaxed),
-            bloom_useful_negatives: self.bloom_useful_negatives.load(Ordering::Relaxed),
-            cache: cache.snapshot(),
-            level_table_probes,
+    #[test]
+    fn read_statistics_saturate_instead_of_wrapping() {
+        let stats = ReadStats::default();
+        {
+            let mut state = stats.lock();
+            state.point_reads = u64::MAX;
+            state.bloom_checks = u64::MAX;
+            state.bloom_useful_negatives = u64::MAX;
+            state.level_table_probes[0] = u64::MAX;
+            state.level_table_probes[1] = 1;
         }
+
+        stats.record_point_read();
+        stats.record_bloom_check(true);
+        stats.record_table_probe(0);
+        let snapshot = stats.snapshot(&BlockCache::new(10).unwrap());
+
+        assert_eq!(snapshot.point_reads, u64::MAX);
+        assert_eq!(snapshot.bloom_checks, u64::MAX);
+        assert_eq!(snapshot.bloom_useful_negatives, u64::MAX);
+        assert_eq!(snapshot.level_table_probes[0], u64::MAX);
+        assert_eq!(snapshot.sstable_probes, u64::MAX);
     }
 }
