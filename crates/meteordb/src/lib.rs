@@ -53,4 +53,7 @@ pub use sstable::{
 pub use stats::StatsSnapshot;
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
 pub use wal::{RecoveredBatch, WalWriter, replay_wal, replay_wal_with_fs};
-pub use workloads::{CacheLookup, InferenceCache, InferenceEntry, InferenceKey};
+pub use workloads::{
+    CacheLookup, Embedding, EmbeddingKey, EmbeddingStore, FeatureKey, FeatureRecord, FeatureStore,
+    FeatureValue, InferenceCache, InferenceEntry, InferenceKey, ScalarType,
+};

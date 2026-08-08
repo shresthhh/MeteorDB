@@ -4,7 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use meteordb::{
-    CacheLookup, Engine, Error, InferenceCache, InferenceEntry, InferenceKey, ManualClock, Options,
+    CacheLookup, Embedding, EmbeddingKey, EmbeddingStore, Engine, Error, FeatureKey, FeatureRecord,
+    FeatureStore, FeatureValue, InferenceCache, InferenceEntry, InferenceKey, ManualClock, Options,
+    ScalarType,
 };
 
 fn key(version: &[u8], input: &[u8]) -> InferenceKey {
@@ -452,4 +454,247 @@ fn raw_cache_entry(engine: &Engine) -> (Vec<u8>, Vec<u8>) {
         .unwrap();
     assert_eq!(entries.len(), 1);
     entries.into_iter().next().unwrap()
+}
+
+fn feature_record(score: f64, label: &[u8]) -> FeatureRecord {
+    let mut record = FeatureRecord::new();
+    record
+        .insert(b"score", FeatureValue::F64(score))
+        .unwrap()
+        .insert(b"label", FeatureValue::Bytes(label.to_vec()))
+        .unwrap();
+    record
+}
+
+#[test]
+fn feature_store_keys_are_delimiter_safe_ordered_and_namespace_isolated() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let left = FeatureStore::new(engine.clone(), b"tenant\0a").unwrap();
+    let right = FeatureStore::new(engine, b"tenant").unwrap();
+    let ambiguous_left = FeatureKey::new(b"ab", b"c", b"group\0x", -1);
+    let ambiguous_right = FeatureKey::new(b"a", b"bc", b"group\0x", -1);
+
+    left.put(&ambiguous_left, &feature_record(1.0, b"left"), None)
+        .unwrap();
+    left.put(&ambiguous_right, &feature_record(2.0, b"right"), None)
+        .unwrap();
+    right
+        .put(&ambiguous_left, &feature_record(3.0, b"other"), None)
+        .unwrap();
+
+    assert_eq!(
+        left.get(&ambiguous_left).unwrap().unwrap().get(b"label"),
+        Some(&FeatureValue::Bytes(b"left".to_vec()))
+    );
+    assert_eq!(
+        left.get(&ambiguous_right).unwrap().unwrap().get(b"label"),
+        Some(&FeatureValue::Bytes(b"right".to_vec()))
+    );
+    assert_eq!(
+        right.get(&ambiguous_left).unwrap().unwrap().get(b"label"),
+        Some(&FeatureValue::Bytes(b"other".to_vec()))
+    );
+}
+
+#[test]
+fn feature_store_latest_as_of_and_history_follow_signed_event_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        FeatureStore::new(Engine::open(Options::new(dir.path())).unwrap(), b"events").unwrap();
+    for (time, score) in [(-10, 1.0), (0, 2.0), (25, 3.0)] {
+        store
+            .put(
+                &FeatureKey::new(b"user", b"42", b"ranking", time),
+                &feature_record(score, b"row"),
+                None,
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        store
+            .latest(b"user", b"42", b"ranking")
+            .unwrap()
+            .unwrap()
+            .0
+            .event_time(),
+        25
+    );
+    assert_eq!(
+        store
+            .as_of(b"user", b"42", b"ranking", 7)
+            .unwrap()
+            .unwrap()
+            .0
+            .event_time(),
+        0
+    );
+    assert_eq!(
+        store
+            .history(b"user", b"42", b"ranking", -10..=0)
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key.event_time())
+            .collect::<Vec<_>>(),
+        vec![-10, 0]
+    );
+}
+
+#[test]
+fn feature_store_group_scan_and_batch_read_use_complete_atomic_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        FeatureStore::new(Engine::open(Options::new(dir.path())).unwrap(), b"rows").unwrap();
+    let first = FeatureKey::new(b"user", b"1", b"profile", 100);
+    let second = FeatureKey::new(b"user", b"1", b"profile", 200);
+    store
+        .put(&first, &feature_record(1.0, b"first"), None)
+        .unwrap();
+    store
+        .put(&second, &feature_record(2.0, b"second"), None)
+        .unwrap();
+
+    let rows = store.scan_group(b"user", b"1", b"profile").unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|(key, _)| key.event_time())
+            .collect::<Vec<_>>(),
+        vec![100, 200]
+    );
+    assert_eq!(
+        store.get_many([&second, &first, &second]).unwrap(),
+        vec![
+            Some(feature_record(2.0, b"second")),
+            Some(feature_record(1.0, b"first")),
+            Some(feature_record(2.0, b"second")),
+        ]
+    );
+}
+
+#[test]
+fn feature_store_ttl_and_typed_encoding_are_validated() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ManualClock::new(5_000));
+    let engine = Engine::open_with_clock(Options::new(dir.path()), clock.clone()).unwrap();
+    let store = FeatureStore::new(engine, b"ttl").unwrap();
+    let key = FeatureKey::new(b"user", b"1", b"live", 10);
+    let mut record = FeatureRecord::new();
+    assert!(matches!(
+        record.insert(b"bad", FeatureValue::F64(f64::NAN)),
+        Err(Error::InvalidArgument(message)) if message.contains("finite")
+    ));
+    record
+        .insert(b"flag", FeatureValue::Bool(true))
+        .unwrap()
+        .insert(b"count", FeatureValue::I64(-7))
+        .unwrap()
+        .insert(b"text", FeatureValue::String("meteor".into()))
+        .unwrap();
+
+    store.put(&key, &record, Some(10)).unwrap();
+    assert_eq!(store.get(&key).unwrap(), Some(record));
+    clock.set(5_010).unwrap();
+    assert_eq!(store.get(&key).unwrap(), None);
+}
+
+#[test]
+fn embedding_validates_lengths_dimensions_finiteness_and_little_endian_bytes() {
+    assert!(matches!(
+        Embedding::from_bytes(0, ScalarType::F32, Vec::new()),
+        Err(Error::InvalidArgument(message)) if message.contains("dimension")
+    ));
+    assert!(matches!(
+        Embedding::from_bytes(2, ScalarType::F32, vec![0; 7]),
+        Err(Error::InvalidArgument(message)) if message.contains("8")
+    ));
+    assert!(matches!(
+        Embedding::from_bytes(2, ScalarType::F16, vec![0; 6]),
+        Err(Error::InvalidArgument(message)) if message.contains("4")
+    ));
+    assert!(matches!(
+        Embedding::from_f32(&[1.0, f32::INFINITY]),
+        Err(Error::InvalidArgument(message)) if message.contains("finite")
+    ));
+    assert!(matches!(
+        Embedding::from_f16_bits(&[0x3c00, 0x7e00]),
+        Err(Error::InvalidArgument(message)) if message.contains("finite")
+    ));
+
+    let embedding = Embedding::from_f32(&[1.0, -2.5]).unwrap();
+    assert_eq!(embedding.dimension(), 2);
+    assert_eq!(embedding.scalar_type(), ScalarType::F32);
+    assert_eq!(
+        embedding.vector_bytes(),
+        [1.0f32.to_le_bytes(), (-2.5f32).to_le_bytes()].concat()
+    );
+    assert_eq!(embedding.to_f32().unwrap(), vec![1.0, -2.5]);
+    assert!(matches!(
+        embedding.to_f16_bits(),
+        Err(Error::InvalidArgument(message)) if message.contains("F16")
+    ));
+}
+
+#[test]
+fn embedding_store_isolates_models_preserves_metadata_and_batch_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        EmbeddingStore::new(Engine::open(Options::new(dir.path())).unwrap(), b"tenant").unwrap();
+    let v1 = EmbeddingKey::new(b"doc\0one").with_model(b"encoder", b"v1");
+    let v2 = EmbeddingKey::new(b"doc\0one").with_model(b"encoder", b"v2");
+    let missing = EmbeddingKey::new(b"missing").with_model(b"encoder", b"v1");
+    let mut first = Embedding::from_f32(&[1.0, 2.0]).unwrap();
+    first
+        .set_model(b"encoder", b"v1")
+        .insert_metadata(b"source", b"docs")
+        .unwrap();
+    let mut second = Embedding::from_f16_bits(&[0x3c00, 0xc000]).unwrap();
+    second.set_model(b"encoder", b"v2");
+
+    store.put(&v1, &first, None).unwrap();
+    store.put(&v2, &second, None).unwrap();
+
+    let results = store.get_many([&v2, &missing, &v1, &v2]).unwrap();
+    assert_eq!(
+        results,
+        vec![
+            Some(second.clone()),
+            None,
+            Some(first.clone()),
+            Some(second)
+        ]
+    );
+    assert_eq!(
+        results[2]
+            .as_ref()
+            .unwrap()
+            .metadata()
+            .get(b"source".as_slice()),
+        Some(&b"docs".to_vec())
+    );
+    assert!(matches!(
+        store.put(&v2, &first, None),
+        Err(Error::InvalidArgument(message)) if message.contains("model")
+    ));
+}
+
+#[test]
+fn embedding_batch_put_is_atomic_and_restart_round_trips_portable_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = Options::new(dir.path());
+    let first_key = EmbeddingKey::new(b"a");
+    let second_key = EmbeddingKey::new(b"b");
+    let first = Embedding::from_f32(&[0.25, -0.5, 4.0]).unwrap();
+    let second = Embedding::from_f16_bits(&[0x0000, 0x3c00, 0xc000]).unwrap();
+    {
+        let store =
+            EmbeddingStore::new(Engine::open(options.clone()).unwrap(), b"restart").unwrap();
+        store
+            .put_many([(&first_key, &first), (&second_key, &second)])
+            .unwrap();
+    }
+
+    let store = EmbeddingStore::new(Engine::open(options).unwrap(), b"restart").unwrap();
+    assert_eq!(store.get(&first_key).unwrap(), Some(first));
+    assert_eq!(store.get(&second_key).unwrap(), Some(second));
 }
