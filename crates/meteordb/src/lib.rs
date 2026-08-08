@@ -36,7 +36,9 @@ pub use compaction::{
 };
 pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
-pub use fs::{DurableFile, DurableFs, DurableReadFile, OsDurableFs};
+pub use fs::{
+    DurableFile, DurableFs, DurableReadFile, FaultEvent, FaultOperation, FaultyFs, OsDurableFs,
+};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
 pub use iter::{KvIterator, ScanBounds};
 pub use manifest::{

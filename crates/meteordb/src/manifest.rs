@@ -487,18 +487,33 @@ impl VersionSet {
         let manifest_path = directory.join(&manifest_name);
         let manifest_temp = directory.join(format!("{manifest_name}.tmp"));
         let current_path = directory.join("CURRENT");
+        let current_temp = directory.join("CURRENT.tmp");
         if fs
             .entry_exists(&current_path)
             .map_err(|source| io_error("check CURRENT", &current_path, source))?
-            || fs
-                .entry_exists(&manifest_path)
-                .map_err(|source| io_error("check manifest", &manifest_path, source))?
         {
             return Err(Error::InvalidArgument(format!(
                 "database already exists at {}",
                 directory.display()
             )));
         }
+        if fs
+            .entry_exists(&manifest_path)
+            .map_err(|source| io_error("check manifest", &manifest_path, source))?
+        {
+            if fs.validate_file(&manifest_path).is_err() {
+                return Err(Error::InvalidArgument(format!(
+                    "database already exists at {}",
+                    directory.display()
+                )));
+            }
+            remove_temporary_if_present(&current_temp, fs.as_ref())?;
+            replace_current(&directory, &manifest_name, fs.as_ref())?;
+            drop(lock);
+            return Self::recover_with_fs(directory, fs);
+        }
+        remove_temporary_if_present(&manifest_temp, fs.as_ref())?;
+        remove_temporary_if_present(&current_temp, fs.as_ref())?;
 
         let initial = initial_edit();
         let encoded = encode_edit(&initial)?;
@@ -959,6 +974,17 @@ fn replace_current(directory: &Path, manifest_name: &str, fs: &dyn DurableFs) ->
         .map_err(|source| io_error("install CURRENT", &current_path, source))?;
     fs.sync_directory(directory)
         .map_err(|source| io_error("sync CURRENT directory", directory, source))
+}
+
+fn remove_temporary_if_present(path: &Path, fs: &dyn DurableFs) -> Result<()> {
+    if fs
+        .entry_exists(path)
+        .map_err(|source| io_error("check temporary metadata file", path, source))?
+    {
+        fs.remove_file(path)
+            .map_err(|source| io_error("remove temporary metadata file", path, source))?;
+    }
+    Ok(())
 }
 
 struct ManifestWriter {

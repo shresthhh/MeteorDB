@@ -1,6 +1,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -231,6 +234,184 @@ impl DurableFs for OsDurableFs {
 
     fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
         std::fs::rename(source, destination)
+    }
+}
+
+/// A crash-sensitive filesystem operation observed by [`FaultyFs`].
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum FaultOperation {
+    /// Bytes are written to a WAL, manifest, or temporary SSTable.
+    Write,
+    /// An open file is synchronized.
+    FileSync,
+    /// An existing immutable file is synchronized by path.
+    SyncFile,
+    /// A source path atomically replaces a destination path.
+    AtomicReplace,
+    /// A temporary immutable file is atomically installed.
+    AtomicInstall,
+    /// A directory is synchronized.
+    DirectorySync,
+    /// A persistent file is shortened.
+    Truncate,
+    /// An obsolete file is removed.
+    Remove,
+}
+
+/// One deterministic operation recorded by [`FaultyFs`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FaultEvent {
+    /// One-based position in the complete operation stream.
+    pub index: usize,
+    /// Kind of durable operation.
+    pub operation: FaultOperation,
+    /// Primary path affected by the operation.
+    pub path: PathBuf,
+}
+
+#[derive(Default)]
+struct FaultState {
+    next_index: AtomicUsize,
+    events: Mutex<Vec<FaultEvent>>,
+    fail_at: Option<usize>,
+}
+
+impl FaultState {
+    fn observe(&self, operation: FaultOperation, path: &Path) -> std::io::Result<()> {
+        let index = self.next_index.fetch_add(1, Ordering::SeqCst) + 1;
+        self.events.lock().unwrap().push(FaultEvent {
+            index,
+            operation,
+            path: path.to_path_buf(),
+        });
+        if self.fail_at == Some(index) {
+            return Err(std::io::Error::other(format!(
+                "injected crash at operation {index}: {operation:?} {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// An operating-system filesystem wrapper with a reproducible crash point.
+///
+/// Every mutation relevant to storage durability receives a one-based index.
+/// [`FaultyFs::recording`] discovers the stable sequence for a workload, and
+/// [`FaultyFs::fail_at`] replays that workload while returning an I/O error
+/// immediately before the selected physical operation. Tests can then discard
+/// the engine and reopen with a normal filesystem to model a process crash at
+/// that boundary.
+pub struct FaultyFs {
+    inner: OsDurableFs,
+    state: Arc<FaultState>,
+}
+
+impl FaultyFs {
+    /// Creates a wrapper that records every crash-sensitive operation.
+    pub fn recording() -> Self {
+        Self {
+            inner: OsDurableFs,
+            state: Arc::new(FaultState::default()),
+        }
+    }
+
+    /// Creates a wrapper that fails immediately before one one-based operation.
+    pub fn fail_at(operation_index: usize) -> Self {
+        Self {
+            inner: OsDurableFs,
+            state: Arc::new(FaultState {
+                fail_at: Some(operation_index),
+                ..FaultState::default()
+            }),
+        }
+    }
+
+    /// Returns a snapshot of all operations observed so far.
+    pub fn events(&self) -> Vec<FaultEvent> {
+        self.state.events.lock().unwrap().clone()
+    }
+
+    fn wrap(&self, path: &Path, file: Box<dyn DurableFile>) -> Box<dyn DurableFile> {
+        Box::new(FaultyFile {
+            inner: file,
+            path: path.to_path_buf(),
+            state: self.state.clone(),
+        })
+    }
+}
+
+struct FaultyFile {
+    inner: Box<dyn DurableFile>,
+    path: PathBuf,
+    state: Arc<FaultState>,
+}
+
+impl DurableFile for FaultyFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::Write, &self.path)?;
+        self.inner.write_all(bytes)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::FileSync, &self.path)?;
+        self.inner.sync_all()
+    }
+}
+
+impl DurableFs for FaultyFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path).map(|file| self.wrap(path, file))
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path).map(|file| self.wrap(path, file))
+    }
+
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner
+            .append_existing(path)
+            .map(|file| self.wrap(path, file))
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        self.inner.open_read(path)
+    }
+
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.inner.read_file(path)
+    }
+
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::SyncFile, path)?;
+        self.inner.sync_file(path)
+    }
+
+    fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::Truncate, path)?;
+        self.inner.truncate_file(path, length)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::DirectorySync, path)?;
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.state
+            .observe(FaultOperation::AtomicReplace, destination)?;
+        self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.state
+            .observe(FaultOperation::AtomicInstall, destination)?;
+        self.inner.atomic_install(source, destination)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.state.observe(FaultOperation::Remove, path)?;
+        self.inner.remove_file(path)
     }
 }
 
