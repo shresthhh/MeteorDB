@@ -11,6 +11,27 @@ use crate::sstable::{
 };
 use crate::{BloomFilter, Compression, Error, InternalKey, Result};
 
+/// Conservative default ceiling for one uncompressed SSTable data block.
+pub const DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+
+/// Trusted resource limits applied while opening and reading an SSTable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TableReaderOptions {
+    /// Maximum accepted uncompressed bytes in one data block.
+    ///
+    /// This limit comes from the caller, not the file. It bounds stored-block
+    /// reads and Snappy output before allocation or decompression.
+    pub max_uncompressed_data_block_bytes: usize,
+}
+
+impl Default for TableReaderOptions {
+    fn default() -> Self {
+        Self {
+            max_uncompressed_data_block_bytes: DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES,
+        }
+    }
+}
+
 /// Open immutable table with eagerly checked metadata and lazily read data blocks.
 ///
 /// Opening validates the fixed footer, metadata handles, metadata checksums,
@@ -25,6 +46,7 @@ pub struct TableReader {
     index: Vec<(Vec<u8>, BlockHandle)>,
     filter: BloomFilter,
     properties: TableProperties,
+    max_uncompressed_data_block_bytes: usize,
 }
 
 impl TableReader {
@@ -36,6 +58,21 @@ impl TableReader {
     /// malformed/checksum-invalid structure, or [`Error::UnsupportedFormat`]
     /// when the magic is recognized but the footer version is not `1`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_options(path, TableReaderOptions::default())
+    }
+
+    /// Opens an SSTable with caller-trusted data-block resource limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] for a zero limit and otherwise the
+    /// same errors as [`TableReader::open`].
+    pub fn open_with_options(path: impl AsRef<Path>, options: TableReaderOptions) -> Result<Self> {
+        if options.max_uncompressed_data_block_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "max_uncompressed_data_block_bytes must be greater than zero".to_owned(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         let mut file =
             File::open(&path).map_err(|source| io_error("open SSTable", &path, source))?;
@@ -70,10 +107,7 @@ impl TableReader {
         let index_handle = decode_fixed_handle(&footer, 0, footer_start)?;
         let filter_handle = decode_fixed_handle(&footer, 20, footer_start)?;
         let properties_handle = decode_fixed_handle(&footer, 40, footer_start)?;
-        validate_metadata_handles(
-            [index_handle, filter_handle, properties_handle],
-            footer_start,
-        )?;
+        validate_metadata_handles(index_handle, filter_handle, properties_handle, footer_start)?;
 
         let index_payload = read_metadata_block(&mut file, &path, index_handle)?;
         let filter_payload = read_metadata_block(&mut file, &path, filter_handle)?;
@@ -88,9 +122,9 @@ impl TableReader {
                 return Err(index_corruption("trailing bytes after data-block handle"));
             }
             validate_handle(handle, filter_handle.offset(), "data block")?;
-            if handle.offset() < previous_end {
+            if handle.offset() != previous_end {
                 return Err(index_corruption(
-                    "data-block handles overlap or are out of file order",
+                    "data-block handles are not contiguous and in increasing order",
                 ));
             }
             previous_end = handle
@@ -102,8 +136,23 @@ impl TableReader {
         if index.is_empty() {
             return Err(index_corruption("index contains no data blocks"));
         }
+        if previous_end != filter_handle.offset() {
+            return Err(index_corruption(
+                "final data block is not immediately followed by the filter block",
+            ));
+        }
         let filter = BloomFilter::decode(filter_payload)?;
         let properties = decode_properties(&properties_payload)?;
+        let trusted_maximum =
+            u64::try_from(options.max_uncompressed_data_block_bytes).map_err(|_| {
+                Error::InvalidArgument("reader data-block limit exceeds u64".to_owned())
+            })?;
+        if properties.max_data_block_bytes > trusted_maximum {
+            return Err(properties_corruption(format!(
+                "declared maximum data-block bytes {} exceeds reader limit {trusted_maximum}",
+                properties.max_data_block_bytes
+            )));
+        }
         if properties.data_blocks
             != u64::try_from(index.len())
                 .map_err(|_| index_corruption("index entry count exceeds u64"))?
@@ -121,6 +170,7 @@ impl TableReader {
             index,
             filter,
             properties,
+            max_uncompressed_data_block_bytes: options.max_uncompressed_data_block_bytes,
         })
     }
 
@@ -186,6 +236,14 @@ impl TableReader {
 
     fn read_data_block(&self, handle: BlockHandle) -> Result<Block> {
         validate_handle(handle, self.data_end, "data block")?;
+        let maximum_stored =
+            maximum_stored_data_block_bytes(self.max_uncompressed_data_block_bytes)?;
+        if handle.size() > maximum_stored {
+            return Err(data_corruption(format!(
+                "stored block bytes {} exceeds reader allocation limit {maximum_stored}",
+                handle.size()
+            )));
+        }
         let mut file = self
             .file
             .lock()
@@ -202,15 +260,30 @@ impl TableReader {
             )));
         }
         let decoded = match marker {
-            NO_COMPRESSION => payload,
+            NO_COMPRESSION => {
+                if payload.len() > self.max_uncompressed_data_block_bytes {
+                    return Err(data_corruption(format!(
+                        "uncompressed block bytes {} exceeds reader limit {}",
+                        payload.len(),
+                        self.max_uncompressed_data_block_bytes
+                    )));
+                }
+                payload
+            }
             SNAPPY_COMPRESSION => {
                 let expected = snap::raw::decompress_len(&payload)
                     .map_err(|error| data_corruption(format!("invalid Snappy header: {error}")))?;
-                let maximum = usize::try_from(self.properties.max_data_block_bytes)
+                let property_maximum = usize::try_from(self.properties.max_data_block_bytes)
                     .map_err(|_| data_corruption("maximum data-block size exceeds usize"))?;
-                if expected > maximum {
+                if expected > self.max_uncompressed_data_block_bytes {
                     return Err(data_corruption(format!(
-                        "Snappy output length {expected} exceeds property maximum {maximum}"
+                        "Snappy output length {expected} exceeds reader limit {}",
+                        self.max_uncompressed_data_block_bytes
+                    )));
+                }
+                if expected > property_maximum {
+                    return Err(data_corruption(format!(
+                        "Snappy output length {expected} exceeds property maximum {property_maximum}"
                     )));
                 }
                 snap::raw::Decoder::new()
@@ -219,10 +292,21 @@ impl TableReader {
                         data_corruption(format!("Snappy decompression failed: {error}"))
                     })?
             }
+
             _ => unreachable!("stored-block decoding validates compression markers"),
         };
         Block::decode(decoded)
     }
+}
+
+fn maximum_stored_data_block_bytes(uncompressed_limit: usize) -> Result<u64> {
+    let maximum = uncompressed_limit
+        .checked_add(32)
+        .and_then(|bytes| bytes.checked_add(uncompressed_limit / 6))
+        .and_then(|bytes| bytes.checked_add(crate::sstable::BLOCK_TRAILER_BYTES))
+        .ok_or_else(|| Error::InvalidArgument("reader data-block limit overflows usize".into()))?;
+    u64::try_from(maximum)
+        .map_err(|_| Error::InvalidArgument("reader data-block limit exceeds u64".into()))
 }
 
 /// Lazy forward iterator over every internal key/value pair in a table.
@@ -247,7 +331,13 @@ impl Iterator for TableIter<'_> {
         }
         loop {
             if let Some((key, value)) = self.entries.next() {
-                return Some(InternalKey::decode(key).map(|key| (key, value)));
+                return Some(match InternalKey::decode(key) {
+                    Ok(key) => Ok((key, value)),
+                    Err(error) => {
+                        self.failed = true;
+                        Err(error)
+                    }
+                });
             }
             let (_, handle) = self.reader.index.get(self.block_index)?;
             self.block_index += 1;
@@ -284,27 +374,31 @@ fn decode_fixed_handle(encoded: &[u8], start: usize, limit: u64) -> Result<Block
     Ok(handle)
 }
 
-fn validate_metadata_handles(handles: [BlockHandle; 3], footer_start: u64) -> Result<()> {
-    let mut ranges: Vec<_> = handles
-        .into_iter()
-        .map(|handle| {
-            let end = handle
-                .offset()
-                .checked_add(handle.size())
-                .ok_or_else(|| footer_corruption("metadata block range overflows u64"))?;
-            Ok((handle.offset(), end))
-        })
-        .collect::<Result<_>>()?;
-    ranges.sort_unstable();
-    for pair in ranges.windows(2) {
-        if pair[0].1 > pair[1].0 {
-            return Err(footer_corruption("metadata block handles overlap"));
-        }
-    }
-    if ranges.last().is_some_and(|range| range.1 > footer_start) {
-        return Err(footer_corruption("metadata block extends into the footer"));
+fn validate_metadata_handles(
+    index: BlockHandle,
+    filter: BlockHandle,
+    properties: BlockHandle,
+    footer_start: u64,
+) -> Result<()> {
+    let filter_end = checked_handle_end(filter, "filter")?;
+    let index_end = checked_handle_end(index, "index")?;
+    let properties_end = checked_handle_end(properties, "properties")?;
+    if filter_end != index.offset()
+        || index_end != properties.offset()
+        || properties_end != footer_start
+    {
+        return Err(footer_corruption(
+            "metadata blocks do not follow canonical filter-index-properties-footer layout",
+        ));
     }
     Ok(())
+}
+
+fn checked_handle_end(handle: BlockHandle, kind: &'static str) -> Result<u64> {
+    handle
+        .offset()
+        .checked_add(handle.size())
+        .ok_or_else(|| footer_corruption(format!("{kind} block range overflows u64")))
 }
 
 fn validate_handle(handle: BlockHandle, limit: u64, kind: &'static str) -> Result<()> {
