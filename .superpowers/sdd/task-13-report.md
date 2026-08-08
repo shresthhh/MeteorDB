@@ -5,8 +5,9 @@
 Implemented in:
 
 - `22c9c92` `feat: add inference cache workload adapter`
+- `d142d20` `fix: harden inference cache reentrancy and format`
 
-The commit has no co-author trailer and was not pushed.
+Neither commit has a co-author trailer, and neither was pushed.
 
 ## What changed
 
@@ -16,12 +17,17 @@ The commit has no co-author trailer and was not pushed.
 - Added deterministic canonical keys for binary model names, model versions,
   generation parameters, namespaces, and inputs.
 - Added process-local singleflight shared by cloned cache handles.
+- Added immutable leader-thread ownership to each flight. Recursive
+  `get_or_compute` for the same canonical key now returns structured
+  `Error::Reentrant` instead of waiting on itself.
 - Added checked versioned entry decoding instead of treating malformed data as
   a cache miss.
+- Changed the durable value format to the specified leading schema byte plus a
+  postcard-serialized `InferenceEntry` body.
 - Added explicit limits for namespaces, models, versions, inputs, parameters,
   canonical key material, payloads, and TTL values.
 - Added BLAKE3 with its pure-Rust feature. No general serialization dependency
-  was needed for the small key and value formats.
+  is used for keys; values use Serde and postcard as required.
 
 ## Beginner walkthrough
 
@@ -72,13 +78,16 @@ iteration order are not stable storage formats.
 An `InferenceEntry` owns arbitrary binary payload bytes. Its stored format is:
 
 ```text
-entry schema byte | u32 payload length | payload bytes
+entry schema byte | postcard(InferenceEntry { payload: Vec<u8> })
 ```
 
-The small checked encoder avoids adding `serde` and `postcard` solely for one
-byte vector. The schema byte reserves an explicit compatibility boundary.
-Unknown schema versions return `UnsupportedFormat`; truncated or inconsistent
-lengths return `Corruption`, never `Miss`.
+Postcard supplies its canonical variable-length sequence framing. Encoding uses
+`postcard::to_allocvec`; decoding uses `postcard::take_from_bytes`, rejects any
+remainder, validates the serialized-body and decoded-payload limits, and
+re-encodes the entry to reject non-canonical framing accepted by a decoder.
+The schema byte remains an explicit compatibility boundary. Unknown schema
+versions return `UnsupportedFormat`; malformed, oversized, non-canonical, or
+trailing bodies return `Corruption`, never `Miss`.
 
 `put(..., Some(ttl_ms))` uses the engine's serialized `put_with_ttl` path.
 MeteorDB stores an absolute wall-clock deadline with the value. Before the
@@ -100,6 +109,12 @@ condition variable without running their computation. The leader rechecks the
 cache after winning the flight, computes outside all cache mutexes, atomically
 stores the complete entry, publishes the result, and wakes every follower.
 
+Each flight records the leader's `ThreadId` as immutable state before it is
+published in the flight map. A caller finding the same canonical key and the
+same thread ID returns `Error::Reentrant { operation: ... }` immediately. A
+nested call for another key creates an independent flight, while callers from
+other threads remain ordinary followers.
+
 Followers receive the same entry or a reconstructed error with the same public
 variant and diagnostic. If computation panics, followers are awakened with a
 background error before the leader resumes unwinding, preventing abandoned
@@ -116,6 +131,12 @@ Tests prove that:
 - batch lookup preserves misses, duplicates, and request order;
 - empty required fields, oversized namespace/input/payload, empty parameter
   names, and negative TTLs fail explicitly;
+- the raw durable value is exactly one schema byte followed by the postcard
+  encoding of the entry;
+- malformed postcard, trailing bytes, and unknown schemas report structured
+  corruption or unsupported-format errors;
+- same-thread same-key recursion fails immediately with `Error::Reentrant`;
+- same-thread nesting for an unrelated key succeeds and stores both entries;
 - 32 simultaneous misses execute one successful computation;
 - concurrent followers receive the leader's error without storing a value.
 
@@ -129,6 +150,14 @@ key, value, or batch limits, which continue to return normal engine errors.
 `crates/meteordb/tests/workloads.rs` was created before production code. The
 first targeted GCC run failed because `CacheLookup`, `InferenceCache`,
 `InferenceEntry`, and `InferenceKey` did not exist.
+
+For the findings fix, the new regression tests were written first. The targeted
+GCC run failed because the `postcard` dependency and `Error::Reentrant` variant
+did not yet exist. The same-thread recursion test is direct and timeout-free:
+the old implementation would wait on its own flight, while the fixed
+implementation returns before any condition-variable wait. The unrelated-key
+test is also timeout-free. Existing 32-caller and shared-error tests continue
+to exercise other-thread followers.
 
 After implementation, the initial BLAKE3 build exposed an environment-specific
 failure: its default assembly build required a missing `libisl.so.23` through
@@ -158,13 +187,16 @@ cargo fmt --all --check
 exit 0
 
 cargo test -p meteordb --test workloads inference_cache
-8 passed; 0 failed
+14 passed; 0 failed
 
 cargo clippy --workspace --all-targets -- -D warnings
 exit 0
 
 cargo test --workspace
-193 passed; 0 failed
+199 passed; 0 failed
+
+cargo test --workspace --doc
+0 passed; 0 failed
 
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 exit 0
@@ -176,18 +208,39 @@ exit 0
 The clean pre-change baseline was also `cargo test --workspace --quiet` with
 185 passing tests.
 
+## Dependency choices
+
+- `serde = "1.0.229"` with only the `derive` feature. `InferenceEntry` derives
+  only the required `Serialize` and `Deserialize` serialization traits in
+  addition to its existing API traits.
+- `postcard = "1.1.3"` with default features disabled and only `alloc` enabled.
+  This provides `to_allocvec` for the owned binary payload without postcard's
+  default heapless compare-and-swap feature.
+- Both are declared in `[workspace.dependencies]` and consumed with
+  `.workspace = true`, matching the repository's dependency convention.
+- BLAKE3 remains `1.8.2` with `pure`; it still serves only canonical key input
+  hashing and is unrelated to entry serialization.
+
 ## Trade-offs and concerns
 
 - Singleflight is shared by clones of one `InferenceCache`. Independently
   constructed adapters, other processes, and other machines do not coordinate.
+- `Error::Reentrant` adds a public error variant. This is necessary for callers
+  to handle the deadlock prevention without parsing display text, but exhaustive
+  downstream matches must add a branch.
+- Thread ownership is process-local and intentionally uses Rust's opaque
+  `ThreadId`; it is never serialized or exposed as cache data.
 - BLAKE3 collision risk is negligible but not mathematically impossible. Input
   length is encoded alongside the digest as an additional discriminator.
 - The pure-Rust BLAKE3 feature favors reliable builds in this repository's GCC
   environment over optional C/assembly implementations.
 - Canonical parameter bytes remain in the database key. The 512 KiB aggregate
   limit bounds key amplification while keeping exact parameter identity.
-- Entries intentionally contain only the binary result in this task. The schema
-  byte permits a future version to add application metadata without ambiguous
-  decoding.
+- Entries intentionally contain only the binary result in this task. Within
+  schema version 1, the Serde struct layout is now durable and must not be
+  changed incompatibly; future shape changes require a new leading schema byte.
+- Canonical validation re-serializes each decoded entry, temporarily allocating
+  a second body of at most the configured 16 MiB payload bound. This trades peak
+  read memory for an exact canonical-framing check.
 - Batch lookup has one MVCC sequence view, but TTL remains a wall-clock decision
   and is not frozen by snapshots, matching the engine's established contract.
