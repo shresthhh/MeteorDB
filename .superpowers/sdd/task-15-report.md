@@ -1,101 +1,145 @@
 # Task 15 Report: Inspection CLI and Structured Statistics
 
-## What was added
+## Commits
 
-MeteorDB now has a `meteordb` binary with four commands:
+- `82fa15a` — `fix: harden task 15 inspection and benchmarks`
+- Documentation/report commit: the commit containing this updated report.
 
-- `check` validates `CURRENT`, every manifest edit, referenced SSTable lengths,
-  SSTable metadata and data-block checksums, and required WAL checksums.
-- `dump-manifest` prints validated edits and the final seven-level file layout.
-- `dump-sstable` prints checked properties, block locations, key ranges, and a
-  caller-bounded entry sample.
-- `bench` runs a seeded `inference-cache` workload and reports configuration,
-  dataset size, operations, throughput, p50/p95/p99 latency, and engine stats.
+## Review findings fixed
 
-Inspection is deliberately separate from writer recovery. It only opens files
-for reading: it does not acquire `LOCK`, append to a manifest, recover an
-engine, truncate a torn tail, or create a replacement WAL. A torn manifest is
-reported as corruption and left byte-for-byte unchanged.
+### 1. No-follow, same-handle inspection
 
-## Beginner walkthrough
+The root cause was split filesystem handling. Manifest and WAL helpers used
+`DurableFs::read_file`, but SSTables used `File::open` directly, manifest
+inspection separately called path-based metadata, and engine cached readers did
+not receive the engine's injected filesystem.
 
-1. Clap parses the required top-level `--path` and then one subcommand.
-2. `check` calls `inspect_manifest`, which reuses the engine's checked
-   `CURRENT`, manifest framing, checksum, edit decoder, counter validation, and
-   version-building logic.
-3. Each live table is opened with `TableReader`. `TableReader::inspect` walks
-   the normal iterator, so every data block passes the existing checksum,
-   compression, block, and internal-key decoders.
-4. Required `.wal` files are passed to `inspect_wal`, which delegates to the
-   existing WAL replay parser. The CLI never implements a second disk-format
-   decoder.
-5. Human output uses a fixed field order. JSON uses versioned structs and
-   Serde's struct field order, so names and serialization remain stable.
-6. Output samples are bounded by `--max-edits`, `--max-blocks`, and
-   `--max-entries`; validation still covers the complete file.
+`DurableFs` now exposes `open_read`, returning a `DurableReadFile` that combines
+`Read`, `Seek`, and handle-derived `len`. Unix opens still use `O_NOFOLLOW`;
+Windows uses `FILE_FLAG_OPEN_REPARSE_POINT`; the opened object must be a regular
+file. Manifest, WAL, SSTable metadata, and SSTable payload reads derive from the
+same handle. Engine reads, scans, and compaction pass their existing
+`Arc<dyn DurableFs>` into `TableReader`, preserving lazy data-block reads and
+the existing cache hit/miss behavior.
 
-## Clap and parser design
+Engine, compaction, and `check` also compare the manifest-recorded SSTable
+length against the length of the exact handle whose footer, metadata, and data
+blocks are validated. Canonical `CURRENT` and `--file` parsing continue to
+reject path components and directory escape.
 
-`clap` derive supplies usage errors and exit code 2 before command execution.
-Operational failures return 1. Corruption and unsupported persistent formats
-return 3. Successful commands return 0.
+Regressions cover:
 
-The CLI accepts only canonical relative SSTable names such as `000042.sst`, so
-`dump-sstable` cannot escape the database directory. Canonical WAL filenames
-are recognized with the same six-digit-or-wider number rule used by the
-engine. Storage bytes are decoded only by library inspection APIs.
+- manifest and SSTable symlinks through the CLI;
+- direct SSTable symlink rejection;
+- an SSTable path replacement after `open_read`, followed by a lazy block read;
+- manifest and WAL path replacements after `open_read`;
+- injected readable handles, proving these paths no longer bypass `DurableFs`.
 
-## Structured statistics
+### 2. Bounded streaming inspection
 
-`StatsSnapshot`, `CacheSnapshot`, and `CachePartitionSnapshot` now implement
-`Serialize`. The existing mutex-protected read counters preserve related
-invariants in one snapshot, and cache partitions are copied while holding the
-cache mutex. A byte-exact JSON test locks field names and order.
+The previous manifest inspection retained every decoded edit before applying
+`--max-edits`, and WAL inspection called recovery, retaining every decoded
+batch and sequence. Output truncation therefore did not bound peak memory.
 
-## Examples
+Manifest and WAL physical framing now read one 32 KiB block at a time from the
+same open handle. Complete logical records still go through the existing
+`decode_edit` and `decode_batch` parsers. Recovery may collect records as
+required by the engine, while inspection callbacks update validation state and
+summary counters immediately:
 
-```bash
-meteordb --path ./database check
-meteordb --path ./database check --format json
-meteordb --path ./database dump-manifest --format json --max-edits 100
-meteordb --path ./database dump-sstable --file 000004.sst \
-  --max-blocks 20 --max-entries 20
-meteordb --path ./bench-db bench --seconds 1 --workload inference-cache \
-  --seed 7 --dataset-size 1000 --format json
-```
+- manifest inspection retains at most `max_edits`, `max_files`, and
+  `max_bytes`;
+- `max_files` and `max_bytes` also hard-bound the live manifest version needed
+  for replay validation;
+- edit file lists and final level layout share the file/byte output budgets;
+- WAL inspection retains no batches or sequence vector, only counts and
+  first/last sequence;
+- cross-WAL continuity uses each fully validated segment's contiguous
+  first/last range;
+- SSTable inspection retains at most `max_entries`, `max_blocks`, and raw
+  `max_bytes` of sampled key material while iterating and validating every
+  record.
 
-## TDD and verification
+The CLI adds:
 
-The integration suite was written before the command implementation. The first
-red invocation exposed the environment's missing system linker; a local GCC
-toolchain was then used for every executable gate. Focused red/green cycles
-also covered WAL sequence gaps and bounded block output. The suite covers
-live-writer read-only inspection, unchanged torn manifests, SSTable and WAL
-corruption, human and JSON manifest output, bounded SSTable output, benchmark
-metrics, and usage exits.
+- `check --max-files --max-bytes`;
+- `dump-manifest --max-files --max-bytes`;
+- `dump-sstable --max-bytes`.
 
-All gates used GCC 12.4.0:
+All count/byte limits reject zero. Tests confirm corruption after the manifest
+edit sample cap is still reported.
+
+### 3. Explicit benchmark durability
+
+`bench` now accepts `--durability sync|buffered`, defaults to `sync`, and maps
+directly to `Options::durability`. Human and JSON results include
+`durability`. Unit coverage locks both enum-to-engine mappings; integration
+coverage runs and checks both JSON modes and the human default.
+
+The README documents that `sync` matches `Options::new` and that `buffered`
+may acknowledge writes still resident in operating-system buffers.
+
+## CLI compatibility notes
+
+- Existing commands, top-level `--path`, output formats, workload name, and
+  benchmark default behavior remain available.
+- Benchmark output gains an additive `durability` field/line.
+- Manifest JSON gains additive total/truncation fields for bounded edit file
+  lists and live levels.
+- SSTable JSON/human output gains `shown_bytes` and `bytes_truncated`.
+- Zero values formerly accepted for dump sample counts are now usage errors.
+- `dump-manifest` and `dump-sstable` defaults remain bounded; callers needing
+  larger output must raise the explicit limits.
+- Library `TableReader::inspect(max_entries, max_blocks)` retains its previous
+  zero-sample behavior. New callers can use `inspect_with_limits`.
+
+## TDD evidence
+
+CLI regressions were written first. The GCC run failed because durability,
+`--max-files`, `--max-bytes`, and positive-limit validation did not exist.
+After implementation, the focused CLI suite passed 13 tests.
+
+Focused filesystem tests cover the new injectable handle and replacement
+races. Manifest, WAL, and SSTable focused suites pass 24, 20, and 15 tests
+respectively.
+
+## Full GCC validation
+
+All final gates used:
 
 ```text
-cargo test -p meteordb-cli --test cli
-  8 passed
-
-cargo test -p meteordb stats::tests::snapshot_json_has_stable_field_order_and_names
-  1 passed
-
-cargo fmt --all -- --check
-  passed
-
-cargo clippy --workspace --all-targets -- -D warnings
-  passed
-
-cargo test --workspace
-  all unit, integration, CLI, and doc tests passed
+gcc-13 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
 ```
 
-## Concerns
+Environment:
 
-- WAL replay intentionally ignores structurally torn final fragments, matching
-  MeteorDB recovery semantics; checksum damage is still surfaced as corruption.
-- `check --max-batch-bytes` must match a database created with a non-default WAL
-  batch limit.
+```bash
+ROOT="$PWD/.superpowers/sdd/local-toolchain/root"
+export PATH="$ROOT/usr/bin:$PATH"
+export CC="$ROOT/usr/bin/gcc-13"
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$ROOT/usr/bin/gcc-13"
+export LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib/gcc/x86_64-linux-gnu/13"
+```
+
+Successful gates:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo test --workspace
+git diff --check
+```
+
+## Residual risks
+
+- `O_NOFOLLOW`/reparse-point protection applies to the final database-file
+  component. MeteorDB still trusts the database directory path supplied by the
+  caller; securing every ancestor against concurrent privileged rename would
+  require a directory-handle/open-at API.
+- One manifest edit and one WAL batch may allocate up to their existing trusted
+  parser limits while being decoded. Inspection no longer accumulates multiple
+  decoded records.
+- WAL torn-tail handling intentionally remains identical to recovery:
+  structurally incomplete final fragments are ignored, while checksum damage
+  remains corruption.
