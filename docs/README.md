@@ -21,7 +21,10 @@ Use this index to choose the shortest path to the information you need.
 
 ## Contributors
 
-- Use the validation commands in the [contributing section](../README.md#contributing).
+- Follow the [contribution guide](../CONTRIBUTING.md) for issue, correctness,
+  test, and review expectations.
+- Use the [development guide](development.md) for setup, focused tests, fault
+  injection, property tests, and required validation.
 - Keep storage changes within the module boundaries in the
   [architecture module map](architecture.md#module-map).
 - Add integration coverage under

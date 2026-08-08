@@ -123,7 +123,8 @@ concurrency, and correctness details.
 ## Contributing
 
 MeteorDB welcomes focused changes with tests for correctness-sensitive
-behavior. Before submitting a change, run:
+behavior. Read the [contribution guide](CONTRIBUTING.md) and
+[development guide](docs/development.md) before submitting a change. Run:
 
 ```bash
 cargo fmt --check

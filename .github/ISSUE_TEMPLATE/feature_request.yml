@@ -1,0 +1,62 @@
+name: Feature request
+description: Propose a workload-driven MeteorDB capability or improvement
+title: "feature: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the workload and measurable outcome rather than only the requested API shape. Check ROADMAP.md before proposing an existing roadmap item.
+  - type: textarea
+    id: workload
+    attributes:
+      label: Workload
+      description: What application or storage problem should MeteorDB solve?
+      placeholder: Describe data volume, key/value sizes, concurrency, and operating environment.
+    validations:
+      required: true
+  - type: textarea
+    id: access-pattern
+    attributes:
+      label: Access pattern
+      description: Describe reads, writes, batches, snapshots, locality, and expected database lifetime.
+    validations:
+      required: true
+  - type: textarea
+    id: correctness
+    attributes:
+      label: Correctness requirements
+      description: State required atomicity, durability, recovery, ordering, snapshot, and compatibility behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the externally observable behavior and configuration, without requiring a specific internal implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Explain current workarounds and other designs you considered.
+    validations:
+      required: true
+  - type: textarea
+    id: benchmarks
+    attributes:
+      label: Benchmark criteria
+      description: If performance motivates this request, define the dataset, operation mix, baseline, metric, and target. Enter "Not performance-driven" when not applicable.
+    validations:
+      required: true
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I checked the roadmap and searched existing issues and pull requests.
+          required: true
+        - label: This request does not contain credentials, tokens, private data, or other secrets.
+          required: true
