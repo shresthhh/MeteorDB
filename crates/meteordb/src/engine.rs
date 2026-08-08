@@ -482,7 +482,7 @@ impl Engine {
         }
         let old_version = state.versions.current();
         validate_compaction_plan(&plan, &old_version)?;
-        let output = crate::compaction::run(
+        let mut output = crate::compaction::run(
             &plan,
             CompactionContext {
                 directory: &self.inner.options.path,
@@ -508,11 +508,17 @@ impl Engine {
         for file in plan.overlap_files() {
             edit.delete_file(plan.output_level(), file.number());
         }
-        for file in output.files {
-            edit.add_file(plan.output_level(), file);
+        for file in &output.files {
+            edit.add_file(plan.output_level(), file.clone());
         }
         edit.set_next_file_number(output.next_file_number);
-        state.versions.apply(edit)?;
+        if let Err(failure) = state.versions.apply_with_visibility(edit) {
+            if failure.edit_may_be_visible {
+                output.preserve_files();
+            }
+            return Err(failure.error);
+        }
+        output.preserve_files();
         state.next_file_number = output.next_file_number;
         state.obsolete_sstables.push_back(ObsoleteSstables {
             version: old_version,

@@ -189,6 +189,13 @@ fn ranges_overlap(file: &FileMeta, smallest: &[u8], largest: &[u8]) -> bool {
 pub(crate) struct CompactionOutput {
     pub(crate) files: Vec<FileMeta>,
     pub(crate) next_file_number: u64,
+    cleanup: CompactionCleanup,
+}
+
+impl CompactionOutput {
+    pub(crate) fn preserve_files(&mut self) {
+        self.cleanup.armed = false;
+    }
 }
 
 pub(crate) struct CompactionContext<'a> {
@@ -226,6 +233,7 @@ pub(crate) fn run(
     let mut merged = InternalMergingIterator::new(children).peekable();
     let mut next_file_number = context.next_file_number;
     let mut outputs = Vec::new();
+    let mut cleanup = CompactionCleanup::new(context.directory, context.fs.clone());
     let mut pending: Vec<InternalEntry> = Vec::new();
     let mut builder: Option<OutputBuilder> = None;
 
@@ -265,6 +273,7 @@ pub(crate) fn run(
             outputs.push(finish_output(
                 builder.take().expect("checked output exists"),
                 &context,
+                &mut cleanup,
             )?);
         }
         if builder.is_none() {
@@ -272,7 +281,9 @@ pub(crate) fn run(
             next_file_number = next_file_number
                 .checked_add(1)
                 .ok_or_else(|| Error::InvalidArgument("file number space is exhausted".into()))?;
-            builder = Some(start_output(number, &context)?);
+            let output = start_output(number, &context)?;
+            cleanup.track_temporary(number);
+            builder = Some(output);
         }
         let output = builder.as_mut().expect("output was just created");
         for entry in retained {
@@ -283,11 +294,12 @@ pub(crate) fn run(
         output.estimated_bytes = output.estimated_bytes.saturating_add(group_bytes);
     }
     if let Some(output) = builder {
-        outputs.push(finish_output(output, &context)?);
+        outputs.push(finish_output(output, &context, &mut cleanup)?);
     }
     Ok(CompactionOutput {
         files: outputs,
         next_file_number,
+        cleanup,
     })
 }
 
@@ -365,7 +377,11 @@ fn start_output(number: u64, context: &CompactionContext<'_>) -> Result<OutputBu
     })
 }
 
-fn finish_output(output: OutputBuilder, context: &CompactionContext<'_>) -> Result<FileMeta> {
+fn finish_output(
+    output: OutputBuilder,
+    context: &CompactionContext<'_>,
+    cleanup: &mut CompactionCleanup,
+) -> Result<FileMeta> {
     let built = output.builder.finish()?;
     let temporary = context
         .directory
@@ -374,6 +390,7 @@ fn finish_output(output: OutputBuilder, context: &CompactionContext<'_>) -> Resu
         .fs
         .atomic_install(&temporary, &output.final_path)
         .map_err(|source| io_error("install compacted SSTable", &output.final_path, source))?;
+    cleanup.track_installed(built.file_number);
     context
         .fs
         .sync_directory(context.directory)
@@ -390,6 +407,52 @@ fn finish_output(output: OutputBuilder, context: &CompactionContext<'_>) -> Resu
         built.smallest,
         built.largest,
     )
+}
+
+struct CompactionCleanup {
+    directory: std::path::PathBuf,
+    fs: Arc<dyn DurableFs>,
+    paths: Vec<std::path::PathBuf>,
+    armed: bool,
+}
+
+impl CompactionCleanup {
+    fn new(directory: &Path, fs: Arc<dyn DurableFs>) -> Self {
+        Self {
+            directory: directory.to_path_buf(),
+            fs,
+            paths: Vec::new(),
+            armed: true,
+        }
+    }
+
+    fn track_temporary(&mut self, number: u64) {
+        self.paths
+            .push(self.directory.join(format!("{number:06}.sst.tmp")));
+    }
+
+    fn track_installed(&mut self, number: u64) {
+        self.paths
+            .push(self.directory.join(format!("{number:06}.sst")));
+    }
+}
+
+impl Drop for CompactionCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        for path in self.paths.iter().rev() {
+            match self.fs.remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {}
+            }
+        }
+        if !self.paths.is_empty() {
+            let _ = self.fs.sync_directory(&self.directory);
+        }
+    }
 }
 
 fn reader_block_limit(options: &Options) -> usize {

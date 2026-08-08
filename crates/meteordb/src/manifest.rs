@@ -43,6 +43,27 @@ pub struct VersionSet {
     manifest_usable: bool,
 }
 
+pub(crate) struct VersionApplyError {
+    pub(crate) error: Error,
+    pub(crate) edit_may_be_visible: bool,
+}
+
+impl VersionApplyError {
+    fn before_manifest(error: Error) -> Self {
+        Self {
+            error,
+            edit_may_be_visible: false,
+        }
+    }
+
+    fn during_manifest(error: Error) -> Self {
+        Self {
+            error,
+            edit_may_be_visible: true,
+        }
+    }
+}
+
 impl VersionSet {
     /// Creates a new manifest and atomically installs its `CURRENT` pointer.
     pub fn create(directory: impl AsRef<Path>) -> Result<Self> {
@@ -197,10 +218,18 @@ impl VersionSet {
 
     /// Durably installs one edit, then publishes its copy-on-write version.
     pub fn apply(&mut self, edit: VersionEdit) -> Result<()> {
+        self.apply_with_visibility(edit)
+            .map_err(|failure| failure.error)
+    }
+
+    pub(crate) fn apply_with_visibility(
+        &mut self,
+        edit: VersionEdit,
+    ) -> std::result::Result<(), VersionApplyError> {
         if !self.manifest_usable {
-            return Err(Error::Background(
+            return Err(VersionApplyError::before_manifest(Error::Background(
                 "manifest writer is unusable after a failed append or sync".into(),
-            ));
+            )));
         }
         let mut next_file_number = self.next_file_number;
         let mut last_sequence = self.last_sequence;
@@ -215,25 +244,31 @@ impl VersionSet {
             &mut active_log_number,
             &mut wal_sequence,
             false,
-        )?;
-        validate_file_numbers(&edit, next_file_number, &self.used_file_numbers, false)?;
-        let candidate = self.current.apply(&edit)?;
-        let encoded = encode_edit(&edit)?;
+        )
+        .map_err(VersionApplyError::before_manifest)?;
+        validate_file_numbers(&edit, next_file_number, &self.used_file_numbers, false)
+            .map_err(VersionApplyError::before_manifest)?;
+        let candidate = self
+            .current
+            .apply(&edit)
+            .map_err(VersionApplyError::before_manifest)?;
+        let encoded = encode_edit(&edit).map_err(VersionApplyError::before_manifest)?;
 
         for (_, file) in &edit.added_files {
             let path = self.directory.join(sstable_name(file.number()));
             self.fs
                 .sync_file(&path)
-                .map_err(|source| io_error("sync referenced SSTable", &path, source))?;
+                .map_err(|source| io_error("sync referenced SSTable", &path, source))
+                .map_err(VersionApplyError::before_manifest)?;
         }
 
         if let Err(error) = self.manifest.append(&encoded) {
             self.manifest_usable = false;
-            return Err(error);
+            return Err(VersionApplyError::during_manifest(error));
         }
         if let Err(error) = self.manifest.sync("sync manifest edit") {
             self.manifest_usable = false;
-            return Err(error);
+            return Err(VersionApplyError::during_manifest(error));
         }
 
         self.current = Arc::new(candidate);

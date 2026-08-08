@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meteordb::{
@@ -276,13 +277,89 @@ fn compaction_syncs_outputs_before_manifest_install_and_reclaims_inputs_afterwar
     assert!(manifest_sync < first_remove, "{events:?}");
 }
 
+#[test]
+fn failed_output_sync_removes_temporary_sstables_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FailingCompactionFs::default());
+    let db = compaction_database(dir.path(), fs.clone());
+    let original_files = sstable_numbers(dir.path());
+    fs.fail_next_temp_sync();
+
+    assert!(db.compact().is_err());
+    assert_eq!(sstable_numbers(dir.path()), original_files);
+    assert!(temporary_sstable_numbers(dir.path()).is_empty());
+
+    assert!(db.compact().unwrap());
+}
+
+#[test]
+fn failed_manifest_file_sync_removes_unpublished_outputs_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FailingCompactionFs::default());
+    let db = compaction_database(dir.path(), fs.clone());
+    let original_files = sstable_numbers(dir.path());
+    fs.fail_next_manifest_sstable_sync();
+
+    assert!(db.compact().is_err());
+    assert_eq!(sstable_numbers(dir.path()), original_files);
+    assert!(temporary_sstable_numbers(dir.path()).is_empty());
+
+    assert!(db.compact().unwrap());
+}
+
+#[test]
+fn uncertain_manifest_sync_preserves_outputs_that_recovery_may_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FailingCompactionFs::default());
+    let db = compaction_database(dir.path(), fs.clone());
+    let original_files = sstable_numbers(dir.path());
+    fs.fail_next_manifest_sync();
+
+    assert!(db.compact().is_err());
+    let remaining_files = sstable_numbers(dir.path());
+    assert!(
+        remaining_files.len() > original_files.len(),
+        "installed outputs must remain when the manifest edit may be recoverable"
+    );
+    assert!(
+        original_files
+            .iter()
+            .all(|number| remaining_files.contains(number))
+    );
+    assert!(temporary_sstable_numbers(dir.path()).is_empty());
+}
+
+fn compaction_database(directory: &Path, fs: Arc<dyn DurableFs>) -> Engine {
+    let mut options = Options::new(directory);
+    options.target_sstable_bytes = 128;
+    let db = Engine::open_with_fs(options, fs).unwrap();
+    for index in 0..5 {
+        db.put(format!("key-{index}"), vec![b'x'; 80]).unwrap();
+        db.flush().unwrap();
+    }
+    db
+}
+
 fn sstable_numbers(directory: &Path) -> Vec<u64> {
-    std::fs::read_dir(directory)
+    let mut numbers = std::fs::read_dir(directory)
         .unwrap()
         .filter_map(|entry| {
             let name = entry.unwrap().file_name();
             let name = name.to_str()?;
             name.strip_suffix(".sst")?.parse().ok()
+        })
+        .collect::<Vec<_>>();
+    numbers.sort_unstable();
+    numbers
+}
+
+fn temporary_sstable_numbers(directory: &Path) -> Vec<u64> {
+    std::fs::read_dir(directory)
+        .unwrap()
+        .filter_map(|entry| {
+            let name = entry.unwrap().file_name();
+            let name = name.to_str()?;
+            name.strip_suffix(".sst.tmp")?.parse().ok()
         })
         .collect()
 }
@@ -369,6 +446,109 @@ impl DurableFs for TrackingFs {
             "remove {}",
             path.file_name().unwrap().to_string_lossy()
         ));
+        self.inner.remove_file(path)
+    }
+}
+
+#[derive(Default)]
+struct FailingCompactionFs {
+    inner: OsDurableFs,
+    fail_temp_sync: Arc<AtomicBool>,
+    fail_manifest_sstable_sync: AtomicBool,
+    fail_manifest_sync: Arc<AtomicBool>,
+}
+
+impl FailingCompactionFs {
+    fn fail_next_temp_sync(&self) {
+        self.fail_temp_sync.store(true, Ordering::Release);
+    }
+
+    fn fail_next_manifest_sstable_sync(&self) {
+        self.fail_manifest_sstable_sync
+            .store(true, Ordering::Release);
+    }
+
+    fn fail_next_manifest_sync(&self) {
+        self.fail_manifest_sync.store(true, Ordering::Release);
+    }
+}
+
+struct FailingCompactionFile {
+    inner: Box<dyn DurableFile>,
+    fail_sync: Arc<AtomicBool>,
+}
+
+impl DurableFile for FailingCompactionFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(bytes)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        if self.fail_sync.swap(false, Ordering::AcqRel) {
+            return Err(std::io::Error::other(
+                "injected compacted SSTable sync failure",
+            ));
+        }
+        self.inner.sync_all()
+    }
+}
+
+impl DurableFs for FailingCompactionFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let file = self.inner.create(path)?;
+        if path.to_string_lossy().ends_with(".sst.tmp") {
+            return Ok(Box::new(FailingCompactionFile {
+                inner: file,
+                fail_sync: self.fail_temp_sync.clone(),
+            }));
+        }
+        Ok(file)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let file = self.inner.append_existing(path)?;
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("MANIFEST-"))
+        {
+            return Ok(Box::new(FailingCompactionFile {
+                inner: file,
+                fail_sync: self.fail_manifest_sync.clone(),
+            }));
+        }
+        Ok(file)
+    }
+
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        if path.extension().is_some_and(|extension| extension == "sst")
+            && self
+                .fail_manifest_sstable_sync
+                .swap(false, Ordering::AcqRel)
+        {
+            return Err(std::io::Error::other(
+                "injected manifest SSTable sync failure",
+            ));
+        }
+        self.inner.sync_file(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_install(source, destination)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
         self.inner.remove_file(path)
     }
 }
