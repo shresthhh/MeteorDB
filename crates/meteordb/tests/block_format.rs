@@ -175,6 +175,26 @@ fn malformed_entries_and_overflowing_lengths_are_rejected() {
 }
 
 #[test]
+fn blocks_reject_non_canonical_varints() {
+    for entries in [
+        &[0x80, 0x00, 0x00, 0x00][..],
+        &[0x00, 0x81, 0x00, 0x00][..],
+        &[0x00, 0x00, 0x80, 0x80, 0x00][..],
+        &[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00, 0x00,
+        ][..],
+    ] {
+        assert!(matches!(
+            Block::decode(block_bytes_with_entries(entries)),
+            Err(Error::Corruption {
+                context: "SSTable data block",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn decoded_blocks_reject_non_increasing_keys() {
     let mut entries = Vec::new();
     entries.extend_from_slice(&[0, 1, 0, b'b']);
@@ -233,6 +253,41 @@ fn block_handle_uses_checked_varints() {
             ..
         })
     ));
+}
+
+#[test]
+fn block_handles_reject_non_canonical_varints_and_accept_boundaries() {
+    for encoded in [
+        &[0x80, 0x00, 0x00][..],
+        &[0x81, 0x00, 0x00][..],
+        &[0x00, 0x80, 0x80, 0x00][..],
+        &[
+            0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x00, 0x00,
+        ][..],
+    ] {
+        assert!(matches!(
+            BlockHandle::decode(encoded),
+            Err(Error::Corruption {
+                context: "SSTable block handle",
+                ..
+            })
+        ));
+    }
+
+    for value in [
+        0,
+        0x7f,
+        0x80,
+        0x3fff,
+        0x4000,
+        (1_u64 << 63) - 1,
+        1_u64 << 63,
+        u64::MAX,
+    ] {
+        let handle = BlockHandle::new(value, 0);
+        let encoded = handle.encode();
+        assert_eq!(BlockHandle::decode(&encoded).unwrap().0, handle);
+    }
 }
 
 fn block_bytes_with_entries(entries: &[u8]) -> Vec<u8> {

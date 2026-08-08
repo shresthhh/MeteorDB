@@ -55,7 +55,9 @@ impl BlockHandle {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Corruption`] for truncated or overflowing varints.
+    /// Returns [`Error::Corruption`] for truncated, overflowing, or
+    /// non-canonical varints. Canonical unsigned varints use the fewest bytes
+    /// possible, so a multi-byte encoding's final seven-bit group is nonzero.
     pub fn decode(encoded: &[u8]) -> Result<(Self, usize)> {
         let (offset, offset_bytes) =
             read_varint(encoded, 0, "block offset").map_err(handle_error)?;
@@ -145,6 +147,9 @@ pub(super) fn read_varint(
         }
         value |= u64::from(byte & 0x7f) << (index * 7);
         if byte & 0x80 == 0 {
+            if index > 0 && byte == 0 {
+                return Err(format!("{field} varint is not canonically encoded"));
+            }
             return Ok((value, index + 1));
         }
     }
