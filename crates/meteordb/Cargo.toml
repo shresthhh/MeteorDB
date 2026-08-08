@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 crc32c.workspace = true
+snap.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

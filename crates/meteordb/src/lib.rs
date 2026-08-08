@@ -31,7 +31,8 @@ pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};
 pub use sstable::{
     BLOCK_TRAILER_BYTES, Block, BlockBuilder, BlockHandle, BlockIter, NO_COMPRESSION,
-    SNAPPY_COMPRESSION, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, decode_stored_block,
+    SNAPPY_COMPRESSION, SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC,
+    TableBuildResult, TableBuilder, TableIter, TableProperties, TableReader, decode_stored_block,
     encode_stored_block,
 };
 pub use wal::{RecoveredBatch, WalWriter, replay_wal};

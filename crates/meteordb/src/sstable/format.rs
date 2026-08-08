@@ -12,6 +12,12 @@ pub const SNAPPY_COMPRESSION: u8 = 1;
 pub const SSTABLE_FORMAT_VERSION: u32 = 1;
 /// Eight-byte identifier written into a complete SSTable footer.
 pub const SSTABLE_MAGIC: [u8; 8] = *b"METEOR01";
+/// Fixed bytes reserved for three block handles, version, and magic.
+///
+/// Each handle receives a 20-byte slot, enough for two maximum-width `u64`
+/// varints. Unused slot bytes are zero padding, so the footer stays seekable
+/// from end-of-file while still reusing checked canonical handle decoding.
+pub const SSTABLE_FOOTER_BYTES: usize = 72;
 
 /// Locates one encoded block within an SSTable file.
 ///
