@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
 use crate::background::{BackgroundSignal, ObsoleteSstables};
+use crate::batch::MAX_WRITE_BATCH_OPERATIONS;
 use crate::compaction::{CompactionContext, CompactionPicker, DEFAULT_L0_COMPACTION_TRIGGER};
 use crate::iter::{
     ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds, user_key_in_bounds,
@@ -22,6 +23,38 @@ use crate::{
 /// A cloneable handle to MeteorDB's durable engine.
 pub struct Engine {
     inner: Arc<EngineInner>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct WriteBatchLimits {
+    max_payload_bytes: usize,
+    max_operations: usize,
+}
+
+impl WriteBatchLimits {
+    pub(crate) fn validate_next_put(
+        self,
+        batch: &WriteBatch,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        if batch.len() >= self.max_operations {
+            return Err(Error::InvalidArgument(format!(
+                "write batch operation count would exceed {}",
+                self.max_operations
+            )));
+        }
+        let projected_bytes = batch.projected_put_bytes(key, value).ok_or_else(|| {
+            Error::InvalidArgument("write batch payload byte count overflow".into())
+        })?;
+        if projected_bytes > self.max_payload_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "write batch payload {projected_bytes} exceeds max_batch_bytes {}",
+                self.max_payload_bytes
+            )));
+        }
+        Ok(())
+    }
 }
 
 struct EngineInner {
@@ -113,6 +146,13 @@ impl TerminalFailure {
 }
 
 impl Engine {
+    pub(crate) fn write_batch_limits(&self) -> WriteBatchLimits {
+        WriteBatchLimits {
+            max_payload_bytes: self.inner.options.max_batch_bytes,
+            max_operations: MAX_WRITE_BATCH_OPERATIONS,
+        }
+    }
+
     /// Opens or recovers an engine using the operating system's durable filesystem.
     pub fn open(options: Options) -> Result<Self> {
         Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
@@ -1423,6 +1463,13 @@ fn validate_batch(options: &Options, batch: &WriteBatch) -> Result<()> {
         return Err(Error::InvalidArgument(
             "cannot write an empty batch".to_owned(),
         ));
+    }
+    if batch.len() > MAX_WRITE_BATCH_OPERATIONS {
+        return Err(Error::InvalidArgument(format!(
+            "write batch operation count {} exceeds {}",
+            batch.len(),
+            MAX_WRITE_BATCH_OPERATIONS
+        )));
     }
     if batch.approximate_bytes() > options.max_batch_bytes {
         return Err(Error::InvalidArgument(format!(

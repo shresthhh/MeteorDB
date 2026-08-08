@@ -267,9 +267,13 @@ impl EmbeddingStore {
         entries: impl IntoIterator<Item = (&'a EmbeddingKey, &'a Embedding)>,
     ) -> Result<()> {
         let mut batch = WriteBatch::default();
+        let limits = self.engine.write_batch_limits();
         for (key, embedding) in entries {
             validate_key_matches_embedding(key, embedding)?;
-            batch.put(self.encode_key(key)?, encode_embedding(embedding)?);
+            let key = self.encode_key(key)?;
+            let value = encode_embedding(embedding)?;
+            limits.validate_next_put(&batch, &key, &value)?;
+            batch.put_owned(key, value);
         }
         if batch.is_empty() {
             return Ok(());
@@ -530,5 +534,43 @@ fn value_corruption(detail: impl Into<String>) -> Error {
     Error::Corruption {
         context: "embedding-store value",
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::Options;
+
+    #[test]
+    fn put_many_stops_before_retaining_the_first_operation_over_the_batch_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = EmbeddingKey::new(b"same-key");
+        let original = Embedding::from_f32(&[1.0]).unwrap();
+        let replacement = Embedding::from_f32(&[2.0]).unwrap();
+
+        let initial = Engine::open(Options::new(dir.path())).unwrap();
+        let initial_store = EmbeddingStore::new(initial, b"tenant").unwrap();
+        initial_store.put(&key, &original, None).unwrap();
+        let operation_bytes = initial_store.encode_key(&key).unwrap().len()
+            + encode_embedding(&replacement).unwrap().len();
+        drop(initial_store);
+
+        let mut options = Options::new(dir.path());
+        options.max_batch_bytes = operation_bytes;
+        let store = EmbeddingStore::new(Engine::open(options).unwrap(), b"tenant").unwrap();
+        let consumed = Cell::new(0);
+        let entries = std::iter::repeat((&key, &replacement))
+            .inspect(|_| consumed.set(consumed.get() + 1))
+            .take(10_000);
+
+        assert!(matches!(
+            store.put_many(entries),
+            Err(Error::InvalidArgument(message)) if message.contains("max_batch_bytes")
+        ));
+        assert_eq!(consumed.get(), 2);
+        assert_eq!(store.get(&key).unwrap(), Some(original));
     }
 }

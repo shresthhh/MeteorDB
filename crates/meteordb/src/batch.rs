@@ -33,6 +33,7 @@ pub struct WriteBatch {
 }
 
 pub(crate) const BATCH_FORMAT_VERSION: u8 = 1;
+pub(crate) const MAX_WRITE_BATCH_OPERATIONS: usize = u32::MAX as usize;
 const PUT_TAG: u8 = 1;
 const DELETE_TAG: u8 = 2;
 
@@ -47,6 +48,17 @@ impl WriteBatch {
     /// Panics if the cumulative payload byte count exceeds [`usize::MAX`].
     pub fn put(&mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> &mut Self {
         self.put_with_expiration(key, value, None)
+    }
+
+    pub(crate) fn put_owned(&mut self, key: Vec<u8>, value: Vec<u8>) -> &mut Self {
+        self.add_bytes(key.len());
+        self.add_bytes(value.len());
+        self.operations.push(WriteOp::Put {
+            key,
+            value,
+            expires_at_unix_ms: None,
+        });
+        self
     }
 
     /// Appends a put with optional expiration and returns the batch for chaining.
@@ -106,6 +118,12 @@ impl WriteBatch {
     /// for enforcing payload limits rather than estimating heap allocation.
     pub fn approximate_bytes(&self) -> usize {
         self.approximate_bytes
+    }
+
+    pub(crate) fn projected_put_bytes(&self, key: &[u8], value: &[u8]) -> Option<usize> {
+        self.approximate_bytes
+            .checked_add(key.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
     }
 
     /// Borrows the operations in insertion order.
