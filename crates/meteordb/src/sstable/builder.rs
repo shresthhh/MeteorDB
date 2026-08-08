@@ -65,7 +65,7 @@ struct DataBlockMeta {
 ///
 /// Data records are grouped into prefix-compressed blocks near `block_bytes`.
 /// Oversized individual records remain intact, so the target is approximate.
-/// A global Bloom filter permits definite misses to skip data I/O, while an
+/// A global user-key Bloom filter permits definite misses to skip data I/O, while an
 /// index maps separator keys to block handles. A separator is at least the
 /// preceding block's last key but, when byte space exists, shorter than the
 /// following block's first key. Looking for the first separator greater than
@@ -229,7 +229,7 @@ impl TableBuilder {
             .get_or_insert_with(|| key.as_bytes().to_vec());
         self.pending_last = Some(key.as_bytes().to_vec());
         self.previous_key = Some(key.as_bytes().to_vec());
-        self.filter_keys.push(key.as_bytes().to_vec());
+        self.filter_keys.push(key.user_key().to_vec());
         self.entries = self
             .entries
             .checked_add(1)

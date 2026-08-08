@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::sstable::builder::TableProperties;
 use crate::sstable::format::read_varint;
@@ -9,7 +9,10 @@ use crate::sstable::{
     Block, BlockHandle, NO_COMPRESSION, SNAPPY_COMPRESSION, SSTABLE_FOOTER_BYTES,
     SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, decode_stored_block,
 };
-use crate::{BloomFilter, Compression, Error, InternalKey, Result};
+use crate::stats::ReadStats;
+use crate::{
+    BlockCache, BlockKind, BloomFilter, Compression, Error, InternalKey, Result, SequenceNumber,
+};
 
 /// Conservative default ceiling for one uncompressed SSTable data block.
 pub const DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES: usize = 64 * 1024 * 1024;
@@ -47,6 +50,16 @@ pub struct TableReader {
     filter: BloomFilter,
     properties: TableProperties,
     max_uncompressed_data_block_bytes: usize,
+    file_number: Option<u64>,
+    cache: Option<Arc<BlockCache>>,
+    stats: Option<Arc<ReadStats>>,
+    user_key_filter: bool,
+}
+
+pub(crate) enum TableLookup {
+    BloomNegative,
+    Absent,
+    Found(InternalKey, Vec<u8>),
 }
 
 impl TableReader {
@@ -56,7 +69,7 @@ impl TableReader {
     ///
     /// Returns [`Error::Io`] for filesystem failures, [`Error::Corruption`] for
     /// malformed/checksum-invalid structure, or [`Error::UnsupportedFormat`]
-    /// when the magic is recognized but the footer version is not `1`.
+    /// when the magic is recognized but the footer version is unsupported.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_with_options(path, TableReaderOptions::default())
     }
@@ -68,6 +81,26 @@ impl TableReader {
     /// Returns [`Error::InvalidArgument`] for a zero limit and otherwise the
     /// same errors as [`TableReader::open`].
     pub fn open_with_options(path: impl AsRef<Path>, options: TableReaderOptions) -> Result<Self> {
+        Self::open_internal(path, options, None, None, None)
+    }
+
+    pub(crate) fn open_cached(
+        path: impl AsRef<Path>,
+        file_number: u64,
+        cache: Arc<BlockCache>,
+        stats: Arc<ReadStats>,
+        options: TableReaderOptions,
+    ) -> Result<Self> {
+        Self::open_internal(path, options, Some(file_number), Some(cache), Some(stats))
+    }
+
+    fn open_internal(
+        path: impl AsRef<Path>,
+        options: TableReaderOptions,
+        file_number: Option<u64>,
+        cache: Option<Arc<BlockCache>>,
+        stats: Option<Arc<ReadStats>>,
+    ) -> Result<Self> {
         if options.max_uncompressed_data_block_bytes == 0 {
             return Err(Error::InvalidArgument(
                 "max_uncompressed_data_block_bytes must be greater than zero".to_owned(),
@@ -98,7 +131,7 @@ impl TableReader {
                 .try_into()
                 .expect("fixed footer has four version bytes"),
         );
-        if version != SSTABLE_FORMAT_VERSION {
+        if version != 1 && version != SSTABLE_FORMAT_VERSION {
             return Err(Error::UnsupportedFormat {
                 kind: "SSTable",
                 version,
@@ -109,10 +142,24 @@ impl TableReader {
         let properties_handle = decode_fixed_handle(&footer, 40, footer_start)?;
         validate_metadata_handles(index_handle, filter_handle, properties_handle, footer_start)?;
 
-        let index_payload = read_metadata_block(&mut file, &path, index_handle)?;
-        let filter_payload = read_metadata_block(&mut file, &path, filter_handle)?;
+        let (index_payload, index_miss) = read_cached_metadata(
+            &mut file,
+            &path,
+            file_number,
+            cache.as_deref(),
+            index_handle,
+            BlockKind::Index,
+        )?;
+        let (filter_payload, filter_miss) = read_cached_metadata(
+            &mut file,
+            &path,
+            file_number,
+            cache.as_deref(),
+            filter_handle,
+            BlockKind::Filter,
+        )?;
         let properties_payload = read_metadata_block(&mut file, &path, properties_handle)?;
-        let index_block = Block::decode(index_payload)?;
+        let index_block = Block::decode(index_payload.as_ref())?;
         let mut index = Vec::with_capacity(index_block.len());
         let mut previous_end = 0_u64;
         for entry in index_block.iter() {
@@ -141,8 +188,34 @@ impl TableReader {
                 "final data block is not immediately followed by the filter block",
             ));
         }
-        let filter = BloomFilter::decode(filter_payload)?;
+        let filter = BloomFilter::decode(filter_payload.as_ref())?;
         let properties = decode_properties(&properties_payload)?;
+        if let Some(expected) = file_number
+            && properties.file_number != expected
+        {
+            return Err(properties_corruption(format!(
+                "file number {} does not match expected {expected}",
+                properties.file_number
+            )));
+        }
+        if let (Some(cache), Some(number)) = (&cache, file_number) {
+            if index_miss {
+                cache.insert(
+                    number,
+                    index_handle.offset(),
+                    BlockKind::Index,
+                    index_payload,
+                )?;
+            }
+            if filter_miss {
+                cache.insert(
+                    number,
+                    filter_handle.offset(),
+                    BlockKind::Filter,
+                    filter_payload,
+                )?;
+            }
+        }
         let trusted_maximum =
             u64::try_from(options.max_uncompressed_data_block_bytes).map_err(|_| {
                 Error::InvalidArgument("reader data-block limit exceeds u64".to_owned())
@@ -171,6 +244,10 @@ impl TableReader {
             filter,
             properties,
             max_uncompressed_data_block_bytes: options.max_uncompressed_data_block_bytes,
+            file_number,
+            cache,
+            stats,
+            user_key_filter: version >= 2,
         })
     }
 
@@ -184,17 +261,22 @@ impl TableReader {
         self.file_size
     }
 
-    /// Reports the Bloom filter's answer for one exact internal key.
+    /// Reports the Bloom filter's answer for an internal key's user key.
     ///
-    /// `false` is a definite miss and means `get` will not read a data block.
+    /// Version 1 tables retain exact-internal-key filters for compatibility;
+    /// version 2 tables use user-key filters shared by all MVCC versions.
     /// `true` remains probabilistic and must be verified against table data.
     pub fn may_contain(&self, key: &InternalKey) -> bool {
-        self.filter.may_contain(key.as_bytes())
+        if self.user_key_filter {
+            self.filter.may_contain(key.user_key())
+        } else {
+            self.filter.may_contain(key.as_bytes())
+        }
     }
 
     /// Looks up one exact internal key.
     ///
-    /// The Bloom filter runs first. On a possible match, the index separator
+    /// The Bloom filter runs first. On a possible user-key match, the index separator
     /// selects one block, whose checksum and compression are validated only
     /// then. A lower-bound seek must still equal the requested bytes because a
     /// Bloom positive may be false.
@@ -206,6 +288,7 @@ impl TableReader {
         if !self.may_contain(key) {
             return Ok(None);
         }
+
         let Some((_, handle)) = self
             .index
             .iter()
@@ -218,6 +301,39 @@ impl TableReader {
             Some((found, value)) if found == key.as_bytes() => Ok(Some(value)),
             _ => Ok(None),
         }
+    }
+
+    pub(crate) fn get_visible(
+        &self,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<TableLookup> {
+        if self.user_key_filter {
+            let may_contain = self.filter.may_contain(user_key);
+            if let Some(stats) = &self.stats {
+                stats.record_bloom_check(!may_contain);
+            }
+            if !may_contain {
+                return Ok(TableLookup::BloomNegative);
+            }
+        }
+        let seek = InternalKey::deletion(user_key, sequence);
+        let Some((_, handle)) = self
+            .index
+            .iter()
+            .find(|(separator, _)| separator.as_slice() >= seek.as_bytes())
+        else {
+            return Ok(TableLookup::Absent);
+        };
+        let block = self.read_data_block(*handle)?;
+        let Some((found, value)) = block.seek(seek.as_bytes())? else {
+            return Ok(TableLookup::Absent);
+        };
+        let found = InternalKey::decode(found)?;
+        if found.user_key() != user_key || found.sequence() > sequence {
+            return Ok(TableLookup::Absent);
+        }
+        Ok(TableLookup::Found(found, value))
     }
 
     /// Returns a lazy forward iterator across all internal records.
@@ -236,6 +352,11 @@ impl TableReader {
 
     fn read_data_block(&self, handle: BlockHandle) -> Result<Block> {
         validate_handle(handle, self.data_end, "data block")?;
+        if let (Some(cache), Some(file_number)) = (&self.cache, self.file_number)
+            && let Some(payload) = cache.get(file_number, handle.offset(), BlockKind::Data)?
+        {
+            return Block::decode(payload.as_ref());
+        }
         let maximum_stored =
             maximum_stored_data_block_bytes(self.max_uncompressed_data_block_bytes)?;
         if handle.size() > maximum_stored {
@@ -295,7 +416,16 @@ impl TableReader {
 
             _ => unreachable!("stored-block decoding validates compression markers"),
         };
-        Block::decode(decoded)
+        let block = Block::decode(&decoded)?;
+        if let (Some(cache), Some(file_number)) = (&self.cache, self.file_number) {
+            cache.insert(
+                file_number,
+                handle.offset(),
+                BlockKind::Data,
+                Arc::from(decoded),
+            )?;
+        }
+        Ok(block)
     }
 }
 
@@ -424,7 +554,24 @@ fn read_metadata_block(file: &mut File, path: &Path, handle: BlockHandle) -> Res
     if marker != NO_COMPRESSION {
         return Err(footer_corruption("metadata blocks must not be compressed"));
     }
+
     Ok(payload)
+}
+
+fn read_cached_metadata(
+    file: &mut File,
+    path: &Path,
+    file_number: Option<u64>,
+    cache: Option<&BlockCache>,
+    handle: BlockHandle,
+    kind: BlockKind,
+) -> Result<(Arc<[u8]>, bool)> {
+    if let (Some(cache), Some(file_number)) = (cache, file_number)
+        && let Some(payload) = cache.get(file_number, handle.offset(), kind)?
+    {
+        return Ok((payload, false));
+    }
+    Ok((Arc::from(read_metadata_block(file, path, handle)?), true))
 }
 
 fn read_exact_range(

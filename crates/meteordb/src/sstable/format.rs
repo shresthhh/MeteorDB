@@ -9,7 +9,10 @@ pub const NO_COMPRESSION: u8 = 0;
 /// Codec marker reserved for a Snappy-compressed stored block.
 pub const SNAPPY_COMPRESSION: u8 = 1;
 /// Version written into the fixed SSTable footer by complete table builders.
-pub const SSTABLE_FORMAT_VERSION: u32 = 1;
+///
+/// Version 2 changes the Bloom filter from exact internal keys to user keys,
+/// allowing one safe negative check for every MVCC snapshot sequence.
+pub const SSTABLE_FORMAT_VERSION: u32 = 2;
 /// Eight-byte identifier written into a complete SSTable footer.
 pub const SSTABLE_MAGIC: [u8; 8] = *b"METEOR01";
 /// Fixed bytes reserved for three block handles, version, and magic.

@@ -6,11 +6,13 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
 use crate::background::BackgroundSignal;
+use crate::sstable::TableLookup;
+use crate::stats::ReadStats;
 use crate::{
-    DurableFs, Error, FileMeta, InternalKey, MemTable, Options, OsDurableFs, Result,
-    SequenceNumber, SnapshotGuard, SnapshotRegistry, TableBuildResult, TableBuilder, TableReader,
-    ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter, WriteBatch, WriteOp,
-    replay_wal_with_fs,
+    BlockCache, DurableFs, Error, FileMeta, InternalKey, MemTable, Options, OsDurableFs, Result,
+    SequenceNumber, SnapshotGuard, SnapshotRegistry, StatsSnapshot, TableBuildResult, TableBuilder,
+    TableReader, TableReaderOptions, ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter,
+    WriteBatch, WriteOp, replay_wal_with_fs,
 };
 
 /// A cloneable handle to MeteorDB's durable engine.
@@ -28,6 +30,8 @@ struct EngineInner {
     shutdown: AtomicBool,
     committed_sequence: AtomicU64,
     snapshots: SnapshotRegistry,
+    block_cache: Arc<BlockCache>,
+    read_stats: Arc<ReadStats>,
 }
 
 struct WriteState {
@@ -252,6 +256,7 @@ impl Engine {
         }
         wal_numbers = retained_wals;
 
+        let block_cache = Arc::new(BlockCache::new(options.block_cache_bytes)?);
         let engine = Self {
             inner: Arc::new(EngineInner {
                 options,
@@ -277,6 +282,8 @@ impl Engine {
                 shutdown: AtomicBool::new(false),
                 committed_sequence: AtomicU64::new(largest_sequence),
                 snapshots: SnapshotRegistry::default(),
+                block_cache,
+                read_stats: Arc::new(ReadStats::default()),
             }),
         };
         engine.start_background_worker()?;
@@ -343,6 +350,11 @@ impl Engine {
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
         self.get_at(key.as_ref(), sequence)
+    }
+
+    /// Captures structured read-path and block-cache statistics.
+    pub fn stats(&self) -> StatsSnapshot {
+        self.inner.read_stats.snapshot(&self.inner.block_cache)
     }
 
     /// Captures a stable read view at the current committed sequence.
@@ -448,50 +460,77 @@ impl Engine {
                 self.inner.options.max_key_bytes
             )));
         }
+        self.inner.read_stats.record_point_read();
         let state = self.lock_state();
         ensure_readable(&state)?;
-        let mut best = state
+        if let Some((_, record)) = state
             .mutable
             .table
             .get_entry(key, sequence)?
-            .map(clone_candidate);
+            .map(clone_candidate)
+        {
+            return Ok(record_into_value(record));
+        }
         for immutable in state.immutables.iter().rev() {
-            merge_candidate(
-                &mut best,
-                immutable
-                    .table
-                    .get_entry(key, sequence)?
-                    .map(clone_candidate),
-            );
+            if let Some((_, record)) = immutable
+                .table
+                .get_entry(key, sequence)?
+                .map(clone_candidate)
+            {
+                return Ok(record_into_value(record));
+            }
         }
 
         let version = state.versions.current();
-        for level in 0..crate::NUM_LEVELS {
-            for file in version.files(level) {
-                let reader = TableReader::open(
-                    self.inner
-                        .options
-                        .path
-                        .join(format!("{:06}.sst", file.number())),
-                )?;
-                for entry in reader.iter() {
-                    let (internal_key, value) = entry?;
-                    if internal_key.user_key() == key && internal_key.sequence() <= sequence {
-                        let record = if internal_key.kind() == ValueKind::Deletion {
-                            ValueRecord::Tombstone
-                        } else {
-                            ValueRecord::value(value, None)
-                        };
-                        merge_candidate(&mut best, Some((internal_key.sequence(), record)));
-                        break;
-                    }
+        drop(state);
+        for file in version.files(0).iter().filter(|file| overlaps(file, key)) {
+            if let Some(value) = self.read_table_candidate(file, 0, key, sequence)? {
+                return Ok(value);
+            }
+        }
+        for level in 1..crate::NUM_LEVELS {
+            let files = version.files(level);
+            let index = files.partition_point(|file| file.largest().user_key() < key);
+            let candidate = files.get(index).filter(|file| overlaps(file, key));
+            if let Some(file) = candidate
+                && let Some(value) = self.read_table_candidate(file, level, key, sequence)?
+            {
+                return Ok(value);
+            }
+        }
+        Ok(None)
+    }
+
+    fn read_table_candidate(
+        &self,
+        file: &FileMeta,
+        level: usize,
+        key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Option<Option<Vec<u8>>>> {
+        self.inner.read_stats.record_table_probe(level);
+        let reader = TableReader::open_cached(
+            self.inner
+                .options
+                .path
+                .join(format!("{:06}.sst", file.number())),
+            file.number(),
+            self.inner.block_cache.clone(),
+            self.inner.read_stats.clone(),
+            TableReaderOptions {
+                max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+            },
+        )?;
+        match reader.get_visible(key, sequence)? {
+            TableLookup::BloomNegative | TableLookup::Absent => Ok(None),
+            TableLookup::Found(internal_key, value) => {
+                if internal_key.kind() == ValueKind::Deletion {
+                    Ok(Some(None))
+                } else {
+                    Ok(Some(Some(value)))
                 }
             }
         }
-        Ok(match best {
-            Some((_, ValueRecord::Value { value, .. })) => Some(value),
-            Some((_, ValueRecord::Tombstone)) | None => None,
-        })
     }
 
     fn lock_state(&self) -> MutexGuard<'_, WriteState> {
@@ -843,17 +882,25 @@ fn clone_candidate(entry: (&InternalKey, &ValueRecord)) -> (SequenceNumber, Valu
     (entry.0.sequence(), entry.1.clone())
 }
 
-fn merge_candidate(
-    current: &mut Option<(SequenceNumber, ValueRecord)>,
-    candidate: Option<(SequenceNumber, ValueRecord)>,
-) {
-    if let Some(candidate) = candidate
-        && current
-            .as_ref()
-            .is_none_or(|(sequence, _)| candidate.0 > *sequence)
-    {
-        *current = Some(candidate);
+fn record_into_value(record: ValueRecord) -> Option<Vec<u8>> {
+    match record {
+        ValueRecord::Value { value, .. } => Some(value),
+        ValueRecord::Tombstone => None,
     }
+}
+
+fn overlaps(file: &FileMeta, key: &[u8]) -> bool {
+    file.smallest().user_key() <= key && key <= file.largest().user_key()
+}
+
+fn reader_block_limit(options: &Options) -> usize {
+    let target_with_encoding = options.block_bytes.saturating_mul(2);
+    let largest_entry = options
+        .max_key_bytes
+        .saturating_mul(2)
+        .saturating_add(options.max_value_bytes)
+        .saturating_add(128);
+    target_with_encoding.max(largest_entry)
 }
 
 fn ensure_open(state: &WriteState) -> Result<()> {

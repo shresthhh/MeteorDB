@@ -9,6 +9,7 @@
 mod background;
 mod batch;
 mod bloom;
+mod cache;
 mod clock;
 mod engine;
 mod error;
@@ -19,11 +20,13 @@ mod memtable;
 mod options;
 mod snapshot;
 mod sstable;
+mod stats;
 mod version;
 mod wal;
 
 pub use batch::{WriteBatch, WriteOp};
 pub use bloom::BloomFilter;
+pub use cache::{BlockCache, BlockKind, CachePartition, CachePartitionSnapshot, CacheSnapshot};
 pub use clock::{Clock, SystemClock};
 pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
@@ -40,5 +43,6 @@ pub use sstable::{
     TableIter, TableProperties, TableReader, TableReaderOptions, decode_stored_block,
     encode_stored_block,
 };
+pub use stats::StatsSnapshot;
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
 pub use wal::{RecoveredBatch, WalWriter, replay_wal, replay_wal_with_fs};

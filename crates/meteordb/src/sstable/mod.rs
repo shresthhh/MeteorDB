@@ -11,6 +11,7 @@ pub use format::{
     BLOCK_TRAILER_BYTES, BlockHandle, NO_COMPRESSION, SNAPPY_COMPRESSION, SSTABLE_FOOTER_BYTES,
     SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, decode_stored_block, encode_stored_block,
 };
+pub(crate) use reader::TableLookup;
 pub use reader::{
     DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES, TableIter, TableReader, TableReaderOptions,
 };
