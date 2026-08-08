@@ -4,7 +4,8 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 
 use meteordb::{
-    Durability, DurableFile, DurableFs, Engine, Error, MemTable, Options, ValueRecord, WriteBatch,
+    Durability, DurableFile, DurableFs, Engine, Error, MemTable, Options, OsDurableFs, ValueRecord,
+    WriteBatch,
 };
 
 fn test_options(path: &Path) -> Options {
@@ -74,25 +75,23 @@ fn a_batch_is_visible_at_one_sequence() {
 }
 
 #[test]
-fn reopening_preserves_existing_wal_bytes() {
+fn reopening_replays_existing_wal_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let options = test_options(dir.path());
     let db = Engine::open(options.clone()).unwrap();
     db.put(b"k", b"value").unwrap();
     db.sync().unwrap();
     drop(db);
-    let wal_path = dir.path().join("000001.wal");
+    let wal_path = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "wal"))
+        .unwrap();
     let before = std::fs::read(&wal_path).unwrap();
 
-    assert!(matches!(
-        Engine::open(options),
-        Err(Error::Io {
-            operation: "create new WAL",
-            path,
-            ..
-        }) if path == wal_path
-    ));
-    assert_eq!(std::fs::read(wal_path).unwrap(), before);
+    let reopened = Engine::open(options).unwrap();
+    assert_eq!(reopened.get(b"k").unwrap().as_deref(), Some(&b"value"[..]));
+    assert!(!before.is_empty());
 }
 
 #[test]
@@ -119,15 +118,7 @@ fn concurrent_opens_create_one_wal_without_truncating_it() {
     assert_eq!(
         results
             .iter()
-            .filter(|result| {
-                matches!(
-                    result,
-                    Err(Error::Io {
-                        operation: "create new WAL",
-                        ..
-                    })
-                )
-            })
+            .filter(|result| { matches!(result, Err(Error::Locked(_))) })
             .count(),
         1
     );
@@ -160,23 +151,35 @@ impl DurableFile for FailingFile {
     }
 }
 
-struct FailingWalFs;
+struct FailingWalFs(OsDurableFs);
 
 impl DurableFs for FailingWalFs {
-    fn create(&self, _path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        Ok(Box::new(FailingFile))
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        if path.extension().is_some_and(|extension| extension == "wal") {
+            Ok(Box::new(FailingFile))
+        } else {
+            self.0.create(path)
+        }
     }
 
-    fn append(&self, _path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        Ok(Box::new(FailingFile))
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.0.append(path)
     }
 
-    fn sync_directory(&self, _path: &Path) -> std::io::Result<()> {
-        Ok(())
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.0.append_existing(path)
     }
 
-    fn atomic_replace(&self, _source: &Path, _destination: &Path) -> std::io::Result<()> {
-        unreachable!("the Task 4 engine does not replace files")
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.0.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.0.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.0.atomic_install(source, destination)
     }
 }
 
@@ -197,34 +200,49 @@ impl DurableFile for SyncFailingFile {
 
 struct SyncFailingFs {
     syncs: Arc<AtomicUsize>,
+    inner: OsDurableFs,
 }
 
 impl DurableFs for SyncFailingFs {
-    fn create(&self, _path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        Ok(Box::new(SyncFailingFile {
-            syncs: self.syncs.clone(),
-        }))
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        if path.extension().is_some_and(|extension| extension == "wal") {
+            Ok(Box::new(SyncFailingFile {
+                syncs: self.syncs.clone(),
+            }))
+        } else {
+            self.inner.create(path)
+        }
     }
 
-    fn append(&self, _path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
-        Ok(Box::new(SyncFailingFile {
-            syncs: self.syncs.clone(),
-        }))
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
     }
 
-    fn sync_directory(&self, _path: &Path) -> std::io::Result<()> {
-        Ok(())
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append_existing(path)
     }
 
-    fn atomic_replace(&self, _source: &Path, _destination: &Path) -> std::io::Result<()> {
-        unreachable!("the Task 4 engine does not replace files")
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_install(source, destination)
     }
 }
 
 #[test]
 fn wal_failure_publishes_neither_operation() {
     let dir = tempfile::tempdir().unwrap();
-    let db = Engine::open_with_fs(test_options(dir.path()), Arc::new(FailingWalFs)).unwrap();
+    let db = Engine::open_with_fs(
+        test_options(dir.path()),
+        Arc::new(FailingWalFs(OsDurableFs)),
+    )
+    .unwrap();
     let before = db.snapshot().unwrap();
     let mut batch = WriteBatch::default();
     batch.put(b"a", b"1").put(b"b", b"2");
@@ -286,6 +304,7 @@ fn explicit_sync_failure_disables_later_writes_and_syncs() {
         options,
         Arc::new(SyncFailingFs {
             syncs: syncs.clone(),
+            inner: OsDurableFs,
         }),
     )
     .unwrap();
@@ -312,6 +331,7 @@ fn close_sync_failure_is_terminal_and_repeated_close_returns_it() {
         options,
         Arc::new(SyncFailingFs {
             syncs: syncs.clone(),
+            inner: OsDurableFs,
         }),
     )
     .unwrap();

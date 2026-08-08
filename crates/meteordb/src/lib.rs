@@ -6,6 +6,7 @@
 
 #![deny(missing_docs)]
 
+mod background;
 mod batch;
 mod bloom;
 mod clock;
@@ -40,4 +41,4 @@ pub use sstable::{
     encode_stored_block,
 };
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
-pub use wal::{RecoveredBatch, WalWriter, replay_wal};
+pub use wal::{RecoveredBatch, WalWriter, replay_wal, replay_wal_with_fs};

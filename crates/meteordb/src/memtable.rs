@@ -69,6 +69,7 @@ impl ValueRecord {
 #[derive(Debug, Default)]
 pub struct MemTable {
     entries: BTreeMap<InternalKey, ValueRecord>,
+    approximate_bytes: usize,
 }
 
 impl MemTable {
@@ -110,7 +111,19 @@ impl MemTable {
             };
             prepared.push((InternalKey::try_new(user_key, sequence, kind)?, record));
         }
-        self.entries.extend(prepared);
+        for (key, record) in prepared {
+            let record_bytes = match &record {
+                ValueRecord::Value { value, .. } => {
+                    value.len() + std::mem::size_of::<Option<u64>>()
+                }
+                ValueRecord::Tombstone => 0,
+            };
+            self.approximate_bytes = self
+                .approximate_bytes
+                .saturating_add(key.as_bytes().len())
+                .saturating_add(record_bytes);
+            self.entries.insert(key, record);
+        }
         Ok(())
     }
 
@@ -121,13 +134,33 @@ impl MemTable {
     /// it only while the memtable borrow remains valid, avoiding an allocation
     /// on this internal lookup path.
     pub fn get(&self, user_key: &[u8], sequence: SequenceNumber) -> Result<Option<&ValueRecord>> {
+        Ok(self
+            .get_entry(user_key, sequence)?
+            .map(|(_, record)| record))
+    }
+
+    /// Returns the newest visible internal key and record for `user_key`.
+    pub fn get_entry(
+        &self,
+        user_key: &[u8],
+        sequence: SequenceNumber,
+    ) -> Result<Option<(&InternalKey, &ValueRecord)>> {
         let seek = InternalKey::try_new(user_key, sequence, ValueKind::Deletion)?;
         Ok(self
             .entries
             .range(seek..)
             .next()
-            .filter(|(key, _)| key.user_key() == user_key)
-            .map(|(_, record)| record))
+            .filter(|(key, _)| key.user_key() == user_key))
+    }
+
+    /// Returns the approximate bytes retained by this table.
+    pub fn approximate_bytes(&self) -> usize {
+        self.approximate_bytes
+    }
+
+    /// Reports whether the table contains no records.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
     /// Iterates over every internal key and record in storage order.

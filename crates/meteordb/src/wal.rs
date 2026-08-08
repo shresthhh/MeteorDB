@@ -1,5 +1,4 @@
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -226,14 +225,23 @@ impl WalWriter {
 /// stored in a masked form so their on-disk bytes are decorrelated from common
 /// CRC values.
 pub fn replay_wal(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Vec<RecoveredBatch>> {
+    replay_wal_with_fs(path, max_batch_bytes, Arc::new(OsDurableFs))
+}
+
+/// Replays a WAL through the no-follow durable-filesystem abstraction.
+pub fn replay_wal_with_fs(
+    path: impl AsRef<Path>,
+    max_batch_bytes: usize,
+    fs: Arc<dyn DurableFs>,
+) -> Result<Vec<RecoveredBatch>> {
     let max_logical_record_bytes = encoded_record_limit(max_batch_bytes)?;
     let path = path.as_ref();
-    let file = File::open(path).map_err(|source| io_error("open WAL", path, source))?;
-    let file_length = file
-        .metadata()
-        .map_err(|source| io_error("stat WAL", path, source))?
-        .len();
-    let mut reader = BufReader::new(file);
+    let contents = fs
+        .read_file(path)
+        .map_err(|source| io_error("read WAL", path, source))?;
+    let file_length =
+        u64::try_from(contents.len()).map_err(|_| wal_corruption("WAL length exceeds u64"))?;
+    let mut reader = BufReader::new(Cursor::new(contents));
     let mut block = [0_u8; BLOCK_BYTES];
     let mut block_start = 0_u64;
     let mut logical = Vec::new();
@@ -341,8 +349,8 @@ pub fn replay_wal(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Vec<
     Ok(recovered)
 }
 
-fn read_block(
-    reader: &mut BufReader<File>,
+fn read_block<R: Read>(
+    reader: &mut BufReader<R>,
     block: &mut [u8; BLOCK_BYTES],
 ) -> std::io::Result<usize> {
     let mut filled = 0;

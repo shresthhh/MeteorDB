@@ -124,6 +124,14 @@ pub trait DurableFs: Send + Sync {
         std::fs::hard_link(source, destination)?;
         std::fs::remove_file(source)
     }
+
+    /// Removes one directory entry without following it.
+    ///
+    /// Callers synchronize the containing directory after a removal that must
+    /// survive a crash.
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        std::fs::remove_file(path)
+    }
 }
 
 /// The durable-filesystem implementation backed by Rust's standard library.
