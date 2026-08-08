@@ -8,6 +8,8 @@ Complete.
 - Atomic snapshot fix: `52ebd2509328bedb588d621489411e4224e03a8a`
 - Failed-compaction cleanup fix:
   `051c8a929e8f0c2f17ed1f78fcdaafcffa628ea8`
+- Remaining review fixes:
+  `e2fbbaf3d17580fc49ded3adc5bece58e466a05e`
 - Branch: `feature/meteordb-engine`
 - Nothing was pushed.
 - The commits have no co-author trailers.
@@ -28,6 +30,19 @@ compaction while the snapshot was paused, and the test failed. After the fix,
 the writer remains blocked until the guard is registered, and the snapshot
 still reads the historical value.
 
+### Atomic implicit read capture
+
+Ordinary `get`, `scan`, and `scan_prefix` now lock write state before capturing
+the committed sequence and register a short-lived snapshot guard while still
+holding that lock. The lock order remains write state then snapshot registry,
+matching snapshot creation and compaction. Explicit snapshots continue to use
+their fixed sequence and existing lifetime guard.
+
+Three deterministic regressions pause each ordinary read immediately after
+sequence capture. An overwrite, flush, and compaction must remain blocked until
+the read has protected its sequence; each read then observes the historical
+value.
+
 ### Failed compaction cleanup
 
 Compaction now carries an armed scoped cleanup object that records only
@@ -39,6 +54,13 @@ retry can reuse the unchanged next file number.
 Manifest application now distinguishes failures before append from failures
 during append/sync. Cleanup is disarmed for the latter because recovery may
 observe the edit; files that may be manifest-visible are never deleted.
+
+Compaction also records its destination path before calling `atomic_install`.
+This is intentionally scoped to compaction output cleanup rather than changing
+`DurableFs::atomic_install`, whose callers include WAL and manifest paths. If
+the default hard-link install creates the destination but fails to remove the
+temporary link, unwinding removes both unpublished names and synchronizes the
+directory so the unchanged file number can be retried.
 
 ## What changed
 
@@ -157,7 +179,11 @@ Coverage includes:
   survives one compaction and is removed by a later one.
 - atomic sequence capture and snapshot registration against a concurrent
   overwrite/flush/compaction;
+- atomic sequence capture and protection for ordinary `get`, `scan`, and
+  `scan_prefix` against concurrent overwrite/flush/compaction;
 - temporary SSTable cleanup after an injected output synchronization failure;
+- unpublished destination and temporary-link cleanup after an injected
+  destination-created/temporary-removal-failed atomic install;
 - installed-output cleanup and file-number reuse after an injected
   pre-manifest SSTable synchronization failure; and
 - preservation of installed outputs after an uncertain manifest sync failure.
@@ -165,18 +191,19 @@ Coverage includes:
 The transitive-retention test first reproduced an unsafe early deletion, then
 passed after reclamation began checking all retained old versions.
 
-The snapshot regression first failed because the concurrent writer and
-compaction completed before registration. The cleanup regressions first failed
-with a remaining `.sst.tmp` and five unpublished installed SSTables,
-respectively. Both then passed after the fixes.
+The snapshot and implicit-read regressions first failed because the concurrent
+writer and compaction completed before registration. The cleanup regressions
+first failed with a remaining `.sst.tmp`, unpublished installed SSTables, and
+an unpublished destination left by partial `atomic_install`, respectively.
+They passed after the fixes.
 
 ## Validation
 
 Using `.superpowers/sdd/local-toolchain/root/usr/bin/gcc-13`:
 
 - `cargo fmt --all -- --check` — passed.
-- `cargo test -p meteordb --test compaction` — 10 passed.
-- `cargo test -p meteordb` — 167 unit/integration tests and all doc tests
+- `cargo test -p meteordb --test compaction` — 11 passed.
+- `cargo test -p meteordb` — 171 unit/integration tests and all doc tests
   passed.
 - `cargo clippy -p meteordb --all-targets -- -D warnings` — passed.
 - `RUSTDOCFLAGS="-D warnings" cargo doc -p meteordb --no-deps` — passed.
