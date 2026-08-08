@@ -25,6 +25,7 @@ mod sstable;
 mod stats;
 mod version;
 mod wal;
+mod workloads;
 
 pub use batch::{WriteBatch, WriteOp};
 pub use bloom::BloomFilter;
@@ -52,3 +53,4 @@ pub use sstable::{
 pub use stats::StatsSnapshot;
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
 pub use wal::{RecoveredBatch, WalWriter, replay_wal, replay_wal_with_fs};
+pub use workloads::{CacheLookup, InferenceCache, InferenceEntry, InferenceKey};
