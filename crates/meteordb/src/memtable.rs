@@ -171,4 +171,11 @@ impl MemTable {
     pub fn iter(&self) -> impl Iterator<Item = (&InternalKey, &ValueRecord)> {
         self.entries.iter()
     }
+
+    pub(crate) fn owned_entries(&self) -> Vec<(InternalKey, ValueRecord)> {
+        self.entries
+            .iter()
+            .map(|(key, record)| (key.clone(), record.clone()))
+            .collect()
+    }
 }

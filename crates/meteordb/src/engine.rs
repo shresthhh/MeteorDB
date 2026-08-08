@@ -6,13 +6,15 @@ use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
 use crate::background::BackgroundSignal;
+use crate::iter::{ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds};
 use crate::sstable::TableLookup;
 use crate::stats::ReadStats;
 use crate::{
-    BlockCache, DurableFs, Error, FileMeta, InternalKey, MemTable, Options, OsDurableFs, Result,
-    SequenceNumber, SnapshotGuard, SnapshotRegistry, StatsSnapshot, TableBuildResult, TableBuilder,
-    TableReader, TableReaderOptions, ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter,
-    WriteBatch, WriteOp, replay_wal_with_fs,
+    BlockCache, Clock, DurableFs, Error, FileMeta, InternalKey, KvIterator, MemTable, Options,
+    OsDurableFs, Result, ScanBounds, SequenceNumber, SnapshotGuard, SnapshotRegistry,
+    StatsSnapshot, SystemClock, TableBuildResult, TableBuilder, TableReader, TableReaderOptions,
+    ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter, WriteBatch, WriteOp,
+    replay_wal_with_fs,
 };
 
 /// A cloneable handle to MeteorDB's durable engine.
@@ -352,6 +354,27 @@ impl Engine {
         self.get_at(key.as_ref(), sequence)
     }
 
+    /// Scans visible keys in ascending byte order within `bounds`.
+    ///
+    /// `limit` counts emitted live keys, not hidden versions or tombstones.
+    pub fn scan(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        self.scan_at(bounds, limit, sequence)
+    }
+
+    /// Scans visible keys beginning with `prefix` in ascending byte order.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>, limit: usize) -> Result<KvIterator> {
+        let prefix = prefix.as_ref();
+        validate_length(
+            "prefix",
+            prefix.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
+        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        self.scan_at(prefix_bounds(prefix), limit, sequence)
+    }
+
     /// Captures structured read-path and block-cache statistics.
     pub fn stats(&self) -> StatsSnapshot {
         self.inner.read_stats.snapshot(&self.inner.block_cache)
@@ -501,6 +524,69 @@ impl Engine {
         Ok(None)
     }
 
+    fn scan_at(
+        &self,
+        bounds: ScanBounds,
+        limit: usize,
+        sequence: SequenceNumber,
+    ) -> Result<KvIterator> {
+        validate_scan_bounds(&self.inner.options, &bounds)?;
+        let (mut children, version) = {
+            let state = self.lock_state();
+            ensure_readable(&state)?;
+            let mut children = Vec::with_capacity(1 + state.immutables.len());
+            push_memtable_child(&mut children, &state.mutable.table);
+            for immutable in state.immutables.iter().rev() {
+                push_memtable_child(&mut children, &immutable.table);
+            }
+            (children, state.versions.current())
+        };
+
+        if limit != 0 {
+            for level in 0..crate::NUM_LEVELS {
+                for file in version.files(level).iter().filter(|file| {
+                    overlaps_bounds(
+                        file.smallest().user_key(),
+                        file.largest().user_key(),
+                        &bounds,
+                    )
+                }) {
+                    let reader = TableReader::open_cached(
+                        self.inner
+                            .options
+                            .path
+                            .join(format!("{:06}.sst", file.number())),
+                        file.number(),
+                        self.inner.block_cache.clone(),
+                        self.inner.read_stats.clone(),
+                        TableReaderOptions {
+                            max_uncompressed_data_block_bytes: reader_block_limit(
+                                &self.inner.options,
+                            ),
+                        },
+                    )?;
+                    children.push(Box::new(
+                        reader
+                            .into_iter()
+                            .map(|entry| entry.map(|(key, value)| disk_entry(key, value))),
+                    ));
+                }
+            }
+        } else {
+            children.clear();
+        }
+
+        Ok(KvIterator::new(
+            children,
+            bounds,
+            sequence,
+            SystemClock.now_unix_ms(),
+            limit,
+            version,
+            self.inner.snapshots.acquire(sequence),
+        ))
+    }
+
     fn read_table_candidate(
         &self,
         file: &FileMeta,
@@ -585,6 +671,24 @@ impl Snapshot {
     /// Reads `key` at the snapshot's fixed sequence number.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         self.engine.get_at(key.as_ref(), self.sequence)
+    }
+
+    /// Scans keys visible at this snapshot's fixed sequence.
+    pub fn scan(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        self.engine.scan_at(bounds, limit, self.sequence)
+    }
+
+    /// Scans a prefix at this snapshot's fixed sequence.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>, limit: usize) -> Result<KvIterator> {
+        let prefix = prefix.as_ref();
+        validate_length(
+            "prefix",
+            prefix.len(),
+            "max_key_bytes",
+            self.engine.inner.options.max_key_bytes,
+        )?;
+        self.engine
+            .scan_at(prefix_bounds(prefix), limit, self.sequence)
     }
 }
 
@@ -880,6 +984,27 @@ fn persist_wal_state(state: &mut WriteState) -> Result<()> {
 
 fn clone_candidate(entry: (&InternalKey, &ValueRecord)) -> (SequenceNumber, ValueRecord) {
     (entry.0.sequence(), entry.1.clone())
+}
+
+fn push_memtable_child(children: &mut Vec<ChildIterator>, table: &MemTable) {
+    let entries = table
+        .owned_entries()
+        .into_iter()
+        .map(|(key, record)| Ok(InternalEntry { key, record }));
+    children.push(Box::new(entries));
+}
+
+fn validate_scan_bounds(options: &Options, bounds: &ScanBounds) -> Result<()> {
+    for key in [bounds.start(), bounds.end()]
+        .into_iter()
+        .filter_map(|bound| match bound {
+            std::ops::Bound::Included(key) | std::ops::Bound::Excluded(key) => Some(key),
+            std::ops::Bound::Unbounded => None,
+        })
+    {
+        validate_length("bound", key.len(), "max_key_bytes", options.max_key_bytes)?;
+    }
+    Ok(())
 }
 
 fn record_into_value(record: ValueRecord) -> Option<Vec<u8>> {

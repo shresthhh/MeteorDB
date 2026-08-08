@@ -350,6 +350,15 @@ impl TableReader {
         }
     }
 
+    pub(crate) fn into_iter(self) -> OwnedTableIter {
+        OwnedTableIter {
+            reader: self,
+            block_index: 0,
+            entries: Vec::new().into_iter(),
+            failed: false,
+        }
+    }
+
     fn read_data_block(&self, handle: BlockHandle) -> Result<Block> {
         validate_handle(handle, self.data_end, "data block")?;
         if let (Some(cache), Some(file_number)) = (&self.cache, self.file_number)
@@ -456,33 +465,67 @@ impl Iterator for TableIter<'_> {
     type Item = Result<(InternalKey, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        loop {
-            if let Some((key, value)) = self.entries.next() {
-                return Some(match InternalKey::decode(key) {
-                    Ok(key) => Ok((key, value)),
-                    Err(error) => {
-                        self.failed = true;
-                        Err(error)
-                    }
-                });
-            }
-            let (_, handle) = self.reader.index.get(self.block_index)?;
-            self.block_index += 1;
-            match self.reader.read_data_block(*handle) {
-                Ok(block) => match block.iter().collect::<Result<Vec<_>>>() {
-                    Ok(entries) => self.entries = entries.into_iter(),
-                    Err(error) => {
-                        self.failed = true;
-                        return Some(Err(error));
-                    }
-                },
+        next_table_entry(
+            self.reader,
+            &mut self.block_index,
+            &mut self.entries,
+            &mut self.failed,
+        )
+    }
+}
+
+pub(crate) struct OwnedTableIter {
+    reader: TableReader,
+    block_index: usize,
+    entries: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    failed: bool,
+}
+
+impl Iterator for OwnedTableIter {
+    type Item = Result<(InternalKey, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        next_table_entry(
+            &self.reader,
+            &mut self.block_index,
+            &mut self.entries,
+            &mut self.failed,
+        )
+    }
+}
+
+fn next_table_entry(
+    reader: &TableReader,
+    block_index: &mut usize,
+    entries: &mut std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    failed: &mut bool,
+) -> Option<Result<(InternalKey, Vec<u8>)>> {
+    if *failed {
+        return None;
+    }
+    loop {
+        if let Some((key, value)) = entries.next() {
+            return Some(match InternalKey::decode(key) {
+                Ok(key) => Ok((key, value)),
                 Err(error) => {
-                    self.failed = true;
+                    *failed = true;
+                    Err(error)
+                }
+            });
+        }
+        let (_, handle) = reader.index.get(*block_index)?;
+        *block_index += 1;
+        match reader.read_data_block(*handle) {
+            Ok(block) => match block.iter().collect::<Result<Vec<_>>>() {
+                Ok(block_entries) => *entries = block_entries.into_iter(),
+                Err(error) => {
+                    *failed = true;
                     return Some(Err(error));
                 }
+            },
+            Err(error) => {
+                *failed = true;
+                return Some(Err(error));
             }
         }
     }
