@@ -9,7 +9,8 @@ use crate::background::{BackgroundSignal, ObsoleteSstables};
 use crate::batch::MAX_WRITE_BATCH_OPERATIONS;
 use crate::compaction::{CompactionContext, CompactionPicker, DEFAULT_L0_COMPACTION_TRIGGER};
 use crate::iter::{
-    ChildIterator, InternalEntry, disk_entry, overlaps_bounds, prefix_bounds, user_key_in_bounds,
+    ChildIterator, InternalEntry, ReadLifetime, disk_entry, overlaps_bounds, prefix_bounds,
+    user_key_in_bounds,
 };
 use crate::sstable::TableLookup;
 use crate::stats::ReadStats;
@@ -909,9 +910,7 @@ impl Engine {
             sequence,
             read_time_unix_ms,
             limit,
-            version,
-            guard,
-            reader_lease,
+            ReadLifetime::new(version, guard, reader_lease),
         ))
     }
 

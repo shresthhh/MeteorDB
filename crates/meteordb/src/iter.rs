@@ -141,9 +141,27 @@ pub struct KvIterator {
     remaining: usize,
     failed: bool,
     pending: Option<InternalEntry>,
-    _version: Option<Arc<Version>>,
-    _snapshot_guard: Option<SnapshotGuard>,
-    _reader_lease: Option<Arc<()>>,
+    _lifetime: Option<ReadLifetime>,
+}
+
+pub(crate) struct ReadLifetime {
+    _version: Arc<Version>,
+    _snapshot_guard: SnapshotGuard,
+    _reader_lease: Arc<()>,
+}
+
+impl ReadLifetime {
+    pub(crate) fn new(
+        version: Arc<Version>,
+        snapshot_guard: SnapshotGuard,
+        reader_lease: Arc<()>,
+    ) -> Self {
+        Self {
+            _version: version,
+            _snapshot_guard: snapshot_guard,
+            _reader_lease: reader_lease,
+        }
+    }
 }
 
 impl KvIterator {
@@ -160,9 +178,7 @@ impl KvIterator {
             remaining: 0,
             failed: false,
             pending: None,
-            _version: None,
-            _snapshot_guard: None,
-            _reader_lease: None,
+            _lifetime: None,
         }
     }
 
@@ -172,9 +188,7 @@ impl KvIterator {
         sequence: SequenceNumber,
         read_time_unix_ms: u64,
         limit: usize,
-        version: Arc<Version>,
-        snapshot_guard: SnapshotGuard,
-        reader_lease: Arc<()>,
+        lifetime: ReadLifetime,
     ) -> Self {
         Self {
             merged: InternalMergingIterator::new(children),
@@ -184,9 +198,7 @@ impl KvIterator {
             remaining: limit,
             failed: false,
             pending: None,
-            _version: Some(version),
-            _snapshot_guard: Some(snapshot_guard),
-            _reader_lease: Some(reader_lease),
+            _lifetime: Some(lifetime),
         }
     }
 
