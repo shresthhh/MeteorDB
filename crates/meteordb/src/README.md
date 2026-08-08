@@ -12,7 +12,7 @@ that merely consume the row.
 | `lib` | Declares modules and assembles the crate-root API. | All library modules |
 | `engine` | Coordinates open, recovery, writes, reads, snapshots, rotation, flush, synchronization, and close. | `background`, `batch`, `cache`, `error`, `fs`, `internal_key`, `manifest`, `memtable`, `options`, `snapshot`, `sstable`, `stats`, `version`, `wal` |
 | `options` | Defines and validates durability, compression, size, and resource settings. | `error` |
-| `batch` | Owns ordered atomic mutations and their WAL encoding. | No other crate module |
+| `batch` | Owns ordered atomic mutations and their WAL encoding. | `error` (`Error`/`Result` for checked encoding, decoding, and validation) |
 | `error` | Defines structured public failures. | `thiserror` |
 
 ## Write path and recovery
