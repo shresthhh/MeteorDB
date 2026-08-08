@@ -879,7 +879,9 @@ impl Engine {
                     TableReaderOptions {
                         max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
                     },
+                    self.inner.fs.clone(),
                 )?;
+                validate_table_length(&reader, file)?;
                 let engine_encoded = reader.properties().engine_value_encoding;
                 children.push(Box::new(reader.into_iter().map(move |entry| {
                     entry.and_then(|(key, value)| disk_entry(key, value, engine_encoded))
@@ -918,7 +920,9 @@ impl Engine {
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
             },
+            self.inner.fs.clone(),
         )?;
+        validate_table_length(&reader, file)?;
         match reader.get_visible(key, sequence)? {
             TableLookup::BloomNegative | TableLookup::Absent => Ok(None),
             TableLookup::Found(internal_key, value) => {
@@ -936,6 +940,21 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn validate_table_length(reader: &TableReader, file: &FileMeta) -> Result<()> {
+    if reader.file_size() != file.file_size() {
+        return Err(Error::Corruption {
+            context: "SSTable",
+            detail: format!(
+                "{:06}.sst has length {}, expected {}",
+                file.number(),
+                reader.file_size(),
+                file.file_size()
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl Clone for Engine {

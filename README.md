@@ -159,6 +159,18 @@ Future comparisons with RocksDB should run equivalent workloads with documented
 hardware, configuration, datasets, and reproducible commands. The repository
 does not currently publish benchmark results or performance claims.
 
+The benchmark CLI defaults to synchronous durability, matching
+`Options::new`:
+
+```bash
+meteordb --path ./bench-db bench --seconds 10 \
+  --workload inference-cache --durability sync
+```
+
+Use `--durability buffered` only when intentionally measuring writes that may
+remain in operating-system buffers after acknowledgment. Human and JSON
+benchmark results include the selected durability mode.
+
 ## Design documents
 
 - [MeteorDB design](docs/superpowers/specs/2026-07-17-meteordb-design.md)

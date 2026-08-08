@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meteordb::{
-    BlockHandle, Compression, DurableFile, DurableFs, Error, InternalKey, SSTABLE_FOOTER_BYTES,
-    SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, TableBuilder, TableReader, TableReaderOptions,
+    BlockHandle, Compression, DurableFile, DurableFs, DurableReadFile, Error, InternalKey,
+    OsDurableFs, SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, TableBuilder,
+    TableReader, TableReaderOptions,
 };
 
 fn build_table(
@@ -27,6 +28,74 @@ fn build_table(
     }
     let result = builder.finish().unwrap();
     (entries, result)
+}
+
+#[test]
+fn table_reader_uses_one_injected_handle_for_metadata_and_lazy_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000042.sst");
+    let (entries, _) = build_table(&path, Compression::None);
+    let fs = Arc::new(SwapAfterOpenFs {
+        inner: OsDurableFs,
+        original: dir.path().join("original.sst"),
+        opens: AtomicUsize::new(0),
+    });
+
+    let reader =
+        TableReader::open_with_fs(&path, TableReaderOptions::default(), fs.clone()).unwrap();
+    assert_eq!(fs.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reader.get(&entries[39].0).unwrap(),
+        Some(entries[39].1.clone())
+    );
+    assert_eq!(fs.opens.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn table_reader_rejects_a_symlink_even_when_the_target_is_valid() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.sst");
+    build_table(&target, Compression::None);
+    let link = dir.path().join("000042.sst");
+    symlink(&target, &link).unwrap();
+
+    assert!(TableReader::open(link).is_err());
+}
+
+struct SwapAfterOpenFs {
+    inner: OsDurableFs,
+    original: std::path::PathBuf,
+    opens: AtomicUsize,
+}
+
+impl DurableFs for SwapAfterOpenFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let file = self.inner.open_read(path)?;
+        if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::rename(path, &self.original)?;
+            std::fs::write(path, b"replacement")?;
+        }
+        Ok(file)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 #[test]

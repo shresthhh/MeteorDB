@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use clap::{Parser, Subcommand, ValueEnum};
 use hdrhistogram::Histogram;
 use meteordb::{
-    CacheLookup, Engine, Error, InferenceCache, InferenceEntry, InferenceKey, ManifestInspection,
-    Options, SstableInspection, StatsSnapshot, TableReader, WalInspection, inspect_manifest,
-    inspect_wal,
+    CacheLookup, Durability, Engine, Error, InferenceCache, InferenceEntry, InferenceKey,
+    ManifestInspection, ManifestInspectionOptions, Options, SstableInspection, StatsSnapshot,
+    TableReader, WalInspection, inspect_manifest_with_options, inspect_wal,
 };
 use serde::Serialize;
 
@@ -39,6 +39,12 @@ enum Command {
         /// Trusted maximum logical WAL batch payload.
         #[arg(long, default_value_t = 64 * 1024 * 1024)]
         max_batch_bytes: usize,
+        /// Maximum live SSTable and required WAL files inspected.
+        #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize)]
+        max_files: usize,
+        /// Maximum raw manifest key bytes retained while selecting live files.
+        #[arg(long, default_value_t = 16 * 1024 * 1024, value_parser = parse_positive_usize)]
+        max_bytes: usize,
     },
     /// Render checked manifest edits and the resulting level layout.
     DumpManifest {
@@ -46,8 +52,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
         /// Maximum edits rendered; all edits are still validated.
-        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_ITEMS)]
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_ITEMS, value_parser = parse_positive_usize)]
         max_edits: usize,
+        /// Maximum SSTable references rendered across edits and live levels.
+        #[arg(long, default_value_t = DEFAULT_MAX_OUTPUT_ITEMS, value_parser = parse_positive_usize)]
+        max_files: usize,
+        /// Maximum raw key bytes retained in rendered SSTable metadata.
+        #[arg(long, default_value_t = 1024 * 1024, value_parser = parse_positive_usize)]
+        max_bytes: usize,
     },
     /// Render checked SSTable metadata, blocks, key ranges, and bounded entries.
     DumpSstable {
@@ -58,11 +70,14 @@ enum Command {
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
         /// Maximum records rendered; every block and record is still checked.
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
         max_entries: usize,
         /// Maximum block locations rendered; every block is still checked.
-        #[arg(long, default_value_t = 100)]
+        #[arg(long, default_value_t = 100, value_parser = parse_positive_usize)]
         max_blocks: usize,
+        /// Maximum raw key bytes retained for rendered entry samples.
+        #[arg(long, default_value_t = 1024 * 1024, value_parser = parse_positive_usize)]
+        max_bytes: usize,
     },
     /// Run a reproducible workload benchmark against the database path.
     Bench {
@@ -81,6 +96,9 @@ enum Command {
         /// Output encoding.
         #[arg(long, value_enum, default_value_t)]
         format: OutputFormat,
+        /// Write durability used by the benchmark (default: sync).
+        #[arg(long, value_enum, default_value_t)]
+        durability: BenchDurability,
     },
 }
 
@@ -94,6 +112,29 @@ enum OutputFormat {
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Workload {
     InferenceCache,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+enum BenchDurability {
+    #[default]
+    Sync,
+    Buffered,
+}
+
+impl BenchDurability {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Sync => "sync",
+            Self::Buffered => "buffered",
+        }
+    }
+
+    fn engine(self) -> Durability {
+        match self {
+            Self::Sync => Durability::Sync,
+            Self::Buffered => Durability::Buffered,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -117,6 +158,9 @@ struct ManifestOutput<'a> {
     edits_total: usize,
     edits_truncated: bool,
     levels: &'a [Vec<meteordb::ManifestFileInspection>],
+    files_total: usize,
+    level_file_counts: &'a [usize],
+    files_truncated: bool,
     next_file_number: u64,
     last_sequence: u64,
     log_number: u64,
@@ -128,6 +172,7 @@ struct ManifestOutput<'a> {
 struct BenchOutput {
     format_version: u32,
     workload: &'static str,
+    durability: &'static str,
     seconds: u64,
     seed: u64,
     dataset_size: usize,
@@ -155,35 +200,83 @@ fn run(cli: Cli) -> Result<(), CliError> {
         Command::Check {
             format,
             max_batch_bytes,
-        } => check(&cli.path, max_batch_bytes, format),
-        Command::DumpManifest { format, max_edits } => dump_manifest(&cli.path, max_edits, format),
+            max_files,
+            max_bytes,
+        } => check(&cli.path, max_batch_bytes, max_files, max_bytes, format),
+        Command::DumpManifest {
+            format,
+            max_edits,
+            max_files,
+            max_bytes,
+        } => dump_manifest(&cli.path, max_edits, max_files, max_bytes, format),
         Command::DumpSstable {
             file,
             format,
             max_entries,
             max_blocks,
-        } => dump_sstable(&cli.path, &file, max_entries, max_blocks, format),
+            max_bytes,
+        } => dump_sstable(&cli.path, &file, max_entries, max_blocks, max_bytes, format),
         Command::Bench {
             seconds,
             seed,
             dataset_size,
             workload,
             format,
-        } => bench(&cli.path, seconds, seed, dataset_size, workload, format),
+            durability,
+        } => bench(
+            &cli.path,
+            seconds,
+            seed,
+            dataset_size,
+            workload,
+            durability,
+            format,
+        ),
     }
 }
 
-fn check(path: &Path, max_batch_bytes: usize, format: OutputFormat) -> Result<(), CliError> {
+fn check(
+    path: &Path,
+    max_batch_bytes: usize,
+    max_files: usize,
+    max_bytes: usize,
+    format: OutputFormat,
+) -> Result<(), CliError> {
     if max_batch_bytes == 0 {
         return Err(CliError::message(
             "max_batch_bytes must be greater than zero",
         ));
     }
-    let manifest = inspect_manifest(path)?;
+    let manifest = inspect_manifest_with_options(
+        path,
+        ManifestInspectionOptions {
+            max_edits: 1,
+            max_files,
+            max_bytes,
+        },
+    )?;
+    if manifest.files_truncated {
+        return Err(CliError::message(format!(
+            "live SSTable count {} exceeds max_files {max_files}",
+            manifest.files_total
+        )));
+    }
     let mut sstables = 0;
     for file in manifest.levels.iter().flatten() {
         let table_path = path.join(format!("{:06}.sst", file.number));
         let inspected = TableReader::open(&table_path)?.inspect(0, 0)?;
+        if inspected.file_bytes != file.file_size {
+            return Err(Error::Corruption {
+                context: "SSTable",
+                detail: format!(
+                    "{} has length {}, expected {}",
+                    table_path.display(),
+                    inspected.file_bytes,
+                    file.file_size
+                ),
+            }
+            .into());
+        }
         if inspected.file_number != file.number {
             return Err(Error::Corruption {
                 context: "SSTable properties",
@@ -198,7 +291,8 @@ fn check(path: &Path, max_batch_bytes: usize, format: OutputFormat) -> Result<()
         }
         sstables += 1;
     }
-    let wals = inspect_required_wals(path, &manifest, max_batch_bytes)?;
+    let remaining_files = max_files - manifest.files_total;
+    let wals = inspect_required_wals(path, &manifest, max_batch_bytes, remaining_files)?;
     let output = CheckOutput {
         format_version: 1,
         status: "ok",
@@ -228,6 +322,7 @@ fn inspect_required_wals(
     path: &Path,
     manifest: &ManifestInspection,
     max_batch_bytes: usize,
+    max_files: usize,
 ) -> Result<Vec<WalInspection>, CliError> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(path).map_err(|source| Error::Io {
@@ -241,6 +336,11 @@ fn inspect_required_wals(
             source,
         })?;
         if let Some(number) = parse_numbered_name(&entry.file_name(), ".wal") {
+            if paths.len() == max_files {
+                return Err(CliError::message(format!(
+                    "required WAL count exceeds remaining max_files {max_files}"
+                )));
+            }
             paths.push((number, entry.path()));
         }
     }
@@ -277,18 +377,28 @@ fn inspect_required_wals(
         .checked_add(1)
         .ok_or_else(|| CliError::message("sequence number space is exhausted"))?;
     for wal in &inspections {
-        for &sequence in wal.sequences() {
-            if legacy_wal_metadata && sequence <= manifest.last_sequence {
-                continue;
+        let Some(mut first) = wal.first_sequence else {
+            continue;
+        };
+        if legacy_wal_metadata
+            && wal
+                .last_sequence
+                .is_some_and(|last| last <= manifest.last_sequence)
+        {
+            continue;
+        }
+        if legacy_wal_metadata {
+            first = first.max(expected_sequence);
+        }
+        if first != expected_sequence {
+            return Err(Error::Corruption {
+                context: "WAL",
+                detail: format!("expected sequence {expected_sequence}, found {first}"),
             }
-            if sequence != expected_sequence {
-                return Err(Error::Corruption {
-                    context: "WAL",
-                    detail: format!("expected sequence {expected_sequence}, found {sequence}"),
-                }
-                .into());
-            }
-            last_sequence = sequence;
+            .into());
+        }
+        if let Some(last) = wal.last_sequence {
+            last_sequence = last;
             expected_sequence = last_sequence
                 .checked_add(1)
                 .ok_or_else(|| CliError::message("sequence number space is exhausted"))?;
@@ -307,26 +417,41 @@ fn inspect_required_wals(
     Ok(inspections)
 }
 
-fn dump_manifest(path: &Path, max_edits: usize, format: OutputFormat) -> Result<(), CliError> {
-    let manifest = inspect_manifest(path)?;
-    let shown = manifest.edits.len().min(max_edits);
+fn dump_manifest(
+    path: &Path,
+    max_edits: usize,
+    max_files: usize,
+    max_bytes: usize,
+    format: OutputFormat,
+) -> Result<(), CliError> {
+    let manifest = inspect_manifest_with_options(
+        path,
+        ManifestInspectionOptions {
+            max_edits,
+            max_files,
+            max_bytes,
+        },
+    )?;
+    let shown = manifest.edits.len();
     match format {
         OutputFormat::Human => {
             println!("manifest: {}", manifest.manifest);
             println!("file_bytes: {}", manifest.file_bytes);
-            println!("edits: {}", manifest.edits.len());
+            println!("edits: {}", manifest.edits_total);
             println!("shown_edits: {shown}");
-            println!("edits_truncated: {}", shown < manifest.edits.len());
-            for edit in &manifest.edits[..shown] {
+            println!("edits_truncated: {}", manifest.edits_truncated);
+            for edit in &manifest.edits {
                 println!(
                     "edit {}: added={} deleted={}",
-                    edit.index,
-                    edit.added_files.len(),
-                    edit.deleted_files.len()
+                    edit.index, edit.added_files_total, edit.deleted_files_total
                 );
             }
             for (level, files) in manifest.levels.iter().enumerate() {
-                println!("level {level}: {} file(s)", files.len());
+                println!(
+                    "level {level}: {} file(s), {} shown",
+                    manifest.level_file_counts[level],
+                    files.len()
+                );
                 for file in files {
                     println!(
                         "  {:06}.sst bytes={} smallest={} largest={}",
@@ -346,9 +471,12 @@ fn dump_manifest(path: &Path, max_edits: usize, format: OutputFormat) -> Result<
             manifest: &manifest.manifest,
             file_bytes: manifest.file_bytes,
             edits: &manifest.edits[..shown],
-            edits_total: manifest.edits.len(),
-            edits_truncated: shown < manifest.edits.len(),
+            edits_total: manifest.edits_total,
+            edits_truncated: manifest.edits_truncated,
             levels: &manifest.levels,
+            files_total: manifest.files_total,
+            level_file_counts: &manifest.level_file_counts,
+            files_truncated: manifest.files_truncated,
             next_file_number: manifest.next_file_number,
             last_sequence: manifest.last_sequence,
             log_number: manifest.log_number,
@@ -363,10 +491,15 @@ fn dump_sstable(
     file: &Path,
     max_entries: usize,
     max_blocks: usize,
+    max_bytes: usize,
     format: OutputFormat,
 ) -> Result<(), CliError> {
     validate_sstable_name(file)?;
-    let inspection = TableReader::open(database.join(file))?.inspect(max_entries, max_blocks)?;
+    let inspection = TableReader::open(database.join(file))?.inspect_with_limits(
+        max_entries,
+        max_blocks,
+        max_bytes,
+    )?;
     match format {
         OutputFormat::Human => write_sstable_human(&inspection),
         OutputFormat::Json => write_json(&inspection),
@@ -386,6 +519,8 @@ fn write_sstable_human(inspection: &SstableInspection) -> Result<(), CliError> {
     println!("shown_blocks: {}", inspection.blocks.len());
     println!("blocks_truncated: {}", inspection.blocks_truncated);
     println!("shown_entries: {}", inspection.shown.len());
+    println!("shown_bytes: {}", inspection.shown_bytes);
+    println!("bytes_truncated: {}", inspection.bytes_truncated);
     println!("truncated: {}", inspection.truncated);
     for block in &inspection.blocks {
         println!(
@@ -423,6 +558,7 @@ fn bench(
     seed: u64,
     dataset_size: usize,
     workload: Workload,
+    durability: BenchDurability,
     format: OutputFormat,
 ) -> Result<(), CliError> {
     if dataset_size == 0 {
@@ -430,7 +566,7 @@ fn bench(
     }
     match workload {
         Workload::InferenceCache => {
-            bench_inference_cache(path, seconds, seed, dataset_size, format)
+            bench_inference_cache(path, seconds, seed, dataset_size, durability, format)
         }
     }
 }
@@ -440,9 +576,12 @@ fn bench_inference_cache(
     seconds: u64,
     seed: u64,
     dataset_size: usize,
+    durability: BenchDurability,
     format: OutputFormat,
 ) -> Result<(), CliError> {
-    let engine = Engine::open(Options::new(path))?;
+    let mut options = Options::new(path);
+    options.durability = durability.engine();
+    let engine = Engine::open(options)?;
     let cache = InferenceCache::new(engine.clone(), b"bench")?;
     let keys = (0..dataset_size)
         .map(|index| InferenceKey::new(b"model", b"1", index.to_le_bytes()))
@@ -475,6 +614,7 @@ fn bench_inference_cache(
     let output = BenchOutput {
         format_version: 1,
         workload: "inference-cache",
+        durability: durability.name(),
         seconds,
         seed,
         dataset_size,
@@ -490,6 +630,7 @@ fn bench_inference_cache(
     match format {
         OutputFormat::Human => {
             println!("workload: {}", output.workload);
+            println!("durability: {}", output.durability);
             println!("seconds: {}", output.seconds);
             println!("seed: {}", output.seed);
             println!("dataset_size: {}", output.dataset_size);
@@ -517,6 +658,17 @@ fn parse_numbered_name(name: &OsStr, suffix: &str) -> Option<u64> {
     let digits = name.strip_suffix(suffix)?;
     let number = digits.parse::<u64>().ok()?;
     (number != 0 && digits == format!("{number:06}")).then_some(number)
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid positive integer: {error}"))
+        .and_then(|parsed| {
+            (parsed > 0)
+                .then_some(parsed)
+                .ok_or_else(|| "value must be greater than zero".to_owned())
+        })
 }
 
 fn write_json(value: &impl Serialize) -> Result<(), CliError> {
@@ -577,5 +729,17 @@ impl std::fmt::Display for CliError {
             Self::Engine(error) => error.fmt(formatter),
             Self::Message(message) => formatter.write_str(message),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BenchDurability;
+    use meteordb::Durability;
+
+    #[test]
+    fn benchmark_durability_maps_to_engine_options() {
+        assert_eq!(BenchDurability::Sync.engine(), Durability::Sync);
+        assert_eq!(BenchDurability::Buffered.engine(), Durability::Buffered);
     }
 }

@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meteordb::{
-    Durability, DurableFile, DurableFs, Error, OsDurableFs, WalWriter, WriteBatch, WriteOp,
-    inspect_wal, replay_wal,
+    Durability, DurableFile, DurableFs, DurableReadFile, Error, OsDurableFs, WalWriter, WriteBatch,
+    WriteOp, inspect_wal, inspect_wal_with_fs, replay_wal,
 };
 
 const BLOCK_BYTES: usize = 32 * 1024;
@@ -25,6 +25,58 @@ fn batch_with_put(key: &[u8], value: &[u8]) -> WriteBatch {
     let mut batch = WriteBatch::default();
     batch.put(key, value);
     batch
+}
+
+#[test]
+fn wal_inspection_reads_metadata_and_contents_from_one_injected_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000001.wal");
+    let mut writer = WalWriter::create(&path, 1024).unwrap();
+    writer
+        .append(1, &batch_with_put(b"k", b"v"), Durability::Sync)
+        .unwrap();
+    drop(writer);
+    let fs = Arc::new(SwapWalAfterOpenFs {
+        inner: OsDurableFs,
+        swapped: AtomicUsize::new(0),
+    });
+
+    let inspection = inspect_wal_with_fs(&path, 1024, fs.clone()).unwrap();
+
+    assert_eq!(inspection.batches, 1);
+    assert_eq!(fs.swapped.load(Ordering::SeqCst), 1);
+}
+
+struct SwapWalAfterOpenFs {
+    inner: OsDurableFs,
+    swapped: AtomicUsize,
+}
+
+impl DurableFs for SwapWalAfterOpenFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let file = self.inner.open_read(path)?;
+        if self.swapped.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::rename(path, path.with_extension("opened"))?;
+            std::fs::write(path, b"replacement")?;
+        }
+        Ok(file)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 fn truncate_tail(path: &Path, bytes: u64) {

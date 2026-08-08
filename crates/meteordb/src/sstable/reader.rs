@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,7 +10,8 @@ use crate::sstable::{
 };
 use crate::stats::ReadStats;
 use crate::{
-    BlockCache, BlockKind, BloomFilter, Compression, Error, InternalKey, Result, SequenceNumber,
+    BlockCache, BlockKind, BloomFilter, Compression, DurableFs, DurableReadFile, Error,
+    InternalKey, OsDurableFs, Result, SequenceNumber,
 };
 
 /// Conservative default ceiling for one uncompressed SSTable data block.
@@ -43,7 +43,7 @@ impl Default for TableReaderOptions {
 /// table data size and allowing a Bloom negative to avoid data I/O entirely.
 pub struct TableReader {
     path: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Box<dyn DurableReadFile>>,
     file_size: u64,
     data_end: u64,
     index: Vec<(Vec<u8>, BlockHandle)>,
@@ -111,6 +111,10 @@ pub struct SstableInspection {
     pub blocks_truncated: bool,
     /// First records, bounded by the caller.
     pub shown: Vec<SstableEntryInspection>,
+    /// Raw key bytes retained across shown records.
+    pub shown_bytes: usize,
+    /// Whether records were omitted because the retained-byte limit was reached.
+    pub bytes_truncated: bool,
     /// Whether additional records were checked but omitted.
     pub truncated: bool,
 }
@@ -140,7 +144,16 @@ impl TableReader {
     /// Returns [`Error::InvalidArgument`] for a zero limit and otherwise the
     /// same errors as [`TableReader::open`].
     pub fn open_with_options(path: impl AsRef<Path>, options: TableReaderOptions) -> Result<Self> {
-        Self::open_internal(path, options, None, None, None)
+        Self::open_with_fs(path, options, Arc::new(OsDurableFs))
+    }
+
+    /// Opens an SSTable through an injectable no-follow filesystem abstraction.
+    pub fn open_with_fs(
+        path: impl AsRef<Path>,
+        options: TableReaderOptions,
+        fs: Arc<dyn DurableFs>,
+    ) -> Result<Self> {
+        Self::open_internal(path, options, None, None, None, fs)
     }
 
     pub(crate) fn open_cached(
@@ -149,8 +162,16 @@ impl TableReader {
         cache: Arc<BlockCache>,
         stats: Arc<ReadStats>,
         options: TableReaderOptions,
+        fs: Arc<dyn DurableFs>,
     ) -> Result<Self> {
-        Self::open_internal(path, options, Some(file_number), Some(cache), Some(stats))
+        Self::open_internal(
+            path,
+            options,
+            Some(file_number),
+            Some(cache),
+            Some(stats),
+            fs,
+        )
     }
 
     fn open_internal(
@@ -159,6 +180,7 @@ impl TableReader {
         file_number: Option<u64>,
         cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<ReadStats>>,
+        fs: Arc<dyn DurableFs>,
     ) -> Result<Self> {
         if options.max_uncompressed_data_block_bytes == 0 {
             return Err(Error::InvalidArgument(
@@ -166,12 +188,12 @@ impl TableReader {
             ));
         }
         let path = path.as_ref().to_path_buf();
-        let mut file =
-            File::open(&path).map_err(|source| io_error("open SSTable", &path, source))?;
+        let mut file = fs
+            .open_read(&path)
+            .map_err(|source| io_error("open SSTable", &path, source))?;
         let file_size = file
-            .metadata()
-            .map_err(|source| io_error("stat SSTable", &path, source))?
-            .len();
+            .len()
+            .map_err(|source| io_error("stat SSTable", &path, source))?;
         let footer_size = u64::try_from(SSTABLE_FOOTER_BYTES).expect("footer size fits u64");
         let footer_start = file_size
             .checked_sub(footer_size)
@@ -202,7 +224,7 @@ impl TableReader {
         validate_metadata_handles(index_handle, filter_handle, properties_handle, footer_start)?;
 
         let (index_payload, index_miss) = read_cached_metadata(
-            &mut file,
+            file.as_mut(),
             &path,
             file_number,
             cache.as_deref(),
@@ -210,14 +232,14 @@ impl TableReader {
             BlockKind::Index,
         )?;
         let (filter_payload, filter_miss) = read_cached_metadata(
-            &mut file,
+            file.as_mut(),
             &path,
             file_number,
             cache.as_deref(),
             filter_handle,
             BlockKind::Filter,
         )?;
-        let properties_payload = read_metadata_block(&mut file, &path, properties_handle)?;
+        let properties_payload = read_metadata_block(file.as_mut(), &path, properties_handle)?;
         let index_block = Block::decode(index_payload.as_ref())?;
         let mut index = Vec::with_capacity(index_block.len());
         let mut previous_end = 0_u64;
@@ -322,23 +344,58 @@ impl TableReader {
 
     /// Checks every data block and returns bounded, stable inspection metadata.
     pub fn inspect(&self, max_entries: usize, max_blocks: usize) -> Result<SstableInspection> {
+        self.inspect_internal(max_entries, max_blocks, usize::MAX)
+    }
+
+    /// Checks every data block while bounding retained records, blocks, and key bytes.
+    pub fn inspect_with_limits(
+        &self,
+        max_entries: usize,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<SstableInspection> {
+        if max_entries == 0 || max_blocks == 0 || max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "SSTable inspection limits must be greater than zero".to_owned(),
+            ));
+        }
+        self.inspect_internal(max_entries, max_blocks, max_bytes)
+    }
+
+    fn inspect_internal(
+        &self,
+        max_entries: usize,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<SstableInspection> {
         let mut shown = Vec::with_capacity(max_entries.min(self.index.len()));
+        let mut shown_bytes = 0_usize;
+        let mut bytes_truncated = false;
         let mut checked_entries = 0_u64;
         for entry in self.iter() {
             let (key, value) = entry?;
             checked_entries = checked_entries.saturating_add(1);
             if shown.len() < max_entries {
-                shown.push(SstableEntryInspection {
-                    key_hex: encode_hex(key.as_bytes()),
-                    user_key_hex: encode_hex(key.user_key()),
-                    sequence: key.sequence(),
-                    kind: match key.kind() {
-                        crate::ValueKind::Value => "value",
-                        crate::ValueKind::Deletion => "deletion",
-                    }
-                    .to_owned(),
-                    value_bytes: value.len(),
-                });
+                let retained = key.as_bytes().len().saturating_add(key.user_key().len());
+                if shown_bytes
+                    .checked_add(retained)
+                    .is_some_and(|total| total <= max_bytes)
+                {
+                    shown_bytes += retained;
+                    shown.push(SstableEntryInspection {
+                        key_hex: encode_hex(key.as_bytes()),
+                        user_key_hex: encode_hex(key.user_key()),
+                        sequence: key.sequence(),
+                        kind: match key.kind() {
+                            crate::ValueKind::Value => "value",
+                            crate::ValueKind::Deletion => "deletion",
+                        }
+                        .to_owned(),
+                        value_bytes: value.len(),
+                    });
+                } else {
+                    bytes_truncated = true;
+                }
             }
         }
         if checked_entries != self.properties.entries {
@@ -374,6 +431,8 @@ impl TableReader {
                 })
                 .collect(),
             blocks_truncated: self.index.len() > max_blocks,
+            shown_bytes,
+            bytes_truncated,
             truncated: checked_entries > shown.len() as u64,
             shown,
         })
@@ -496,7 +555,7 @@ impl TableReader {
             .file
             .lock()
             .map_err(|_| Error::Background("SSTable file lock was poisoned".to_owned()))?;
-        let encoded = read_exact_range(&mut file, &self.path, handle, "data block")?;
+        let encoded = read_exact_range(file.as_mut(), &self.path, handle, "data block")?;
         let (payload, marker) = decode_stored_block(&encoded)?;
         let expected_marker = match self.properties.compression {
             Compression::None => NO_COMPRESSION,
@@ -719,7 +778,11 @@ fn validate_handle(handle: BlockHandle, limit: u64, kind: &'static str) -> Resul
     Ok(())
 }
 
-fn read_metadata_block(file: &mut File, path: &Path, handle: BlockHandle) -> Result<Vec<u8>> {
+fn read_metadata_block(
+    file: &mut dyn DurableReadFile,
+    path: &Path,
+    handle: BlockHandle,
+) -> Result<Vec<u8>> {
     let encoded = read_exact_range(file, path, handle, "metadata block")?;
     let (payload, marker) = decode_stored_block(&encoded)?;
     if marker != NO_COMPRESSION {
@@ -730,7 +793,7 @@ fn read_metadata_block(file: &mut File, path: &Path, handle: BlockHandle) -> Res
 }
 
 fn read_cached_metadata(
-    file: &mut File,
+    file: &mut dyn DurableReadFile,
     path: &Path,
     file_number: Option<u64>,
     cache: Option<&BlockCache>,
@@ -746,7 +809,7 @@ fn read_cached_metadata(
 }
 
 fn read_exact_range(
-    file: &mut File,
+    file: &mut dyn DurableReadFile,
     path: &Path,
     handle: BlockHandle,
     kind: &'static str,

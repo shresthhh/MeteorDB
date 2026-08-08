@@ -1,10 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meteordb::{
-    DurableFile, DurableFs, Error, FileMeta, InternalKey, OsDurableFs, VersionEdit, VersionSet,
+    DurableFile, DurableFs, DurableReadFile, Error, FileMeta, InternalKey,
+    ManifestInspectionOptions, OsDurableFs, VersionEdit, VersionSet, inspect_manifest_with_fs,
 };
 
 fn meta(number: u64, smallest: &[u8], largest: &[u8]) -> FileMeta {
@@ -15,6 +17,67 @@ fn meta(number: u64, smallest: &[u8], largest: &[u8]) -> FileMeta {
         InternalKey::value(largest, 1),
     )
     .unwrap()
+}
+
+#[test]
+fn manifest_inspection_reads_metadata_and_bytes_from_one_injected_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(dir.path()).unwrap());
+    let fs = Arc::new(SwapManifestAfterOpenFs {
+        inner: OsDurableFs,
+        swapped: AtomicBool::new(false),
+    });
+
+    let inspection = inspect_manifest_with_fs(
+        dir.path(),
+        ManifestInspectionOptions {
+            max_edits: 1,
+            max_files: 1,
+            max_bytes: 1024,
+        },
+        fs.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(inspection.edits_total, 1);
+    assert!(fs.swapped.load(Ordering::SeqCst));
+}
+
+struct SwapManifestAfterOpenFs {
+    inner: OsDurableFs,
+    swapped: AtomicBool,
+}
+
+impl DurableFs for SwapManifestAfterOpenFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let file = self.inner.open_read(path)?;
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("MANIFEST-"))
+            && !self.swapped.swap(true, Ordering::SeqCst)
+        {
+            let original = path.with_extension("opened");
+            std::fs::rename(path, original)?;
+            std::fs::write(path, b"replacement")?;
+        }
+        Ok(file)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 fn create_sstable(dir: &Path, number: u64) {

@@ -1,4 +1,4 @@
-use std::io::{BufReader, Cursor, Read};
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -44,50 +44,54 @@ pub struct WalInspection {
     pub first_sequence: Option<SequenceNumber>,
     /// Last recovered sequence, when any batch exists.
     pub last_sequence: Option<SequenceNumber>,
-    #[serde(skip)]
-    sequences: Vec<SequenceNumber>,
-}
-
-impl WalInspection {
-    /// Borrows recovered batch sequences for cross-segment continuity checks.
-    pub fn sequences(&self) -> &[SequenceNumber] {
-        &self.sequences
-    }
 }
 
 /// Checks a WAL segment without opening it for append or modifying a torn tail.
 pub fn inspect_wal(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<WalInspection> {
+    inspect_wal_with_fs(path, max_batch_bytes, Arc::new(OsDurableFs))
+}
+
+/// Checks a WAL through an injectable no-follow filesystem abstraction.
+pub fn inspect_wal_with_fs(
+    path: impl AsRef<Path>,
+    max_batch_bytes: usize,
+    fs: Arc<dyn DurableFs>,
+) -> Result<WalInspection> {
     let path = path.as_ref();
-    let file_bytes = std::fs::metadata(path)
-        .map_err(|source| io_error("stat WAL", path, source))?
-        .len();
-    let recovered = replay_wal(path, max_batch_bytes)?;
-    for records in recovered.windows(2) {
-        let expected = records[0]
-            .sequence
-            .checked_add(1)
-            .ok_or_else(|| wal_corruption("sequence number space is exhausted"))?;
-        if records[1].sequence != expected {
-            return Err(wal_corruption(format!(
-                "expected sequence {expected}, found {} in {}",
-                records[1].sequence,
-                path.display()
-            )));
+    let mut batches = 0_usize;
+    let mut operations = 0_usize;
+    let mut first_sequence: Option<SequenceNumber> = None;
+    let mut last_sequence: Option<SequenceNumber> = None;
+    let file_bytes = replay_wal_stream(path, max_batch_bytes, fs.as_ref(), |record| {
+        if let Some(previous) = last_sequence {
+            let expected = previous
+                .checked_add(1)
+                .ok_or_else(|| wal_corruption("sequence number space is exhausted"))?;
+            if record.sequence != expected {
+                return Err(wal_corruption(format!(
+                    "expected sequence {expected}, found {} in {}",
+                    record.sequence,
+                    path.display()
+                )));
+            }
         }
-    }
-    let operations = recovered.iter().try_fold(0_usize, |total, record| {
-        total
+        first_sequence.get_or_insert(record.sequence);
+        last_sequence = Some(record.sequence);
+        batches = batches
+            .checked_add(1)
+            .ok_or_else(|| wal_corruption("WAL batch count exceeds usize"))?;
+        operations = operations
             .checked_add(record.batch.len())
-            .ok_or_else(|| wal_corruption("WAL operation count exceeds usize"))
+            .ok_or_else(|| wal_corruption("WAL operation count exceeds usize"))?;
+        Ok(())
     })?;
     Ok(WalInspection {
         format_version: 1,
         file_bytes,
-        batches: recovered.len(),
+        batches,
         operations,
-        first_sequence: recovered.first().map(|record| record.sequence),
-        last_sequence: recovered.last().map(|record| record.sequence),
-        sequences: recovered.iter().map(|record| record.sequence).collect(),
+        first_sequence,
+        last_sequence,
     })
 }
 
@@ -296,19 +300,32 @@ pub fn replay_wal_with_fs(
     max_batch_bytes: usize,
     fs: Arc<dyn DurableFs>,
 ) -> Result<Vec<RecoveredBatch>> {
+    let mut recovered = Vec::new();
+    replay_wal_stream(path.as_ref(), max_batch_bytes, fs.as_ref(), |record| {
+        recovered.push(record);
+        Ok(())
+    })?;
+    Ok(recovered)
+}
+
+fn replay_wal_stream(
+    path: &Path,
+    max_batch_bytes: usize,
+    fs: &dyn DurableFs,
+    mut on_record: impl FnMut(RecoveredBatch) -> Result<()>,
+) -> Result<u64> {
     let max_logical_record_bytes = encoded_record_limit(max_batch_bytes)?;
-    let path = path.as_ref();
-    let contents = fs
-        .read_file(path)
+    let file = fs
+        .open_read(path)
         .map_err(|source| io_error("read WAL", path, source))?;
-    let file_length =
-        u64::try_from(contents.len()).map_err(|_| wal_corruption("WAL length exceeds u64"))?;
-    let mut reader = BufReader::new(Cursor::new(contents));
+    let file_length = file
+        .len()
+        .map_err(|source| io_error("stat WAL", path, source))?;
+    let mut reader = BufReader::new(file.take(file_length));
     let mut block = [0_u8; BLOCK_BYTES];
     let mut block_start = 0_u64;
     let mut logical = Vec::new();
     let mut assembling = false;
-    let mut recovered = Vec::new();
 
     loop {
         let block_length = read_block(&mut reader, &mut block)
@@ -323,7 +340,7 @@ pub fn replay_wal_with_fs(
             let remaining = block_length - offset;
             if remaining < HEADER_BYTES {
                 if final_block {
-                    return Ok(recovered);
+                    return Ok(file_length);
                 }
                 if block[offset..block_length].iter().any(|byte| *byte != 0) {
                     return Err(wal_corruption("nonzero bytes in physical block trailer"));
@@ -343,7 +360,7 @@ pub fn replay_wal_with_fs(
                 .ok_or_else(|| wal_corruption("physical fragment length overflow"))?;
             if fragment_end > block_length {
                 if final_block {
-                    return Ok(recovered);
+                    return Ok(file_length);
                 }
                 return Err(wal_corruption(format!(
                     "physical fragment length {fragment_length} crosses a block boundary"
@@ -357,9 +374,9 @@ pub fn replay_wal_with_fs(
             match fragment_type {
                 FULL if !assembling => decode_record(
                     fragment,
-                    &mut recovered,
                     max_batch_bytes,
                     max_logical_record_bytes,
+                    &mut on_record,
                 )?,
                 FIRST if !assembling => {
                     logical.clear();
@@ -373,9 +390,9 @@ pub fn replay_wal_with_fs(
                     append_fragment(&mut logical, fragment, max_logical_record_bytes)?;
                     decode_record(
                         &logical,
-                        &mut recovered,
                         max_batch_bytes,
                         max_logical_record_bytes,
+                        &mut on_record,
                     )?;
                     logical.clear();
                     assembling = false;
@@ -408,7 +425,7 @@ pub fn replay_wal_with_fs(
             break;
         }
     }
-    Ok(recovered)
+    Ok(file_length)
 }
 
 fn read_block<R: Read>(
@@ -448,9 +465,9 @@ fn append_fragment(
 
 fn decode_record(
     encoded: &[u8],
-    recovered: &mut Vec<RecoveredBatch>,
     max_batch_bytes: usize,
     max_logical_record_bytes: usize,
+    on_record: &mut impl FnMut(RecoveredBatch) -> Result<()>,
 ) -> Result<()> {
     if encoded.len() > max_logical_record_bytes {
         return Err(wal_corruption(format!(
@@ -465,8 +482,7 @@ fn decode_record(
             batch.approximate_bytes()
         )));
     }
-    recovered.push(RecoveredBatch { sequence, batch });
-    Ok(())
+    on_record(RecoveredBatch { sequence, batch })
 }
 
 fn encoded_record_limit(max_batch_bytes: usize) -> Result<usize> {

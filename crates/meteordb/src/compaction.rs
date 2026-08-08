@@ -224,7 +224,19 @@ pub(crate) fn run(
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(context.options),
             },
+            context.fs.clone(),
         )?;
+        if reader.file_size() != file.file_size() {
+            return Err(Error::Corruption {
+                context: "SSTable",
+                detail: format!(
+                    "{:06}.sst has length {}, expected {}",
+                    file.number(),
+                    reader.file_size(),
+                    file.file_size()
+                ),
+            });
+        }
         let engine_encoded = reader.properties().engine_value_encoding;
         children.push(Box::new(reader.into_iter().map(move |entry| {
             entry.and_then(|(key, value)| disk_entry(key, value, engine_encoded))

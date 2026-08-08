@@ -36,12 +36,12 @@ pub use compaction::{
 };
 pub use engine::{Engine, Snapshot};
 pub use error::{Error, Result};
-pub use fs::{DurableFile, DurableFs, OsDurableFs};
+pub use fs::{DurableFile, DurableFs, DurableReadFile, OsDurableFs};
 pub use internal_key::{InternalKey, SequenceNumber, ValueKind};
 pub use iter::{KvIterator, ScanBounds};
 pub use manifest::{
-    ManifestEditInspection, ManifestFileInspection, ManifestInspection, VersionSet,
-    inspect_manifest,
+    ManifestEditInspection, ManifestFileInspection, ManifestInspection, ManifestInspectionOptions,
+    VersionSet, inspect_manifest, inspect_manifest_with_fs, inspect_manifest_with_options,
 };
 pub use memtable::{MemTable, ValueRecord};
 pub use options::{Compression, Durability, Options};
@@ -56,7 +56,8 @@ pub use sstable::{
 pub use stats::StatsSnapshot;
 pub use version::{FileMeta, NUM_LEVELS, Version, VersionEdit};
 pub use wal::{
-    RecoveredBatch, WalInspection, WalWriter, inspect_wal, replay_wal, replay_wal_with_fs,
+    RecoveredBatch, WalInspection, WalWriter, inspect_wal, inspect_wal_with_fs, replay_wal,
+    replay_wal_with_fs,
 };
 pub use workloads::{
     CacheLookup, Embedding, EmbeddingKey, EmbeddingStore, FeatureKey, FeatureRecord, FeatureStore,

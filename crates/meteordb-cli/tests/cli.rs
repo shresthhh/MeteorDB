@@ -155,6 +155,66 @@ fn dump_manifest_has_stable_human_and_json_output() {
 }
 
 #[test]
+fn dump_manifest_rejects_zero_limits_and_bounds_live_files() {
+    let dir = tempfile::tempdir().unwrap();
+    create_database(dir.path());
+
+    command(dir.path())
+        .args(["dump-manifest", "--max-edits", "0"])
+        .assert()
+        .code(2);
+    command(dir.path())
+        .args(["dump-manifest", "--max-files", "0"])
+        .assert()
+        .code(2);
+    command(dir.path())
+        .args(["dump-manifest", "--max-bytes", "0"])
+        .assert()
+        .code(2);
+
+    let output = command(dir.path())
+        .args([
+            "dump-manifest",
+            "--format",
+            "json",
+            "--max-edits",
+            "1",
+            "--max-files",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["edits"].as_array().unwrap().len(), 1);
+    assert!(
+        document["levels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|level| level.as_array().unwrap().len())
+            .sum::<usize>()
+            <= 1
+    );
+    assert_eq!(document["files_total"], 1);
+}
+
+#[test]
+fn manifest_corruption_after_the_edit_sample_cap_is_still_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    create_database(dir.path());
+    let manifest = find_file(dir.path(), "MANIFEST-000001");
+    let length = fs::metadata(&manifest).unwrap().len();
+    corrupt_byte(&manifest, length - 1);
+
+    command(dir.path())
+        .args(["dump-manifest", "--max-edits", "1"])
+        .assert()
+        .code(3)
+        .stderr(predicate::str::contains("corruption"));
+}
+
+#[test]
 fn dump_sstable_reports_checked_metadata_and_bounds_entries() {
     let dir = tempfile::tempdir().unwrap();
     let sstable = create_database(dir.path());
@@ -164,16 +224,36 @@ fn dump_sstable_reports_checked_metadata_and_bounds_entries() {
         .arg("dump-sstable")
         .arg("--file")
         .arg(name)
-        .args(["--max-entries", "2", "--max-blocks", "0"])
+        .args(["--max-entries", "2", "--max-blocks", "1"])
         .assert()
         .success()
         .stdout(predicate::str::contains("file_number:"))
         .stdout(predicate::str::contains("data_blocks:"))
         .stdout(predicate::str::contains("checksums: ok"))
-        .stdout(predicate::str::contains("shown_blocks: 0"))
-        .stdout(predicate::str::contains("blocks_truncated: true"))
+        .stdout(predicate::str::contains("shown_blocks: 1"))
         .stdout(predicate::str::contains("shown_entries: 2"))
         .stdout(predicate::str::contains("truncated: true"));
+}
+
+#[test]
+fn dump_sstable_rejects_zero_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let sstable = create_database(dir.path());
+    let name = sstable.file_name().unwrap();
+
+    for (flag, value) in [
+        ("--max-entries", "0"),
+        ("--max-blocks", "0"),
+        ("--max-bytes", "0"),
+    ] {
+        command(dir.path())
+            .arg("dump-sstable")
+            .arg("--file")
+            .arg(name)
+            .args([flag, value])
+            .assert()
+            .code(2);
+    }
 }
 
 #[test]
@@ -195,12 +275,65 @@ fn bench_reports_seeded_configuration_throughput_and_percentiles() {
         .assert()
         .success()
         .stdout(predicate::str::contains("workload: inference-cache"))
+        .stdout(predicate::str::contains("durability: sync"))
         .stdout(predicate::str::contains("seed: 7"))
         .stdout(predicate::str::contains("operations:"))
         .stdout(predicate::str::contains("throughput_ops_per_second:"))
         .stdout(predicate::str::contains("p50_us:"))
         .stdout(predicate::str::contains("p95_us:"))
         .stdout(predicate::str::contains("p99_us:"));
+}
+
+#[test]
+fn bench_maps_and_reports_both_durability_modes_in_json() {
+    for mode in ["sync", "buffered"] {
+        let dir = tempfile::tempdir().unwrap();
+        let output = command(dir.path())
+            .args([
+                "bench",
+                "--seconds",
+                "1",
+                "--workload",
+                "inference-cache",
+                "--dataset-size",
+                "1",
+                "--durability",
+                mode,
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(document["durability"], mode);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_rejects_manifest_and_sstable_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sstable = create_database(dir.path());
+    let manifest = find_file(dir.path(), "MANIFEST-000001");
+
+    let manifest_target = dir.path().join("manifest-target");
+    fs::rename(&manifest, &manifest_target).unwrap();
+    symlink(&manifest_target, &manifest).unwrap();
+    command(dir.path()).arg("check").assert().failure();
+
+    fs::remove_file(&manifest).unwrap();
+    fs::rename(&manifest_target, &manifest).unwrap();
+    let table_target = dir.path().join("table-target");
+    fs::rename(&sstable, &table_target).unwrap();
+    symlink(&table_target, &sstable).unwrap();
+    command(dir.path())
+        .arg("check")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("SSTable"));
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,8 +29,16 @@ pub struct ManifestEditInspection {
     pub index: usize,
     /// SSTables added by this edit.
     pub added_files: Vec<ManifestFileInspection>,
+    /// Total SSTables added by this edit.
+    pub added_files_total: usize,
+    /// Whether added SSTables were omitted from this rendered edit.
+    pub added_files_truncated: bool,
     /// `(level, file number)` pairs removed by this edit.
     pub deleted_files: Vec<(usize, u64)>,
+    /// Total SSTables deleted by this edit.
+    pub deleted_files_total: usize,
+    /// Whether deleted SSTables were omitted from this rendered edit.
+    pub deleted_files_truncated: bool,
     /// Next unallocated persistent file number, when changed by this edit.
     pub next_file_number: Option<u64>,
     /// Greatest sequence durable below the WAL, when changed by this edit.
@@ -68,8 +77,18 @@ pub struct ManifestInspection {
     pub file_bytes: u64,
     /// Every validated edit in append order.
     pub edits: Vec<ManifestEditInspection>,
+    /// Total number of validated edits.
+    pub edits_total: usize,
+    /// Whether validated edits were omitted from `edits`.
+    pub edits_truncated: bool,
     /// Resulting live SSTables, grouped into exactly [`NUM_LEVELS`] levels.
     pub levels: Vec<Vec<ManifestFileInspection>>,
+    /// Total live SSTables across all levels.
+    pub files_total: usize,
+    /// Total live SSTables in each level.
+    pub level_file_counts: Vec<usize>,
+    /// Whether live SSTables were omitted from `levels`.
+    pub files_truncated: bool,
     /// Next unallocated persistent file number.
     pub next_file_number: u64,
     /// Greatest durable sequence below the WAL.
@@ -82,13 +101,65 @@ pub struct ManifestInspection {
     pub wal_sequence: SequenceNumber,
 }
 
+/// Caller-trusted limits for retained manifest inspection output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ManifestInspectionOptions {
+    /// Maximum validated edits retained for rendering.
+    pub max_edits: usize,
+    /// Maximum SSTable references retained across edits and live levels.
+    pub max_files: usize,
+    /// Maximum raw internal-key bytes retained across rendered file metadata.
+    pub max_bytes: usize,
+}
+
+impl Default for ManifestInspectionOptions {
+    fn default() -> Self {
+        Self {
+            max_edits: usize::MAX,
+            max_files: usize::MAX,
+            max_bytes: usize::MAX,
+        }
+    }
+}
+
 /// Replays and validates a database manifest without locking or modifying any file.
 ///
 /// Unlike writer recovery, inspection rejects a torn tail instead of truncating
 /// it. Referenced SSTables must exist and match their manifest-recorded lengths.
 pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspection> {
+    inspect_manifest_with_options(directory, ManifestInspectionOptions::default())
+}
+
+/// Replays a manifest while retaining only caller-bounded output samples.
+pub fn inspect_manifest_with_options(
+    directory: impl AsRef<Path>,
+    options: ManifestInspectionOptions,
+) -> Result<ManifestInspection> {
+    inspect_manifest_with_fs(directory, options, Arc::new(OsDurableFs))
+}
+
+/// Replays a manifest through an injectable no-follow filesystem abstraction.
+pub fn inspect_manifest_with_fs(
+    directory: impl AsRef<Path>,
+    options: ManifestInspectionOptions,
+    fs: Arc<dyn DurableFs>,
+) -> Result<ManifestInspection> {
+    if options.max_edits == 0 {
+        return Err(Error::InvalidArgument(
+            "max_edits must be greater than zero".to_owned(),
+        ));
+    }
+    if options.max_files == 0 {
+        return Err(Error::InvalidArgument(
+            "max_files must be greater than zero".to_owned(),
+        ));
+    }
+    if options.max_bytes == 0 {
+        return Err(Error::InvalidArgument(
+            "max_bytes must be greater than zero".to_owned(),
+        ));
+    }
     let directory = directory.as_ref();
-    let fs = OsDurableFs;
     let current_path = directory.join("CURRENT");
     let current = fs
         .read_file(&current_path)
@@ -96,18 +167,6 @@ pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspectio
     let manifest_name = parse_current(&current)?;
     let manifest_number = parse_manifest_number(&manifest_name)?;
     let manifest_path = directory.join(&manifest_name);
-    let replay = replay_manifest(&manifest_path, &fs)?;
-    if replay.valid_bytes != replay.file_length {
-        return Err(manifest_corruption(format!(
-            "manifest has a torn tail at byte {} of {}",
-            replay.valid_bytes, replay.file_length
-        )));
-    }
-    if replay.edits.is_empty() {
-        return Err(manifest_corruption(
-            "manifest contains no complete initial edit",
-        ));
-    }
 
     let mut version = Version::empty();
     let mut next_file_number = 0;
@@ -116,10 +175,14 @@ pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspectio
     let mut active_log_number = 0;
     let mut wal_sequence = 0;
     let mut used_file_numbers = HashSet::from([manifest_number]);
-    let mut edits = Vec::with_capacity(replay.edits.len());
-    for (index, edit) in replay.edits.into_iter().enumerate() {
+    let mut edits = Vec::new();
+    let mut retained_files = 0_usize;
+    let mut retained_bytes = 0_usize;
+    let mut edits_total = 0_usize;
+    let replay = replay_manifest_stream(&manifest_path, fs.as_ref(), |edit| {
+        let index = edits_total;
         update_counters(
-            &edit,
+            edit,
             &mut next_file_number,
             &mut last_sequence,
             &mut log_number,
@@ -127,26 +190,58 @@ pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspectio
             &mut wal_sequence,
             true,
         )?;
-        validate_file_numbers(&edit, next_file_number, &used_file_numbers, true)?;
-        version = version.apply(&edit).map_err(recovery_edit_error)?;
+        validate_file_numbers(edit, next_file_number, &used_file_numbers, true)?;
+        version = version.apply(edit).map_err(recovery_edit_error)?;
+        validate_inspection_state_limits(&version, options)?;
         used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
-        edits.push(inspect_edit(index, &edit));
+        if edits.len() < options.max_edits {
+            edits.push(inspect_edit(
+                index,
+                edit,
+                options.max_files - retained_files,
+                &mut retained_files,
+                options.max_bytes,
+                &mut retained_bytes,
+            ));
+        }
+        edits_total = edits_total
+            .checked_add(1)
+            .ok_or_else(|| manifest_corruption("manifest edit count exceeds usize"))?;
+        Ok(())
+    })?;
+    if replay.valid_bytes != replay.file_length {
+        return Err(manifest_corruption(format!(
+            "manifest has a torn tail at byte {} of {}",
+            replay.valid_bytes, replay.file_length
+        )));
+    }
+    if edits_total == 0 {
+        return Err(manifest_corruption(
+            "manifest contains no complete initial edit",
+        ));
     }
     if next_file_number == 0 {
         return Err(manifest_corruption(
             "manifest never records the next file number",
         ));
     }
-    validate_referenced_files(directory, &version, &fs)?;
-
     let mut levels = Vec::with_capacity(NUM_LEVELS);
+    let mut level_file_counts = Vec::with_capacity(NUM_LEVELS);
+    let mut files_total = 0_usize;
     for level in 0..NUM_LEVELS {
-        let mut files = Vec::with_capacity(version.files(level).len());
+        let level_count = version.files(level).len();
+        level_file_counts.push(level_count);
+        files_total = files_total
+            .checked_add(level_count)
+            .ok_or_else(|| manifest_corruption("live SSTable count exceeds usize"))?;
+        let mut files = Vec::with_capacity(level_count.min(options.max_files - retained_files));
         for file in version.files(level) {
             let path = directory.join(sstable_name(file.number()));
-            let actual = std::fs::metadata(&path)
+            let actual = fs
+                .open_read(&path)
                 .map_err(|source| io_error("stat referenced SSTable", &path, source))?
-                .len();
+                .len()
+                .map_err(|source| io_error("stat referenced SSTable", &path, source))?;
             if actual != file.file_size() {
                 return Err(manifest_corruption(format!(
                     "referenced SSTable {} has length {actual}, expected {}",
@@ -154,17 +249,33 @@ pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspectio
                     file.file_size()
                 )));
             }
-            files.push(inspect_file(level, file));
+            if retained_files < options.max_files {
+                let key_bytes = manifest_file_key_bytes(file);
+                if retained_bytes
+                    .checked_add(key_bytes)
+                    .is_some_and(|total| total <= options.max_bytes)
+                {
+                    files.push(inspect_file(level, file));
+                    retained_files += 1;
+                    retained_bytes += key_bytes;
+                }
+            }
         }
         levels.push(files);
     }
 
+    let retained_live_files = levels.iter().map(Vec::len).sum::<usize>();
     Ok(ManifestInspection {
         format_version: 1,
         manifest: manifest_name,
         file_bytes: replay.file_length,
         edits,
+        edits_total,
+        edits_truncated: edits_total > options.max_edits,
         levels,
+        files_total,
+        level_file_counts,
+        files_truncated: retained_live_files < files_total,
         next_file_number,
         last_sequence,
         log_number,
@@ -173,21 +284,89 @@ pub fn inspect_manifest(directory: impl AsRef<Path>) -> Result<ManifestInspectio
     })
 }
 
-fn inspect_edit(index: usize, edit: &VersionEdit) -> ManifestEditInspection {
+fn validate_inspection_state_limits(
+    version: &Version,
+    options: ManifestInspectionOptions,
+) -> Result<()> {
+    let mut files = 0_usize;
+    let mut key_bytes = 0_usize;
+    for level in 0..NUM_LEVELS {
+        for file in version.files(level) {
+            files = files.checked_add(1).ok_or_else(|| {
+                Error::InvalidArgument("live SSTable count exceeds usize".to_owned())
+            })?;
+            if files > options.max_files {
+                return Err(Error::InvalidArgument(format!(
+                    "live SSTable count exceeds max_files {}",
+                    options.max_files
+                )));
+            }
+            key_bytes = key_bytes
+                .checked_add(manifest_file_key_bytes(file))
+                .ok_or_else(|| {
+                    Error::InvalidArgument("live SSTable key bytes exceed usize".to_owned())
+                })?;
+            if key_bytes > options.max_bytes {
+                return Err(Error::InvalidArgument(format!(
+                    "live SSTable key bytes exceed max_bytes {}",
+                    options.max_bytes
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_edit(
+    index: usize,
+    edit: &VersionEdit,
+    available_files: usize,
+    retained_files: &mut usize,
+    max_bytes: usize,
+    retained_bytes: &mut usize,
+) -> ManifestEditInspection {
+    let mut added_files = Vec::new();
+    for (level, file) in edit.added_files.iter().take(available_files) {
+        let key_bytes = manifest_file_key_bytes(file);
+        if retained_bytes
+            .checked_add(key_bytes)
+            .is_none_or(|total| total > max_bytes)
+        {
+            break;
+        }
+        added_files.push(inspect_file(*level, file));
+        *retained_bytes += key_bytes;
+    }
+    let retained_added = added_files.len();
+    let remaining = available_files - retained_added;
+    let retained_deleted = edit.deleted_files.len().min(remaining);
+    *retained_files += retained_added + retained_deleted;
     ManifestEditInspection {
         index,
-        added_files: edit
-            .added_files
+        added_files,
+        added_files_total: edit.added_files.len(),
+        added_files_truncated: retained_added < edit.added_files.len(),
+        deleted_files: edit
+            .deleted_files
             .iter()
-            .map(|(level, file)| inspect_file(*level, file))
+            .take(retained_deleted)
+            .copied()
             .collect(),
-        deleted_files: edit.deleted_files.clone(),
+        deleted_files_total: edit.deleted_files.len(),
+        deleted_files_truncated: retained_deleted < edit.deleted_files.len(),
         next_file_number: edit.next_file_number,
         last_sequence: edit.last_sequence,
         log_number: edit.log_number,
         active_log_number: edit.active_log_number,
         wal_sequence: edit.wal_sequence,
     }
+}
+
+fn manifest_file_key_bytes(file: &FileMeta) -> usize {
+    file.smallest()
+        .as_bytes()
+        .len()
+        .saturating_add(file.largest().as_bytes().len())
 }
 
 fn inspect_file(level: usize, file: &FileMeta) -> ManifestFileInspection {
@@ -809,23 +988,47 @@ struct ManifestReplay {
 }
 
 fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
-    let contents = fs
-        .read_file(path)
+    let mut edits = Vec::new();
+    let summary = replay_manifest_stream(path, fs, |edit| {
+        edits.push(edit.clone());
+        Ok(())
+    })?;
+    Ok(ManifestReplay {
+        edits,
+        valid_bytes: summary.valid_bytes,
+        file_length: summary.file_length,
+    })
+}
+
+struct ManifestReplaySummary {
+    valid_bytes: u64,
+    file_length: u64,
+}
+
+fn replay_manifest_stream(
+    path: &Path,
+    fs: &dyn DurableFs,
+    mut on_edit: impl FnMut(&VersionEdit) -> Result<()>,
+) -> Result<ManifestReplaySummary> {
+    let file = fs
+        .open_read(path)
         .map_err(|source| io_error("open manifest", path, source))?;
-    let file_length = contents.len() as u64;
+    let file_length = file
+        .len()
+        .map_err(|source| io_error("stat manifest", path, source))?;
+    let mut reader = BufReader::new(file.take(file_length));
+    let mut block = [0_u8; BLOCK_BYTES];
     let mut block_start = 0_u64;
     let mut logical = Vec::new();
     let mut assembling = false;
     let mut record_start = 0_u64;
-    let mut edits = Vec::new();
 
     loop {
-        let start = usize::try_from(block_start).expect("manifest length fits usize");
-        let block_length = (contents.len() - start).min(BLOCK_BYTES);
+        let block_length = read_manifest_block(&mut reader, &mut block)
+            .map_err(|source| io_error("read manifest", path, source))?;
         if block_length == 0 {
             break;
         }
-        let block = &contents[start..start + block_length];
         let final_block = block_start + block_length as u64 == file_length;
         let mut offset = 0;
         while offset < block_length {
@@ -837,8 +1040,7 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
                     } else {
                         block_start + offset as u64
                     };
-                    return Ok(ManifestReplay {
-                        edits,
+                    return Ok(ManifestReplaySummary {
                         valid_bytes,
                         file_length,
                     });
@@ -863,8 +1065,7 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
                 .ok_or_else(|| manifest_corruption("physical fragment length overflow"))?;
             if fragment_end > block_length {
                 if final_block {
-                    return Ok(ManifestReplay {
-                        edits,
+                    return Ok(ManifestReplaySummary {
                         valid_bytes: if assembling {
                             record_start
                         } else {
@@ -883,7 +1084,10 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
             }
 
             match fragment_type {
-                FULL if !assembling => edits.push(decode_edit(fragment)?),
+                FULL if !assembling => {
+                    let edit = decode_edit(fragment)?;
+                    on_edit(&edit)?;
+                }
                 FIRST if !assembling => {
                     record_start = block_start + offset as u64;
                     logical.clear();
@@ -893,7 +1097,8 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
                 MIDDLE if assembling => append_fragment(&mut logical, fragment)?,
                 LAST if assembling => {
                     append_fragment(&mut logical, fragment)?;
-                    edits.push(decode_edit(&logical)?);
+                    let edit = decode_edit(&logical)?;
+                    on_edit(&edit)?;
                     logical.clear();
                     assembling = false;
                 }
@@ -916,8 +1121,7 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
             break;
         }
     }
-    Ok(ManifestReplay {
-        edits,
+    Ok(ManifestReplaySummary {
         valid_bytes: if assembling {
             record_start
         } else {
@@ -925,6 +1129,21 @@ fn replay_manifest(path: &Path, fs: &dyn DurableFs) -> Result<ManifestReplay> {
         },
         file_length,
     })
+}
+
+fn read_manifest_block<R: Read>(
+    reader: &mut BufReader<R>,
+    block: &mut [u8; BLOCK_BYTES],
+) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < block.len() {
+        let read = reader.read(&mut block[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    Ok(filled)
 }
 
 fn append_fragment(logical: &mut Vec<u8>, fragment: &[u8]) -> Result<()> {

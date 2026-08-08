@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 
 #[cfg(unix)]
@@ -20,7 +20,22 @@ pub trait DurableFile: Send {
     fn sync_all(&self) -> std::io::Result<()>;
 }
 
+/// An open regular file used for checked, no-follow reads.
+///
+/// Metadata and contents are obtained from this same handle so callers cannot
+/// validate one directory entry and then read a swapped replacement.
+pub trait DurableReadFile: Read + Seek + Send {
+    /// Returns the length of the file represented by this open handle.
+    fn len(&self) -> std::io::Result<u64>;
+
+    /// Reports whether this open file is empty.
+    fn is_empty(&self) -> std::io::Result<bool> {
+        self.len().map(|length| length == 0)
+    }
+}
+
 struct OsDurableFile(File);
+struct OsDurableReadFile(File);
 
 impl DurableFile for OsDurableFile {
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
@@ -29,6 +44,24 @@ impl DurableFile for OsDurableFile {
 
     fn sync_all(&self) -> std::io::Result<()> {
         self.0.sync_all()
+    }
+}
+
+impl Read for OsDurableReadFile {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buffer)
+    }
+}
+
+impl Seek for OsDurableReadFile {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(position)
+    }
+}
+
+impl DurableReadFile for OsDurableReadFile {
+    fn len(&self) -> std::io::Result<u64> {
+        self.0.metadata().map(|metadata| metadata.len())
     }
 }
 
@@ -66,11 +99,19 @@ pub trait DurableFs: Send + Sync {
         Ok(Box::new(OsDurableFile(open_regular(path, &mut options)?)))
     }
 
-    /// Reads an existing regular file without following symlinks.
-    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+    /// Opens an existing regular file for reading without following symlinks.
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
         let mut options = OpenOptions::new();
         options.read(true);
-        let mut file = open_regular(path, &mut options)?;
+        Ok(Box::new(OsDurableReadFile(open_regular(
+            path,
+            &mut options,
+        )?)))
+    }
+
+    /// Reads an existing regular file without following symlinks.
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        let mut file = self.open_read(path)?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         Ok(bytes)
@@ -78,9 +119,7 @@ pub trait DurableFs: Send + Sync {
 
     /// Validates that `path` names an existing regular file without following symlinks.
     fn validate_file(&self, path: &Path) -> std::io::Result<()> {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        open_regular(path, &mut options).map(drop)
+        self.open_read(path).map(drop)
     }
 
     /// Opens and synchronizes an existing immutable file.
