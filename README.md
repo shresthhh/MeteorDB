@@ -148,6 +148,30 @@ yet.
 | TTL enforcement | Planned |
 | AI workload adapters | Planned |
 
+## Inspection resource limits
+
+Inspection commands apply caller-trusted limits before retaining replay state
+or allocating SSTable metadata buffers:
+
+```bash
+meteordb --path ./db check \
+  --max-historical-files 100000 --max-metadata-bytes 67108864
+meteordb --path ./db dump-sstable --file 000042.sst \
+  --max-bytes 1048576 --max-metadata-bytes 67108864
+```
+
+`--max-historical-files` bounds the distinct manifest and SSTable numbers
+remembered to detect reuse. If the next new number would exceed the limit,
+inspection rejects the manifest immediately; it never forgets accepted numbers
+or silently skips the remaining stream. `--max-metadata-bytes` bounds the
+combined stored index, filter, and properties handles before those blocks are
+read.
+
+SSTable `--max-bytes` includes raw smallest/largest property-key bytes and
+sampled entry-key bytes. Inspection rejects a table when its mandatory property
+keys alone exceed that output budget. Otherwise JSON output remains complete
+and valid, with `bytes_truncated` describing omitted entry samples.
+
 ## AI workload direction
 
 MeteorDB's roadmap includes typed adapters for inference caching, feature

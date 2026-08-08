@@ -79,6 +79,29 @@ fn check_validates_a_live_database_without_mutating_or_taking_the_writer_lock() 
 }
 
 #[test]
+fn check_reports_the_total_validated_manifest_edit_count() {
+    let dir = tempfile::tempdir().unwrap();
+    create_database(dir.path());
+
+    let check = command(dir.path())
+        .args(["check", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(check.status.success());
+    let check: serde_json::Value = serde_json::from_slice(&check.stdout).unwrap();
+
+    let manifest = command(dir.path())
+        .args(["dump-manifest", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(manifest.status.success());
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest.stdout).unwrap();
+
+    assert!(manifest["edits_total"].as_u64().unwrap() > 1);
+    assert_eq!(check["manifest_edits"], manifest["edits_total"]);
+}
+
+#[test]
 fn check_surfaces_sstable_corruption_with_a_distinct_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let sstable = create_database(dir.path());
@@ -171,6 +194,10 @@ fn dump_manifest_rejects_zero_limits_and_bounds_live_files() {
         .args(["dump-manifest", "--max-bytes", "0"])
         .assert()
         .code(2);
+    command(dir.path())
+        .args(["dump-manifest", "--max-historical-files", "0"])
+        .assert()
+        .code(2);
 
     let output = command(dir.path())
         .args([
@@ -236,6 +263,36 @@ fn dump_sstable_reports_checked_metadata_and_bounds_entries() {
 }
 
 #[test]
+fn dump_sstable_counts_property_keys_in_the_json_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let sstable = create_database(dir.path());
+    let name = sstable.file_name().unwrap();
+
+    let output = command(dir.path())
+        .arg("dump-sstable")
+        .arg("--file")
+        .arg(name)
+        .args([
+            "--format",
+            "json",
+            "--max-entries",
+            "1",
+            "--max-blocks",
+            "1",
+            "--max-bytes",
+            "64",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let property_bytes = document["smallest_key_hex"].as_str().unwrap().len() / 2
+        + document["largest_key_hex"].as_str().unwrap().len() / 2;
+    assert!(property_bytes > 0);
+    assert!(document["shown_bytes"].as_u64().unwrap() >= property_bytes as u64);
+}
+
+#[test]
 fn dump_sstable_rejects_zero_limits() {
     let dir = tempfile::tempdir().unwrap();
     let sstable = create_database(dir.path());
@@ -245,6 +302,7 @@ fn dump_sstable_rejects_zero_limits() {
         ("--max-entries", "0"),
         ("--max-blocks", "0"),
         ("--max-bytes", "0"),
+        ("--max-metadata-bytes", "0"),
     ] {
         command(dir.path())
             .arg("dump-sstable")

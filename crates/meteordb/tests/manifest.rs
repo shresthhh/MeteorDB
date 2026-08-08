@@ -34,6 +34,7 @@ fn manifest_inspection_reads_metadata_and_bytes_from_one_injected_handle() {
             max_edits: 1,
             max_files: 1,
             max_bytes: 1024,
+            ..ManifestInspectionOptions::default()
         },
         fs.clone(),
     )
@@ -41,6 +42,78 @@ fn manifest_inspection_reads_metadata_and_bytes_from_one_injected_handle() {
 
     assert_eq!(inspection.edits_total, 1);
     assert!(fs.swapped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn manifest_inspection_bounds_historical_file_number_tracking() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    create_sstable(dir.path(), 3);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+
+    let mut add_two = VersionEdit::new();
+    add_two
+        .add_file(0, meta(2, b"a", b"m"))
+        .set_next_file_number(3);
+    versions.apply(add_two).unwrap();
+    let mut delete_two = VersionEdit::new();
+    delete_two.delete_file(0, 2);
+    versions.apply(delete_two).unwrap();
+    let mut add_three = VersionEdit::new();
+    add_three
+        .add_file(0, meta(3, b"n", b"z"))
+        .set_next_file_number(4);
+    versions.apply(add_three).unwrap();
+    let mut delete_three = VersionEdit::new();
+    delete_three.delete_file(0, 3);
+    versions.apply(delete_three).unwrap();
+    drop(versions);
+
+    assert!(matches!(
+        meteordb::inspect_manifest_with_options(
+            dir.path(),
+            ManifestInspectionOptions {
+                max_historical_files: 2,
+                ..ManifestInspectionOptions::default()
+            },
+        ),
+        Err(Error::InvalidArgument(message))
+            if message.contains("historical file number count exceeds max_historical_files 2")
+    ));
+}
+
+#[test]
+fn manifest_inspection_still_detects_reuse_within_the_historical_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    let mut delete = VersionEdit::new();
+    delete.delete_file(0, 2);
+    versions.apply(delete).unwrap();
+    drop(versions);
+    append_raw_edit(
+        &dir.path().join("MANIFEST-000001"),
+        None,
+        &[],
+        &[(1, meta(2, b"a", b"z"))],
+    );
+
+    assert!(matches!(
+        meteordb::inspect_manifest_with_options(
+            dir.path(),
+            ManifestInspectionOptions {
+                max_historical_files: 2,
+                ..ManifestInspectionOptions::default()
+            },
+        ),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("already been used")
+    ));
 }
 
 struct SwapManifestAfterOpenFs {

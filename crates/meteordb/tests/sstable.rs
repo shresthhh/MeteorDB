@@ -202,6 +202,7 @@ fn reader_limit_rejects_untrusted_snappy_size_declarations() {
 
     let options = TableReaderOptions {
         max_uncompressed_data_block_bytes: 64,
+        max_metadata_bytes: 1024,
     };
     assert!(matches!(
         TableReader::open_with_options(&path, options),
@@ -244,6 +245,7 @@ fn snappy_block_header_cannot_exceed_reader_limit() {
         &path,
         TableReaderOptions {
             max_uncompressed_data_block_bytes: 64,
+            max_metadata_bytes: 1024,
         },
     )
     .unwrap();
@@ -253,6 +255,92 @@ fn snappy_block_header_cannot_exceed_reader_limit() {
             context: "SSTable data block",
             detail,
         }) if detail.contains("reader limit")
+    ));
+}
+
+#[test]
+fn metadata_handles_are_rejected_before_large_block_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-metadata.sst");
+    let block_size = 1024 * 1024_u64;
+    let footer_start = block_size * 3;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(footer_start + SSTABLE_FOOTER_BYTES as u64)
+        .unwrap();
+    file.seek(SeekFrom::Start(footer_start)).unwrap();
+    file.write_all(&test_footer(
+        BlockHandle::new(block_size, block_size),
+        BlockHandle::new(0, block_size),
+        BlockHandle::new(block_size * 2, block_size),
+    ))
+    .unwrap();
+    file.sync_all().unwrap();
+
+    assert!(matches!(
+        TableReader::open_with_options(
+            &path,
+            TableReaderOptions {
+                max_uncompressed_data_block_bytes: 64,
+                max_metadata_bytes: 1024,
+            },
+        ),
+        Err(Error::Corruption {
+            context: "SSTable footer",
+            detail,
+        }) if detail.contains("metadata allocation limit")
+    ));
+}
+
+#[test]
+fn inspection_rejects_property_keys_over_the_output_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000042.sst.tmp");
+    build_table(&path, Compression::None);
+    let reader = TableReader::open(&path).unwrap();
+
+    assert!(matches!(
+        reader.inspect_with_limits(1, 1, 1),
+        Err(Error::InvalidArgument(message))
+            if message.contains("property key bytes") && message.contains("max_bytes 1")
+    ));
+}
+
+#[test]
+fn oversized_property_key_length_is_rejected_without_allocating_the_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-property-key.sst.tmp");
+    build_table(&path, Compression::None);
+
+    let properties = footer_handle(&path, 40);
+    let mut stored = read_at(&path, properties.offset(), properties.size() as usize);
+    let payload_end = stored.len() - 5;
+    let mut cursor = 0;
+    for _ in 0..3 {
+        cursor = skip_varint(&stored[..payload_end], cursor);
+    }
+    cursor += 1;
+    cursor = skip_varint(&stored[..payload_end], cursor);
+    stored[cursor..cursor + 10]
+        .copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+    rewrite_stored_checksum(&mut stored);
+    write_at(&path, properties.offset(), &stored);
+
+    assert!(matches!(
+        TableReader::open_with_options(
+            &path,
+            TableReaderOptions {
+                max_uncompressed_data_block_bytes: 1024,
+                max_metadata_bytes: 1024,
+            },
+        ),
+        Err(Error::Corruption {
+            context: "SSTable properties",
+            ..
+        })
     ));
 }
 

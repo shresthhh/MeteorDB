@@ -13,6 +13,6 @@ pub use format::{
 };
 pub(crate) use reader::TableLookup;
 pub use reader::{
-    DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES, SstableBlockInspection, SstableEntryInspection,
-    SstableInspection, TableIter, TableReader, TableReaderOptions,
+    DEFAULT_MAX_METADATA_BYTES, DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES, SstableBlockInspection,
+    SstableEntryInspection, SstableInspection, TableIter, TableReader, TableReaderOptions,
 };

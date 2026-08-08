@@ -9,7 +9,7 @@ use hdrhistogram::Histogram;
 use meteordb::{
     CacheLookup, Durability, Engine, Error, InferenceCache, InferenceEntry, InferenceKey,
     ManifestInspection, ManifestInspectionOptions, Options, SstableInspection, StatsSnapshot,
-    TableReader, WalInspection, inspect_manifest_with_options, inspect_wal,
+    TableReader, TableReaderOptions, WalInspection, inspect_manifest_with_options, inspect_wal,
 };
 use serde::Serialize;
 
@@ -45,6 +45,12 @@ enum Command {
         /// Maximum raw manifest key bytes retained while selecting live files.
         #[arg(long, default_value_t = 16 * 1024 * 1024, value_parser = parse_positive_usize)]
         max_bytes: usize,
+        /// Maximum combined stored metadata bytes accepted from each SSTable.
+        #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = parse_positive_usize)]
+        max_metadata_bytes: usize,
+        /// Maximum distinct manifest and SSTable file numbers remembered during replay.
+        #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize)]
+        max_historical_files: usize,
     },
     /// Render checked manifest edits and the resulting level layout.
     DumpManifest {
@@ -60,6 +66,9 @@ enum Command {
         /// Maximum raw key bytes retained in rendered SSTable metadata.
         #[arg(long, default_value_t = 1024 * 1024, value_parser = parse_positive_usize)]
         max_bytes: usize,
+        /// Maximum distinct manifest and SSTable file numbers remembered during replay.
+        #[arg(long, default_value_t = 100_000, value_parser = parse_positive_usize)]
+        max_historical_files: usize,
     },
     /// Render checked SSTable metadata, blocks, key ranges, and bounded entries.
     DumpSstable {
@@ -78,6 +87,9 @@ enum Command {
         /// Maximum raw key bytes retained for rendered entry samples.
         #[arg(long, default_value_t = 1024 * 1024, value_parser = parse_positive_usize)]
         max_bytes: usize,
+        /// Maximum combined stored index, filter, and properties bytes accepted.
+        #[arg(long, default_value_t = 64 * 1024 * 1024, value_parser = parse_positive_usize)]
+        max_metadata_bytes: usize,
     },
     /// Run a reproducible workload benchmark against the database path.
     Bench {
@@ -202,20 +214,47 @@ fn run(cli: Cli) -> Result<(), CliError> {
             max_batch_bytes,
             max_files,
             max_bytes,
-        } => check(&cli.path, max_batch_bytes, max_files, max_bytes, format),
+            max_metadata_bytes,
+            max_historical_files,
+        } => check(
+            &cli.path,
+            max_batch_bytes,
+            max_files,
+            max_bytes,
+            max_metadata_bytes,
+            max_historical_files,
+            format,
+        ),
         Command::DumpManifest {
             format,
             max_edits,
             max_files,
             max_bytes,
-        } => dump_manifest(&cli.path, max_edits, max_files, max_bytes, format),
+            max_historical_files,
+        } => dump_manifest(
+            &cli.path,
+            max_edits,
+            max_files,
+            max_bytes,
+            max_historical_files,
+            format,
+        ),
         Command::DumpSstable {
             file,
             format,
             max_entries,
             max_blocks,
             max_bytes,
-        } => dump_sstable(&cli.path, &file, max_entries, max_blocks, max_bytes, format),
+            max_metadata_bytes,
+        } => dump_sstable(
+            &cli.path,
+            &file,
+            max_entries,
+            max_blocks,
+            max_bytes,
+            max_metadata_bytes,
+            format,
+        ),
         Command::Bench {
             seconds,
             seed,
@@ -240,6 +279,8 @@ fn check(
     max_batch_bytes: usize,
     max_files: usize,
     max_bytes: usize,
+    max_metadata_bytes: usize,
+    max_historical_files: usize,
     format: OutputFormat,
 ) -> Result<(), CliError> {
     if max_batch_bytes == 0 {
@@ -253,6 +294,7 @@ fn check(
             max_edits: 1,
             max_files,
             max_bytes,
+            max_historical_files,
         },
     )?;
     if manifest.files_truncated {
@@ -264,7 +306,14 @@ fn check(
     let mut sstables = 0;
     for file in manifest.levels.iter().flatten() {
         let table_path = path.join(format!("{:06}.sst", file.number));
-        let inspected = TableReader::open(&table_path)?.inspect(0, 0)?;
+        let inspected = TableReader::open_with_options(
+            &table_path,
+            TableReaderOptions {
+                max_metadata_bytes,
+                ..TableReaderOptions::default()
+            },
+        )?
+        .inspect(0, 0)?;
         if inspected.file_bytes != file.file_size {
             return Err(Error::Corruption {
                 context: "SSTable",
@@ -297,7 +346,7 @@ fn check(
         format_version: 1,
         status: "ok",
         manifest: manifest.manifest,
-        manifest_edits: manifest.edits.len(),
+        manifest_edits: manifest.edits_total,
         sstables,
         wal_segments: wals.len(),
         wal_batches: wals.iter().map(|wal| wal.batches).sum(),
@@ -422,6 +471,7 @@ fn dump_manifest(
     max_edits: usize,
     max_files: usize,
     max_bytes: usize,
+    max_historical_files: usize,
     format: OutputFormat,
 ) -> Result<(), CliError> {
     let manifest = inspect_manifest_with_options(
@@ -430,6 +480,7 @@ fn dump_manifest(
             max_edits,
             max_files,
             max_bytes,
+            max_historical_files,
         },
     )?;
     let shown = manifest.edits.len();
@@ -492,14 +543,18 @@ fn dump_sstable(
     max_entries: usize,
     max_blocks: usize,
     max_bytes: usize,
+    max_metadata_bytes: usize,
     format: OutputFormat,
 ) -> Result<(), CliError> {
     validate_sstable_name(file)?;
-    let inspection = TableReader::open(database.join(file))?.inspect_with_limits(
-        max_entries,
-        max_blocks,
-        max_bytes,
-    )?;
+    let inspection = TableReader::open_with_options(
+        database.join(file),
+        TableReaderOptions {
+            max_metadata_bytes,
+            ..TableReaderOptions::default()
+        },
+    )?
+    .inspect_with_limits(max_entries, max_blocks, max_bytes)?;
     match format {
         OutputFormat::Human => write_sstable_human(&inspection),
         OutputFormat::Json => write_json(&inspection),

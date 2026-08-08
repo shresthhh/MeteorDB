@@ -47,7 +47,7 @@ pub use memtable::{MemTable, ValueRecord};
 pub use options::{Compression, Durability, Options};
 pub use snapshot::{SnapshotGuard, SnapshotRegistry};
 pub use sstable::{
-    BLOCK_TRAILER_BYTES, Block, BlockBuilder, BlockHandle, BlockIter,
+    BLOCK_TRAILER_BYTES, Block, BlockBuilder, BlockHandle, BlockIter, DEFAULT_MAX_METADATA_BYTES,
     DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES, NO_COMPRESSION, SNAPPY_COMPRESSION,
     SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, SstableBlockInspection,
     SstableEntryInspection, SstableInspection, TableBuildResult, TableBuilder, TableIter,

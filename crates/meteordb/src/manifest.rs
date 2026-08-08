@@ -110,6 +110,12 @@ pub struct ManifestInspectionOptions {
     pub max_files: usize,
     /// Maximum raw internal-key bytes retained across rendered file metadata.
     pub max_bytes: usize,
+    /// Maximum distinct persistent file numbers remembered during replay.
+    ///
+    /// Inspection rejects the manifest when the next new number would exceed
+    /// this trusted limit. Numbers already accepted remain tracked so reuse is
+    /// still detected, and no suffix is silently skipped.
+    pub max_historical_files: usize,
 }
 
 impl Default for ManifestInspectionOptions {
@@ -118,6 +124,7 @@ impl Default for ManifestInspectionOptions {
             max_edits: usize::MAX,
             max_files: usize::MAX,
             max_bytes: usize::MAX,
+            max_historical_files: usize::MAX,
         }
     }
 }
@@ -159,6 +166,11 @@ pub fn inspect_manifest_with_fs(
             "max_bytes must be greater than zero".to_owned(),
         ));
     }
+    if options.max_historical_files == 0 {
+        return Err(Error::InvalidArgument(
+            "max_historical_files must be greater than zero".to_owned(),
+        ));
+    }
     let directory = directory.as_ref();
     let current_path = directory.join("CURRENT");
     let current = fs
@@ -174,7 +186,12 @@ pub fn inspect_manifest_with_fs(
     let mut log_number = 0;
     let mut active_log_number = 0;
     let mut wal_sequence = 0;
-    let mut used_file_numbers = HashSet::from([manifest_number]);
+    let mut used_file_numbers = HashSet::new();
+    insert_historical_file_number(
+        &mut used_file_numbers,
+        manifest_number,
+        options.max_historical_files,
+    )?;
     let mut edits = Vec::new();
     let mut retained_files = 0_usize;
     let mut retained_bytes = 0_usize;
@@ -193,7 +210,13 @@ pub fn inspect_manifest_with_fs(
         validate_file_numbers(edit, next_file_number, &used_file_numbers, true)?;
         version = version.apply(edit).map_err(recovery_edit_error)?;
         validate_inspection_state_limits(&version, options)?;
-        used_file_numbers.extend(edit.added_files.iter().map(|(_, file)| file.number()));
+        for (_, file) in &edit.added_files {
+            insert_historical_file_number(
+                &mut used_file_numbers,
+                file.number(),
+                options.max_historical_files,
+            )?;
+        }
         if edits.len() < options.max_edits {
             edits.push(inspect_edit(
                 index,
@@ -262,6 +285,23 @@ pub fn inspect_manifest_with_fs(
             }
         }
         levels.push(files);
+    }
+
+    fn insert_historical_file_number(
+        used_file_numbers: &mut HashSet<u64>,
+        number: u64,
+        maximum: usize,
+    ) -> Result<()> {
+        if used_file_numbers.contains(&number) {
+            return Ok(());
+        }
+        if used_file_numbers.len() == maximum {
+            return Err(Error::InvalidArgument(format!(
+                "historical file number count exceeds max_historical_files {maximum}"
+            )));
+        }
+        used_file_numbers.insert(number);
+        Ok(())
     }
 
     let retained_live_files = levels.iter().map(Vec::len).sum::<usize>();

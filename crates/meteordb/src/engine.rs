@@ -878,6 +878,7 @@ impl Engine {
                     self.inner.read_stats.clone(),
                     TableReaderOptions {
                         max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+                        max_metadata_bytes: reader_metadata_limit(&self.inner.options),
                     },
                     self.inner.fs.clone(),
                 )?;
@@ -919,6 +920,7 @@ impl Engine {
             self.inner.read_stats.clone(),
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+                max_metadata_bytes: reader_metadata_limit(&self.inner.options),
             },
             self.inner.fs.clone(),
         )?;
@@ -1426,6 +1428,12 @@ fn reader_block_limit(options: &Options) -> usize {
         .saturating_add(options.max_value_bytes)
         .saturating_add(128);
     target_with_encoding.max(largest_entry)
+}
+
+fn reader_metadata_limit(options: &Options) -> usize {
+    options
+        .target_sstable_bytes
+        .max(options.max_key_bytes.saturating_mul(2).saturating_add(128))
 }
 
 fn ensure_open(state: &WriteState) -> Result<()> {

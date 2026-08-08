@@ -16,6 +16,8 @@ use crate::{
 
 /// Conservative default ceiling for one uncompressed SSTable data block.
 pub const DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+/// Conservative default ceiling for all eagerly read SSTable metadata blocks.
+pub const DEFAULT_MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 /// Trusted resource limits applied while opening and reading an SSTable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,12 +27,18 @@ pub struct TableReaderOptions {
     /// This limit comes from the caller, not the file. It bounds stored-block
     /// reads and Snappy output before allocation or decompression.
     pub max_uncompressed_data_block_bytes: usize,
+    /// Maximum combined stored bytes in index, filter, and properties blocks.
+    ///
+    /// Footer handles are checked against this caller-trusted limit before any
+    /// metadata payload buffer is allocated.
+    pub max_metadata_bytes: usize,
 }
 
 impl Default for TableReaderOptions {
     fn default() -> Self {
         Self {
             max_uncompressed_data_block_bytes: DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES,
+            max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
         }
     }
 }
@@ -111,7 +119,7 @@ pub struct SstableInspection {
     pub blocks_truncated: bool,
     /// First records, bounded by the caller.
     pub shown: Vec<SstableEntryInspection>,
-    /// Raw key bytes retained across shown records.
+    /// Raw key bytes retained across property bounds and shown records.
     pub shown_bytes: usize,
     /// Whether records were omitted because the retained-byte limit was reached.
     pub bytes_truncated: bool,
@@ -187,6 +195,11 @@ impl TableReader {
                 "max_uncompressed_data_block_bytes must be greater than zero".to_owned(),
             ));
         }
+        if options.max_metadata_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "max_metadata_bytes must be greater than zero".to_owned(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
         let mut file = fs
             .open_read(&path)
@@ -222,6 +235,12 @@ impl TableReader {
         let filter_handle = decode_fixed_handle(&footer, 20, footer_start)?;
         let properties_handle = decode_fixed_handle(&footer, 40, footer_start)?;
         validate_metadata_handles(index_handle, filter_handle, properties_handle, footer_start)?;
+        validate_metadata_allocation_limit(
+            index_handle,
+            filter_handle,
+            properties_handle,
+            options.max_metadata_bytes,
+        )?;
 
         let (index_payload, index_miss) = read_cached_metadata(
             file.as_mut(),
@@ -348,6 +367,10 @@ impl TableReader {
     }
 
     /// Checks every data block while bounding retained records, blocks, and key bytes.
+    ///
+    /// The byte budget includes the smallest and largest property keys. If
+    /// those mandatory fields alone exceed the budget, inspection rejects the
+    /// table instead of allocating or emitting an over-budget document.
     pub fn inspect_with_limits(
         &self,
         max_entries: usize,
@@ -368,8 +391,22 @@ impl TableReader {
         max_blocks: usize,
         max_bytes: usize,
     ) -> Result<SstableInspection> {
+        let property_key_bytes = self
+            .properties
+            .smallest
+            .as_bytes()
+            .len()
+            .checked_add(self.properties.largest.as_bytes().len())
+            .ok_or_else(|| {
+                Error::InvalidArgument("SSTable property key byte count exceeds usize".to_owned())
+            })?;
+        if property_key_bytes > max_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "SSTable property key bytes {property_key_bytes} exceed max_bytes {max_bytes}"
+            )));
+        }
         let mut shown = Vec::with_capacity(max_entries.min(self.index.len()));
-        let mut shown_bytes = 0_usize;
+        let mut shown_bytes = property_key_bytes;
         let mut bytes_truncated = false;
         let mut checked_entries = 0_u64;
         for entry in self.iter() {
@@ -750,6 +787,29 @@ fn validate_metadata_handles(
         return Err(footer_corruption(
             "metadata blocks do not follow canonical filter-index-properties-footer layout",
         ));
+    }
+    Ok(())
+}
+
+fn validate_metadata_allocation_limit(
+    index: BlockHandle,
+    filter: BlockHandle,
+    properties: BlockHandle,
+    maximum: usize,
+) -> Result<()> {
+    let maximum = u64::try_from(maximum)
+        .map_err(|_| Error::InvalidArgument("metadata byte limit exceeds u64".to_owned()))?;
+    let total = [index, filter, properties]
+        .into_iter()
+        .try_fold(0_u64, |total, handle| {
+            total
+                .checked_add(handle.size())
+                .ok_or_else(|| footer_corruption("metadata byte count overflows u64"))
+        })?;
+    if total > maximum {
+        return Err(footer_corruption(format!(
+            "metadata handle bytes {total} exceed metadata allocation limit {maximum}"
+        )));
     }
     Ok(())
 }

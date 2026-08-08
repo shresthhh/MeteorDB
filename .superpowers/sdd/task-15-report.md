@@ -4,8 +4,32 @@
 
 - `82fa15a` — `fix: harden task 15 inspection and benchmarks`
 - Documentation/report commit: the commit containing this updated report.
+- Remaining review fixes: the commit containing this updated report.
 
 ## Review findings fixed
+
+### Remaining Task 15 review fixes
+
+- `check` now reports `ManifestInspection::edits_total`; its one retained edit
+  remains an internal validation sample rather than the reported manifest edit
+  count. A multi-edit CLI regression compares `check` with `dump-manifest`.
+- `ManifestInspectionOptions::max_historical_files` bounds the distinct file
+  numbers retained for reuse detection. `check` and `dump-manifest` expose
+  `--max-historical-files`. Inspection checks the trusted limit before each new
+  insertion, retains every accepted number for reuse checks, and rejects
+  immediately rather than forgetting history or accepting an unvalidated
+  suffix.
+- `TableReaderOptions::max_metadata_bytes` bounds the combined stored index,
+  filter, and properties handles before any metadata block allocation or read.
+  Engine readers derive this trusted ceiling from configured table/key limits;
+  inspection commands expose `--max-metadata-bytes`.
+- SSTable output byte accounting now starts with the raw smallest/largest
+  property keys. Mandatory property keys over `--max-bytes` reject inspection;
+  otherwise sampled-entry truncation remains valid JSON and is described by
+  `bytes_truncated`.
+- Regressions cover sparse oversized metadata handles, an oversized encoded
+  property-key length, property-key output accounting, bounded historical
+  tracking, reuse detection within the bound, and the multi-edit `check` count.
 
 ### 1. No-follow, same-handle inspection
 
@@ -64,6 +88,8 @@ The CLI adds:
 
 - `check --max-files --max-bytes`;
 - `dump-manifest --max-files --max-bytes`;
+- `check`/`dump-manifest --max-historical-files`;
+- `check`/`dump-sstable --max-metadata-bytes`;
 - `dump-sstable --max-bytes`.
 
 All count/byte limits reject zero. Tests confirm corruption after the manifest
@@ -87,6 +113,7 @@ may acknowledge writes still resident in operating-system buffers.
 - Manifest JSON gains additive total/truncation fields for bounded edit file
   lists and live levels.
 - SSTable JSON/human output gains `shown_bytes` and `bytes_truncated`.
+- `shown_bytes` now includes mandatory smallest/largest property-key bytes.
 - Zero values formerly accepted for dump sample counts are now usage errors.
 - `dump-manifest` and `dump-sstable` defaults remain bounded; callers needing
   larger output must raise the explicit limits.
@@ -99,9 +126,12 @@ CLI regressions were written first. The GCC run failed because durability,
 `--max-files`, `--max-bytes`, and positive-limit validation did not exist.
 After implementation, the focused CLI suite passed 13 tests.
 
-Focused filesystem tests cover the new injectable handle and replacement
-races. Manifest, WAL, and SSTable focused suites pass 24, 20, and 15 tests
-respectively.
+The remaining-review regressions failed first because `check` reported its
+single retained edit, and the historical/metadata limit fields did not exist.
+After implementation, the manifest, SSTable, and CLI focused suites pass 26,
+18, and 15 tests respectively. The SSTable suite includes sparse oversized
+metadata handles and a `u64::MAX` property-key length declaration without
+constructing corresponding payload buffers.
 
 ## Full GCC validation
 
