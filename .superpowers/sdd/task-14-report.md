@@ -5,8 +5,9 @@
 Implemented in:
 
 - `11498f0` `feat: add feature and embedding adapters`
+- `766ec96` `fix: bound workload adapter memory`
 
-The commit has no co-author trailer and was not pushed.
+The commits have no co-author trailers and were not pushed.
 
 ## What changed
 
@@ -23,6 +24,15 @@ The commit has no co-author trailer and was not pushed.
   reads, atomic batch writes, delete, TTL, and restart persistence.
 - Added strict limits, finite-float checks, schema checks, canonical decoding,
   and corruption reporting.
+- Added checked conservative feature-row sizing before mutation and
+  serialization, preserving the 16 MiB postcard-body limit without allowing an
+  unbounded serialization allocation.
+- Changed public feature history/group retrieval to require a caller limit.
+- Changed `latest` and `as_of` to stream the ordered engine iterator while
+  retaining only the newest encoded candidate; `as_of` ends at the encoded
+  requested timestamp.
+- Added checked projected metadata accounting before mutation, including
+  subtracting a replaced entry.
 
 ## Beginner walkthrough
 
@@ -61,9 +71,12 @@ put. Replacing a row cannot expose a partially updated set of features.
 Optional TTL delegates to the engine's serialized TTL write path.
 
 `history` constructs inclusive scan bounds by appending the encoded start and
-end times to the group prefix. Results arrive oldest first. `latest` takes the
-last group result; `as_of` scans from `i64::MIN` through the requested time and
-takes the last result. `get_many` validates all keys first, captures one MVCC
+end times to the group prefix. Results arrive oldest first, and callers must
+supply the maximum number of rows. `scan_group` likewise requires a limit.
+`latest` and `as_of` do not build a history `Vec`; they stream the ordered
+iterator and retain only the newest encoded key/value candidate, decoding that
+single candidate after the scan. `as_of` uses the requested event time as its
+encoded upper bound. `get_many` validates all keys first, captures one MVCC
 snapshot, and preserves misses, duplicates, and request order.
 
 ### 3. Embedding keys and values
@@ -116,6 +129,19 @@ The adapter tests were added before production code. The first targeted GCC run
 failed with unresolved imports for every new adapter type. A later zero-dimension
 test was also observed failing before the validation was added.
 
+For the review fixes, tests were changed first. The first GCC workload run
+failed to compile because `history` and `scan_group` did not yet accept caller
+limits. After the limited API was added, the next GCC workload run compiled and
+failed only these new regressions:
+
+```text
+feature_record_rejects_projected_aggregate_over_encoded_limit_before_mutation
+embedding_metadata_replacement_checks_projected_total_before_mutation
+```
+
+Both failed because the inserts incorrectly succeeded. After the checked
+projected-size validation was implemented, all 23 workload tests passed.
+
 GCC environment:
 
 ```bash
@@ -157,11 +183,40 @@ git diff --check
 exit 0
 ```
 
+Fresh GCC gates after `766ec96`:
+
+```text
+cargo fmt --all --check
+exit 0
+
+cargo test -p meteordb --test workloads
+23 passed; 0 failed
+
+cargo test --workspace
+208 passed; 0 failed
+
+cargo test --workspace --doc
+0 passed; 0 failed
+
+cargo clippy --workspace --all-targets -- -D warnings
+exit 0
+
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+exit 0
+
+git diff --check
+exit 0
+```
+
 ## Trade-offs and concerns
 
-- `latest` and `as_of` use forward scans and select the final row because the
-  engine does not expose reverse iteration. This is correct but costs linear
-  work in the selected history.
+- `latest` and `as_of` retain only one candidate, but the engine exposes only
+  forward iteration. They therefore still perform linear I/O across the
+  selected key range; `as_of` avoids scanning keys after its timestamp.
+- Feature sizing is conservative for signed integers (up to ten postcard
+  bytes), so a row within a few bytes of 16 MiB can be rejected even if its
+  exact encoding would fit. This guarantees the serializer's allocation is
+  bounded and never permits an encoded body over 16 MiB.
 - Feature scans return owned rows. This keeps the public API simple but copies
   decoded feature values.
 - Embedding vector bytes are borrowed from the owned `Embedding`; typed
