@@ -113,24 +113,34 @@ impl TerminalFailure {
 impl Engine {
     /// Opens or recovers an engine using the operating system's durable filesystem.
     pub fn open(options: Options) -> Result<Self> {
-        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
+        Self::open_with_fs_and_clock(
+            options,
+            Arc::new(OsDurableFs),
+            Arc::new(SystemClock::default()),
+        )
     }
 
     /// Opens or recovers an engine with injectable crash-sensitive filesystem operations.
     pub fn open_with_fs(options: Options, fs: Arc<dyn DurableFs>) -> Result<Self> {
-        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock))
+        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock::default()))
     }
 
     /// Opens or recovers an engine with an injectable wall clock.
     ///
     /// The clock controls TTL deadline creation and expiration checks. MVCC
     /// snapshots still freeze only their sequence number; they do not freeze
-    /// wall-clock time.
+    /// wall-clock time. Its values must not decrease while this engine is open.
+    /// Persisted deadlines remain absolute Unix timestamps across restart, so
+    /// callers must also avoid reopening with a clock behind time observed by
+    /// the previous process.
     pub fn open_with_clock(options: Options, clock: Arc<dyn Clock>) -> Result<Self> {
         Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), clock)
     }
 
     /// Opens or recovers an engine with injectable filesystem and wall-clock operations.
+    ///
+    /// The clock follows the same non-decreasing and cross-restart requirements
+    /// documented by [`Engine::open_with_clock`].
     pub fn open_with_fs_and_clock(
         options: Options,
         fs: Arc<dyn DurableFs>,
@@ -535,17 +545,6 @@ impl Engine {
     }
 
     pub(crate) fn execute_compaction_plan(&self, plan: crate::CompactionPlan) -> Result<()> {
-        let result = self.execute_compaction_plan_inner(plan);
-        if let Err(error) = result {
-            let mut state = self.lock_state();
-            let error = record_background_failure(&mut state, error);
-            self.inner.background.wake_all();
-            return Err(error);
-        }
-        Ok(())
-    }
-
-    fn execute_compaction_plan_inner(&self, plan: crate::CompactionPlan) -> Result<()> {
         let mut state = self.lock_state();
         ensure_writable(&state)?;
         if !state.immutables.is_empty() || state.flush_running {
@@ -555,6 +554,23 @@ impl Engine {
         }
         let old_version = state.versions.current();
         validate_compaction_plan(&plan, &old_version)?;
+
+        let result = self.execute_valid_compaction_plan(plan, state, old_version);
+        if let Err(error) = result {
+            state = self.lock_state();
+            let error = record_background_failure(&mut state, error);
+            self.inner.background.wake_all();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn execute_valid_compaction_plan(
+        &self,
+        plan: crate::CompactionPlan,
+        mut state: MutexGuard<'_, WriteState>,
+        old_version: Arc<crate::Version>,
+    ) -> Result<()> {
         let mut output = crate::compaction::run(
             &plan,
             CompactionContext {

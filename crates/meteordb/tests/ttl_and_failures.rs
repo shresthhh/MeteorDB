@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use meteordb::{
-    DurableFile, DurableFs, Engine, Error, ManualClock, Options, OsDurableFs, ScanBounds,
+    Clock, DurableFile, DurableFs, Engine, Error, ManualClock, Options, OsDurableFs, ScanBounds,
     TableReader, WriteBatch,
 };
 
@@ -23,7 +23,7 @@ fn ttl_uses_wall_clock_at_each_read_and_never_resurrects_an_older_version() {
         Some(&b"newer"[..])
     );
 
-    clock.set(1_010);
+    clock.set(1_010).unwrap();
     assert_eq!(db.get(b"key").unwrap(), None);
     assert_eq!(snapshot.get(b"key").unwrap(), None);
     assert!(collect(db.scan(ScanBounds::all(), usize::MAX).unwrap()).is_empty());
@@ -42,7 +42,7 @@ fn a_snapshot_before_the_ttl_version_still_reads_its_older_mvcc_version() {
     db.put(b"key", b"older").unwrap();
     let before_ttl = db.snapshot().unwrap();
     db.put_with_ttl(b"key", b"newer", 5).unwrap();
-    clock.set(25);
+    clock.set(25).unwrap();
 
     assert_eq!(db.get(b"key").unwrap(), None);
     assert_eq!(
@@ -62,7 +62,7 @@ fn ttl_rejects_negative_and_overflowing_expiration_calculations() {
         Err(Error::InvalidArgument(message)) if message.contains("ttl_ms")
     ));
 
-    clock.set(u64::MAX - 1);
+    clock.set(u64::MAX - 1).unwrap();
     assert!(matches!(
         db.put_with_ttl(b"overflow", b"value", 2),
         Err(Error::InvalidArgument(message)) if message.contains("overflow")
@@ -83,7 +83,7 @@ fn expiration_persists_across_flush_and_restart_with_an_injected_clock() {
         db.close().unwrap();
     }
 
-    clock.set(510);
+    clock.set(510).unwrap();
     let db = Engine::open_with_clock(options, clock).unwrap();
     assert_eq!(db.get(b"key").unwrap(), None);
     assert!(collect(db.scan(ScanBounds::all(), usize::MAX).unwrap()).is_empty());
@@ -106,9 +106,55 @@ fn compaction_reclaims_an_expired_version_and_the_history_it_hides() {
         db.flush().unwrap();
     }
 
-    clock.set(1_005);
+    clock.set(1_005).unwrap();
     assert!(db.compact().unwrap());
     assert_eq!(db.get(b"expired").unwrap(), None);
+    assert!(
+        sstable_internal_keys(dir.path())
+            .iter()
+            .all(|key| key.as_slice() != b"expired")
+    );
+}
+
+#[test]
+fn point_reads_reject_clock_rollback_and_do_not_resurrect_expired_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ManualClock::new(1_000));
+    let db = Engine::open_with_clock(Options::new(dir.path()), clock.clone()).unwrap();
+
+    db.put_with_ttl(b"key", b"value", 10).unwrap();
+    clock.set(1_010).unwrap();
+    assert_eq!(db.get(b"key").unwrap(), None);
+
+    assert!(matches!(
+        clock.set(1_009),
+        Err(Error::InvalidArgument(message)) if message.contains("backward")
+    ));
+    assert_eq!(clock.now_unix_ms(), 1_010);
+    assert_eq!(db.get(b"key").unwrap(), None);
+}
+
+#[test]
+fn compaction_reclamation_rejects_clock_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let clock = Arc::new(ManualClock::new(2_000));
+    let mut options = Options::new(dir.path());
+    options.target_sstable_bytes = 128;
+    let db = Engine::open_with_clock(options, clock.clone()).unwrap();
+
+    db.put(b"expired", b"older").unwrap();
+    db.flush().unwrap();
+    db.put_with_ttl(b"expired", b"newer", 5).unwrap();
+    db.flush().unwrap();
+    for index in 0..3 {
+        db.put(format!("filler-{index}"), vec![b'x'; 96]).unwrap();
+        db.flush().unwrap();
+    }
+
+    clock.set(2_005).unwrap();
+    assert_eq!(db.get(b"expired").unwrap(), None);
+    assert!(clock.set(2_004).is_err());
+    assert!(db.compact().unwrap());
     assert!(
         sstable_internal_keys(dir.path())
             .iter()

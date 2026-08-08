@@ -1,9 +1,9 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
 use meteordb::{
-    CompactionJob, CompactionPicker, DurableFile, DurableFs, Engine, FileMeta, InternalKey,
+    CompactionJob, CompactionPicker, DurableFile, DurableFs, Engine, Error, FileMeta, InternalKey,
     Options, OsDurableFs, TableBuilder, ValueKind, VersionEdit, VersionSet,
 };
 
@@ -241,6 +241,76 @@ fn bottom_level_compaction_drops_an_unneeded_tombstone() {
 }
 
 #[test]
+fn a_stale_compaction_plan_is_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = compaction_database(dir.path(), Arc::new(OsDurableFs));
+    db.close().unwrap();
+    drop(db);
+    let versions = VersionSet::recover(dir.path()).unwrap();
+    let plan = CompactionPicker::new(4, 128)
+        .pick(&versions.current())
+        .unwrap();
+    drop(versions);
+    let mut options = Options::new(dir.path());
+    options.target_sstable_bytes = 128;
+    let db = Engine::open(options).unwrap();
+    let job = CompactionJob::new(plan);
+
+    job.execute(&db).unwrap();
+    assert!(matches!(
+        job.execute(&db),
+        Err(Error::InvalidArgument(message)) if message.contains("no longer matches")
+    ));
+
+    db.put(b"after-stale-plan", b"value").unwrap();
+    assert_eq!(
+        db.get(b"after-stale-plan").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+}
+
+#[test]
+fn a_flush_busy_compaction_precondition_is_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    let gate = Arc::new(FlushGate::default());
+    let fs = Arc::new(BlockingFlushFs {
+        inner: OsDurableFs,
+        gate: gate.clone(),
+        armed: AtomicBool::new(false),
+    });
+    let db = compaction_database(dir.path(), fs.clone());
+    db.close().unwrap();
+    drop(db);
+    let versions = VersionSet::recover(dir.path()).unwrap();
+    let plan = CompactionPicker::new(4, 128)
+        .pick(&versions.current())
+        .unwrap();
+    drop(versions);
+    let mut options = Options::new(dir.path());
+    options.target_sstable_bytes = 128;
+    let db = Engine::open_with_fs(options, fs.clone()).unwrap();
+
+    db.put(b"pending-flush", b"value").unwrap();
+    fs.armed.store(true, Ordering::Release);
+    let flushing_db = db.clone();
+    let flush = std::thread::spawn(move || flushing_db.flush());
+    gate.wait_until_blocked();
+
+    assert!(matches!(
+        CompactionJob::new(plan).execute(&db),
+        Err(Error::Background(message)) if message.contains("flush is running")
+    ));
+
+    gate.release();
+    flush.join().unwrap().unwrap();
+    db.put(b"after-busy", b"value").unwrap();
+    assert_eq!(
+        db.get(b"after-busy").unwrap().as_deref(),
+        Some(&b"value"[..])
+    );
+}
+
+#[test]
 fn compaction_syncs_outputs_before_manifest_install_and_reclaims_inputs_afterward() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(TrackingFs::default());
@@ -251,6 +321,7 @@ fn compaction_syncs_outputs_before_manifest_install_and_reclaims_inputs_afterwar
         db.put(format!("key-{index}"), b"value").unwrap();
         db.flush().unwrap();
     }
+
     fs.clear();
 
     assert!(db.compact().unwrap());
@@ -275,6 +346,84 @@ fn compaction_syncs_outputs_before_manifest_install_and_reclaims_inputs_afterwar
     assert!(output_sync < published_sync);
     assert!(published_sync < manifest_sync);
     assert!(manifest_sync < first_remove, "{events:?}");
+}
+
+#[derive(Default)]
+struct FlushGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl FlushGate {
+    fn block(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn wait_until_blocked(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct BlockingFlushFile {
+    inner: Box<dyn DurableFile>,
+    gate: Arc<FlushGate>,
+}
+
+impl DurableFile for BlockingFlushFile {
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.inner.write_all(bytes)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.gate.block();
+        self.inner.sync_all()
+    }
+}
+
+struct BlockingFlushFs {
+    inner: OsDurableFs,
+    gate: Arc<FlushGate>,
+    armed: AtomicBool,
+}
+
+impl DurableFs for BlockingFlushFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        let file = self.inner.create(path)?;
+        if self.armed.load(Ordering::Acquire) && path.to_string_lossy().ends_with(".sst.tmp") {
+            Ok(Box::new(BlockingFlushFile {
+                inner: file,
+                gate: self.gate.clone(),
+            }))
+        } else {
+            Ok(file)
+        }
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 #[test]

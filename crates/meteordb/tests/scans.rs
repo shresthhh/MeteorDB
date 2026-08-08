@@ -78,7 +78,8 @@ fn flushed_expiration_hides_the_disk_value_without_exposing_an_older_value() {
     db.put(b"k", b"older").unwrap();
     db.flush().unwrap();
 
-    let expires_at = SystemClock.now_unix_ms().saturating_add(500);
+    let clock = SystemClock::default();
+    let expires_at = clock.now_unix_ms().saturating_add(500);
     let mut batch = WriteBatch::default();
     batch.put_with_expiration(b"k", b"expiring", Some(expires_at));
     db.write(batch).unwrap();
@@ -87,7 +88,7 @@ fn flushed_expiration_hides_the_disk_value_without_exposing_an_older_value() {
 
     let db = Engine::open(Options::new(dir.path())).unwrap();
     assert_eq!(db.get(b"k").unwrap().as_deref(), Some(&b"expiring"[..]));
-    while SystemClock.now_unix_ms() <= expires_at {
+    while clock.now_unix_ms() <= expires_at {
         std::thread::sleep(Duration::from_millis(5));
     }
 
