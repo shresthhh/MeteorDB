@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, ThreadId};
 
 use crate::{Engine, Error, Result};
+use serde::{Deserialize, Serialize};
 
 const KEY_PREFIX: &[u8] = b"\0meteordb:inference-cache\0";
 const KEY_SCHEMA_VERSION: u8 = 1;
@@ -16,6 +18,7 @@ const MAX_PARAMETER_COUNT: usize = 256;
 const MAX_PARAMETER_COMPONENT_BYTES: usize = 16 * 1024;
 const MAX_KEY_MATERIAL_BYTES: usize = 512 * 1024;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
+const MAX_ENTRY_BODY_BYTES: usize = MAX_PAYLOAD_BYTES + 10;
 
 /// The model request fields that determine whether an inference result is reusable.
 ///
@@ -59,7 +62,7 @@ impl InferenceKey {
 }
 
 /// One binary inference result stored in the cache.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InferenceEntry {
     payload: Vec<u8>,
 }
@@ -108,6 +111,7 @@ struct CacheInner {
 }
 
 struct Flight {
+    owner: ThreadId,
     outcome: Mutex<Option<SharedResult>>,
     ready: Condvar,
 }
@@ -130,6 +134,9 @@ enum SharedError {
     UnsupportedFormat {
         kind: &'static str,
         version: u32,
+    },
+    Reentrant {
+        operation: &'static str,
     },
     Locked(PathBuf),
     Closed,
@@ -231,9 +238,15 @@ impl InferenceCache {
         let (flight, leader) = {
             let mut flights = lock_unpoisoned(&self.inner.flights);
             if let Some(flight) = flights.get(&encoded_key) {
+                if flight.owner == thread::current().id() {
+                    return Err(Error::Reentrant {
+                        operation: "inference-cache get_or_compute",
+                    });
+                }
                 (flight.clone(), false)
             } else {
                 let flight = Arc::new(Flight {
+                    owner: thread::current().id(),
                     outcome: Mutex::new(None),
                     ready: Condvar::new(),
                 });
@@ -365,9 +378,12 @@ impl InferenceCache {
 
 fn encode_entry(entry: &InferenceEntry) -> Result<Vec<u8>> {
     validate_max("payload", entry.payload.len(), MAX_PAYLOAD_BYTES)?;
-    let mut encoded = Vec::with_capacity(5 + entry.payload.len());
+    let body = postcard::to_allocvec(entry).map_err(|error| {
+        Error::InvalidArgument(format!("could not encode cache entry: {error}"))
+    })?;
+    let mut encoded = Vec::with_capacity(1 + body.len());
     encoded.push(ENTRY_SCHEMA_VERSION);
-    push_bytes(&mut encoded, &entry.payload);
+    encoded.extend_from_slice(&body);
     Ok(encoded)
 }
 
@@ -381,19 +397,26 @@ fn decode_entry(bytes: &[u8]) -> Result<InferenceEntry> {
             version: u32::from(version),
         });
     }
-    if body.len() < 4 {
-        return Err(entry_corruption("missing payload length"));
+    if body.len() > MAX_ENTRY_BODY_BYTES {
+        return Err(entry_corruption(format!(
+            "serialized entry is {} bytes, exceeding the {} byte limit",
+            body.len(),
+            MAX_ENTRY_BODY_BYTES
+        )));
     }
-    let payload_len = u32::from_be_bytes(body[..4].try_into().unwrap()) as usize;
-    let payload = &body[4..];
-    if payload.len() != payload_len {
-        return Err(entry_corruption(
-            "payload length does not match entry bytes",
-        ));
+    let (entry, trailing) = postcard::take_from_bytes::<InferenceEntry>(body)
+        .map_err(|error| entry_corruption(format!("invalid postcard body: {error}")))?;
+    if !trailing.is_empty() {
+        return Err(entry_corruption("trailing bytes after postcard body"));
     }
-    validate_max("stored payload", payload.len(), MAX_PAYLOAD_BYTES)
+    validate_max("stored payload", entry.payload.len(), MAX_PAYLOAD_BYTES)
         .map_err(|error| entry_corruption(error.to_string()))?;
-    Ok(InferenceEntry::new(payload))
+    let canonical = postcard::to_allocvec(&entry)
+        .map_err(|error| entry_corruption(format!("could not re-encode postcard body: {error}")))?;
+    if canonical != body {
+        return Err(entry_corruption("non-canonical postcard body"));
+    }
+    Ok(entry)
 }
 
 fn wait_for_flight(flight: &Flight) -> Result<InferenceEntry> {
@@ -482,6 +505,7 @@ impl SharedError {
                 kind,
                 version: *version,
             },
+            Error::Reentrant { operation } => Self::Reentrant { operation },
             Error::Locked(path) => Self::Locked(path.clone()),
             Error::Closed => Self::Closed,
             Error::Background(message) => Self::Background(message.clone()),
@@ -508,6 +532,7 @@ impl SharedError {
             },
             Self::Corruption { context, detail } => Error::Corruption { context, detail },
             Self::UnsupportedFormat { kind, version } => Error::UnsupportedFormat { kind, version },
+            Self::Reentrant { operation } => Error::Reentrant { operation },
             Self::Locked(path) => Error::Locked(path),
             Self::Closed => Error::Closed,
             Self::Background(message) => Error::Background(message),

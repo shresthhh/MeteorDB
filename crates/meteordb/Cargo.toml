@@ -10,6 +10,8 @@ blake3.workspace = true
 crc32c.workspace = true
 fs2.workspace = true
 libc.workspace = true
+postcard.workspace = true
+serde.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 

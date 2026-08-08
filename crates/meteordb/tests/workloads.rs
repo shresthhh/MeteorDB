@@ -125,6 +125,91 @@ fn inference_cache_ttl_expiry_is_a_miss_and_binary_payloads_round_trip() {
 }
 
 #[test]
+fn inference_cache_entry_uses_schema_byte_and_postcard_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let cache = InferenceCache::new(engine.clone(), b"format").unwrap();
+    let request = key(b"v1", b"postcard framing");
+    let entry = InferenceEntry::new([0, 0xff, 1, 0, 2]);
+
+    cache.put(&request, entry.clone(), None).unwrap();
+
+    let (raw_key, raw_entry) = raw_cache_entry(&engine);
+    assert!(raw_key.starts_with(b"\0meteordb:inference-cache\0"));
+    assert_eq!(raw_entry[0], 1);
+    assert_eq!(&raw_entry[1..], postcard::to_allocvec(&entry).unwrap());
+    assert_eq!(cache.get(&request).unwrap(), CacheLookup::Hit(entry),);
+}
+
+#[test]
+fn inference_cache_rejects_malformed_postcard_entry_as_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let cache = InferenceCache::new(engine.clone(), b"malformed").unwrap();
+    let request = key(b"v1", b"malformed postcard");
+    cache
+        .put(&request, InferenceEntry::new(b"value"), None)
+        .unwrap();
+    let (raw_key, _) = raw_cache_entry(&engine);
+
+    engine.put(raw_key, [1, 0x80]).unwrap();
+
+    assert!(matches!(
+        cache.get(&request),
+        Err(Error::Corruption {
+            context: "inference-cache entry",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn inference_cache_rejects_trailing_entry_bytes_as_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let cache = InferenceCache::new(engine.clone(), b"trailing").unwrap();
+    let request = key(b"v1", b"trailing bytes");
+    cache
+        .put(&request, InferenceEntry::new([0, 1, 0xff]), None)
+        .unwrap();
+    let (raw_key, mut raw_entry) = raw_cache_entry(&engine);
+    raw_entry.push(0);
+
+    engine.put(raw_key, raw_entry).unwrap();
+
+    assert!(matches!(
+        cache.get(&request),
+        Err(Error::Corruption {
+            context: "inference-cache entry",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn inference_cache_rejects_unknown_entry_schema() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(Options::new(dir.path())).unwrap();
+    let cache = InferenceCache::new(engine.clone(), b"schema").unwrap();
+    let request = key(b"v1", b"unknown schema");
+    cache
+        .put(&request, InferenceEntry::new(b"value"), None)
+        .unwrap();
+    let (raw_key, mut raw_entry) = raw_cache_entry(&engine);
+    raw_entry[0] = 2;
+
+    engine.put(raw_key, raw_entry).unwrap();
+
+    assert!(matches!(
+        cache.get(&request),
+        Err(Error::UnsupportedFormat {
+            kind: "inference-cache entry",
+            version: 2,
+        })
+    ));
+}
+
+#[test]
 fn inference_cache_batch_lookup_preserves_duplicates_and_request_order() {
     let dir = tempfile::tempdir().unwrap();
     let cache =
@@ -305,4 +390,66 @@ fn inference_cache_singleflight_shares_the_leader_error_with_followers() {
     }
     assert_eq!(computations.load(Ordering::SeqCst), 1);
     assert_eq!(cache.get(&request).unwrap(), CacheLookup::Miss);
+}
+
+#[test]
+fn inference_cache_reentrant_same_key_returns_a_structured_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = InferenceCache::new(
+        Engine::open(Options::new(dir.path())).unwrap(),
+        b"reentrant",
+    )
+    .unwrap();
+    let request = key(b"v1", b"same key");
+
+    let error = cache
+        .get_or_compute(&request, None, || {
+            cache.get_or_compute(&request, None, || Ok(InferenceEntry::new(b"nested")))
+        })
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        Error::Reentrant {
+            operation: "inference-cache get_or_compute",
+        }
+    ));
+    assert_eq!(cache.get(&request).unwrap(), CacheLookup::Miss);
+}
+
+#[test]
+fn inference_cache_allows_same_thread_computation_for_an_unrelated_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = InferenceCache::new(
+        Engine::open(Options::new(dir.path())).unwrap(),
+        b"nested-unrelated",
+    )
+    .unwrap();
+    let outer = key(b"v1", b"outer");
+    let inner = key(b"v1", b"inner");
+
+    let outer_entry = cache
+        .get_or_compute(&outer, None, || {
+            let inner_entry =
+                cache.get_or_compute(&inner, None, || Ok(InferenceEntry::new(b"inner value")))?;
+            assert_eq!(inner_entry, InferenceEntry::new(b"inner value"));
+            Ok(InferenceEntry::new(b"outer value"))
+        })
+        .unwrap();
+
+    assert_eq!(outer_entry, InferenceEntry::new(b"outer value"));
+    assert_eq!(
+        cache.get(&inner).unwrap(),
+        CacheLookup::Hit(InferenceEntry::new(b"inner value"))
+    );
+}
+
+fn raw_cache_entry(engine: &Engine) -> (Vec<u8>, Vec<u8>) {
+    let entries = engine
+        .scan_prefix(b"\0meteordb:inference-cache\0", 2)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    entries.into_iter().next().unwrap()
 }
