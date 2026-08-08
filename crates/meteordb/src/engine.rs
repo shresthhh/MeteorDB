@@ -36,6 +36,8 @@ struct EngineInner {
     snapshots: SnapshotRegistry,
     block_cache: Arc<BlockCache>,
     read_stats: Arc<ReadStats>,
+    #[cfg(test)]
+    snapshot_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct WriteState {
@@ -290,6 +292,8 @@ impl Engine {
                 snapshots: SnapshotRegistry::default(),
                 block_cache,
                 read_stats: Arc::new(ReadStats::default()),
+                #[cfg(test)]
+                snapshot_sequence_hook: Mutex::new(None),
             }),
         };
         engine.start_background_worker()?;
@@ -386,15 +390,25 @@ impl Engine {
 
     /// Captures a stable read view at the current committed sequence.
     pub fn snapshot(&self) -> Result<Snapshot> {
+        let state = self.lock_state();
+        ensure_readable(&state)?;
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .snapshot_sequence_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
         {
-            let state = self.lock_state();
-            ensure_readable(&state)?;
+            hook();
         }
+        let guard = self.inner.snapshots.acquire(sequence);
+        drop(state);
         Ok(Snapshot {
             engine: self.clone(),
             sequence,
-            _guard: self.inner.snapshots.acquire(sequence),
+            _guard: guard,
         })
     }
 
@@ -1320,6 +1334,92 @@ mod scan_setup_tests {
 
         assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
         assert_eq!(owned_entry_clone_count(), 0);
+    }
+
+    #[cfg(test)]
+    mod snapshot_registration_tests {
+        use super::*;
+        use std::sync::{Condvar, mpsc};
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct SnapshotGate {
+            state: Mutex<(bool, bool)>,
+            changed: Condvar,
+        }
+
+        impl SnapshotGate {
+            fn pause(&self) {
+                let mut state = self.state.lock().unwrap();
+                state.0 = true;
+                self.changed.notify_all();
+                while !state.1 {
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+
+            fn wait_until_paused(&self) {
+                let mut state = self.state.lock().unwrap();
+                while !state.0 {
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+
+            fn release(&self) {
+                let mut state = self.state.lock().unwrap();
+                state.1 = true;
+                self.changed.notify_all();
+            }
+        }
+
+        #[test]
+        fn snapshot_registers_its_sequence_before_a_writer_can_compact() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Engine::open(Options::new(dir.path())).unwrap();
+            db.put(b"history", b"old").unwrap();
+            db.flush().unwrap();
+            for index in 0..4 {
+                db.put(format!("key-{index}"), b"value").unwrap();
+                db.flush().unwrap();
+            }
+
+            let gate = Arc::new(SnapshotGate::default());
+            *db.inner
+                .snapshot_sequence_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+                let gate = gate.clone();
+                Arc::new(move || gate.pause())
+            });
+
+            let snapshot_db = db.clone();
+            let snapshot_thread = thread::spawn(move || snapshot_db.snapshot().unwrap());
+            gate.wait_until_paused();
+
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let writer_db = db.clone();
+            let writer_thread = thread::spawn(move || {
+                writer_db.put(b"history", b"new").unwrap();
+                writer_db.flush().unwrap();
+                assert!(writer_db.compact().unwrap());
+                finished_tx.send(()).unwrap();
+            });
+            let writer_finished_while_snapshot_was_paused =
+                finished_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
+            gate.release();
+            let snapshot = snapshot_thread.join().unwrap();
+            writer_thread.join().unwrap();
+
+            assert!(
+                !writer_finished_while_snapshot_was_paused,
+                "writes and compaction must wait until the captured sequence is registered"
+            );
+            assert_eq!(
+                snapshot.get(b"history").unwrap().as_deref(),
+                Some(&b"old"[..])
+            );
+        }
     }
 
     #[test]
