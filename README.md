@@ -88,8 +88,11 @@ flowchart LR
     Immutable --> Flush[Background flush]
     Flush --> SSTables[Level 0 SSTables]
     Flush --> Manifest[Manifest and CURRENT]
-    Engine --> Cache[Partitioned block cache]
-    Cache <--> SSTables
+    Engine --> Reader[TableReader]
+    Reader -->|checks| Cache[Partitioned block cache]
+    Cache -->|hit or miss| Reader
+    Reader -->|on miss: read checksummed block| SSTables
+    Reader -->|admit validated blocks| Cache
     Engine --> Manifest
 ```
 
