@@ -308,6 +308,21 @@ fn failed_manifest_file_sync_removes_unpublished_outputs_and_allows_retry() {
 }
 
 #[test]
+fn partial_atomic_install_removes_unpublished_destination_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(FailingCompactionFs::default());
+    let db = compaction_database(dir.path(), fs.clone());
+    let original_files = sstable_numbers(dir.path());
+    fs.fail_next_atomic_install_after_link();
+
+    assert!(db.compact().is_err());
+    assert_eq!(sstable_numbers(dir.path()), original_files);
+    assert!(temporary_sstable_numbers(dir.path()).is_empty());
+
+    assert!(db.compact().unwrap());
+}
+
+#[test]
 fn uncertain_manifest_sync_preserves_outputs_that_recovery_may_reference() {
     let dir = tempfile::tempdir().unwrap();
     let fs = Arc::new(FailingCompactionFs::default());
@@ -454,6 +469,7 @@ impl DurableFs for TrackingFs {
 struct FailingCompactionFs {
     inner: OsDurableFs,
     fail_temp_sync: Arc<AtomicBool>,
+    fail_atomic_install_after_link: AtomicBool,
     fail_manifest_sstable_sync: AtomicBool,
     fail_manifest_sync: Arc<AtomicBool>,
 }
@@ -465,6 +481,11 @@ impl FailingCompactionFs {
 
     fn fail_next_manifest_sstable_sync(&self) {
         self.fail_manifest_sstable_sync
+            .store(true, Ordering::Release);
+    }
+
+    fn fail_next_atomic_install_after_link(&self) {
+        self.fail_atomic_install_after_link
             .store(true, Ordering::Release);
     }
 
@@ -545,6 +566,15 @@ impl DurableFs for FailingCompactionFs {
     }
 
     fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        if self
+            .fail_atomic_install_after_link
+            .swap(false, Ordering::AcqRel)
+        {
+            std::fs::hard_link(source, destination)?;
+            return Err(std::io::Error::other(
+                "injected temporary removal failure after destination creation",
+            ));
+        }
         self.inner.atomic_install(source, destination)
     }
 

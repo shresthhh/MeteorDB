@@ -386,11 +386,12 @@ fn finish_output(
     let temporary = context
         .directory
         .join(format!("{:06}.sst.tmp", built.file_number));
+    // Installation may create the destination before failing to remove the temporary link.
+    cleanup.track_destination(built.file_number);
     context
         .fs
         .atomic_install(&temporary, &output.final_path)
         .map_err(|source| io_error("install compacted SSTable", &output.final_path, source))?;
-    cleanup.track_installed(built.file_number);
     context
         .fs
         .sync_directory(context.directory)
@@ -431,7 +432,7 @@ impl CompactionCleanup {
             .push(self.directory.join(format!("{number:06}.sst.tmp")));
     }
 
-    fn track_installed(&mut self, number: u64) {
+    fn track_destination(&mut self, number: u64) {
         self.paths
             .push(self.directory.join(format!("{number:06}.sst")));
     }

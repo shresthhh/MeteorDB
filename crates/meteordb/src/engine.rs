@@ -38,6 +38,8 @@ struct EngineInner {
     read_stats: Arc<ReadStats>,
     #[cfg(test)]
     snapshot_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    implicit_read_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct WriteState {
@@ -294,6 +296,8 @@ impl Engine {
                 read_stats: Arc::new(ReadStats::default()),
                 #[cfg(test)]
                 snapshot_sequence_hook: Mutex::new(None),
+                #[cfg(test)]
+                implicit_read_sequence_hook: Mutex::new(None),
             }),
         };
         engine.start_background_worker()?;
@@ -358,16 +362,28 @@ impl Engine {
 
     /// Returns the current value for `key`, or `None` for absence or deletion.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        let key = key.as_ref();
+        validate_length(
+            "key",
+            key.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
+        let read_time_unix_ms = SystemClock.now_unix_ms();
+        self.inner.read_stats.record_point_read();
+        let state = self.lock_state();
+        ensure_readable(&state)?;
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
-        self.get_at(key.as_ref(), sequence)
+        self.run_implicit_read_sequence_hook();
+        let _guard = self.inner.snapshots.acquire(sequence);
+        self.get_from_state(key, sequence, read_time_unix_ms, state)
     }
 
     /// Scans visible keys in ascending byte order within `bounds`.
     ///
     /// `limit` counts emitted live keys, not hidden versions or tombstones.
     pub fn scan(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
-        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
-        self.scan_at(bounds, limit, sequence)
+        self.scan_current(bounds, limit)
     }
 
     /// Scans visible keys beginning with `prefix` in ascending byte order.
@@ -379,8 +395,7 @@ impl Engine {
             "max_key_bytes",
             self.inner.options.max_key_bytes,
         )?;
-        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
-        self.scan_at(prefix_bounds(prefix), limit, sequence)
+        self.scan_current(prefix_bounds(prefix), limit)
     }
 
     /// Captures structured read-path and block-cache statistics.
@@ -571,18 +586,43 @@ impl Engine {
         Ok(())
     }
 
-    fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
-        if key.len() > self.inner.options.max_key_bytes {
-            return Err(Error::InvalidArgument(format!(
-                "key length {} exceeds max_key_bytes {}",
-                key.len(),
-                self.inner.options.max_key_bytes
-            )));
+    #[cfg(test)]
+    fn run_implicit_read_sequence_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .implicit_read_sequence_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
         }
+    }
+
+    #[cfg(not(test))]
+    fn run_implicit_read_sequence_hook(&self) {}
+
+    fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
+        validate_length(
+            "key",
+            key.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
         let read_time_unix_ms = SystemClock.now_unix_ms();
         self.inner.read_stats.record_point_read();
         let state = self.lock_state();
         ensure_readable(&state)?;
+        self.get_from_state(key, sequence, read_time_unix_ms, state)
+    }
+
+    fn get_from_state(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+        state: MutexGuard<'_, WriteState>,
+    ) -> Result<Option<Vec<u8>>> {
         if let Some((_, record)) = state
             .mutable
             .table
@@ -624,6 +664,21 @@ impl Engine {
         Ok(None)
     }
 
+    fn scan_current(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        validate_scan_bounds(&self.inner.options, &bounds)?;
+        let read_time_unix_ms = SystemClock.now_unix_ms();
+        if limit == 0 {
+            let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+            return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
+        }
+        let state = self.lock_state();
+        ensure_readable(&state)?;
+        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        self.run_implicit_read_sequence_hook();
+        let guard = self.inner.snapshots.acquire(sequence);
+        self.scan_from_state(bounds, limit, sequence, read_time_unix_ms, state, guard)
+    }
+
     fn scan_at(
         &self,
         bounds: ScanBounds,
@@ -635,16 +690,28 @@ impl Engine {
         if limit == 0 {
             return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
         }
-        let (mut children, version) = {
-            let state = self.lock_state();
-            ensure_readable(&state)?;
-            let mut children = Vec::with_capacity(1 + state.immutables.len());
-            push_memtable_child(&mut children, &state.mutable.table, &bounds);
-            for immutable in state.immutables.iter().rev() {
-                push_memtable_child(&mut children, &immutable.table, &bounds);
-            }
-            (children, state.versions.current())
-        };
+        let state = self.lock_state();
+        ensure_readable(&state)?;
+        let guard = self.inner.snapshots.acquire(sequence);
+        self.scan_from_state(bounds, limit, sequence, read_time_unix_ms, state, guard)
+    }
+
+    fn scan_from_state(
+        &self,
+        bounds: ScanBounds,
+        limit: usize,
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+        state: MutexGuard<'_, WriteState>,
+        guard: SnapshotGuard,
+    ) -> Result<KvIterator> {
+        let mut children = Vec::with_capacity(1 + state.immutables.len());
+        push_memtable_child(&mut children, &state.mutable.table, &bounds);
+        for immutable in state.immutables.iter().rev() {
+            push_memtable_child(&mut children, &immutable.table, &bounds);
+        }
+        let version = state.versions.current();
+        drop(state);
 
         for level in 0..crate::NUM_LEVELS {
             for file in version.files(level).iter().filter(|file| {
@@ -680,7 +747,7 @@ impl Engine {
             read_time_unix_ms,
             limit,
             version,
-            self.inner.snapshots.acquire(sequence),
+            guard,
         ))
     }
 
@@ -1425,6 +1492,95 @@ mod scan_setup_tests {
                 snapshot.get(b"history").unwrap().as_deref(),
                 Some(&b"old"[..])
             );
+        }
+
+        #[derive(Clone, Copy)]
+        enum ImplicitRead {
+            Get,
+            Scan,
+            ScanPrefix,
+        }
+
+        fn assert_implicit_read_captures_sequence_atomically(read: ImplicitRead) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Engine::open(Options::new(dir.path())).unwrap();
+            db.put(b"history", b"old").unwrap();
+            db.flush().unwrap();
+            for index in 0..4 {
+                db.put(format!("key-{index}"), b"value").unwrap();
+                db.flush().unwrap();
+            }
+
+            let gate = Arc::new(SnapshotGate::default());
+            *db.inner
+                .implicit_read_sequence_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+                let gate = gate.clone();
+                Arc::new(move || gate.pause())
+            });
+
+            let reader_db = db.clone();
+            let reader_thread = thread::spawn(move || match read {
+                ImplicitRead::Get => reader_db
+                    .get(b"history")
+                    .unwrap()
+                    .map(|value| vec![(b"history".to_vec(), value)])
+                    .unwrap_or_default(),
+                ImplicitRead::Scan => reader_db
+                    .scan(ScanBounds::all(), usize::MAX)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+                ImplicitRead::ScanPrefix => reader_db
+                    .scan_prefix(b"hist", usize::MAX)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+            });
+            gate.wait_until_paused();
+
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let writer_db = db.clone();
+            let writer_thread = thread::spawn(move || {
+                writer_db.put(b"history", b"new").unwrap();
+                writer_db.flush().unwrap();
+                assert!(writer_db.compact().unwrap());
+                finished_tx.send(()).unwrap();
+            });
+            let writer_finished_while_read_was_paused =
+                finished_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
+            gate.release();
+            let entries = reader_thread.join().unwrap();
+            writer_thread.join().unwrap();
+
+            assert!(
+                !writer_finished_while_read_was_paused,
+                "writes and compaction must wait until an implicit read protects its sequence"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == b"history")
+                    .map(|(_, value)| value.as_slice()),
+                Some(&b"old"[..])
+            );
+        }
+
+        #[test]
+        fn get_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::Get);
+        }
+
+        #[test]
+        fn scan_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::Scan);
+        }
+
+        #[test]
+        fn scan_prefix_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::ScanPrefix);
         }
     }
 
