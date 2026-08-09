@@ -1,0 +1,155 @@
+{
+  "schema_version": 1,
+  "name": "smoke-v1",
+  "seed": 5567949170973754434,
+  "dataset": {
+    "key_count": 100,
+    "key_bytes": 32,
+    "cache_value_bytes": 1024,
+    "embedding_value_bytes": 6144,
+    "absent_key_count": 25
+  },
+  "engine": {
+    "durability": "sync",
+    "compression": "none",
+    "cache_bytes": 8388608,
+    "threads": 1,
+    "write_buffer_bytes": 4194304,
+    "target_file_bytes": 4194304
+  },
+  "measurement": {
+    "warmup_operations": 50,
+    "measured_operations": 200,
+    "sample_interval_operations": 1
+  },
+  "workloads": [
+    {
+      "name": "point-read-write",
+      "kind": "point_read_write",
+      "distribution": {
+        "kind": "uniform"
+      },
+      "operation_mix": {
+        "reads": 70,
+        "writes": 20,
+        "deletes": 5,
+        "scans": 5
+      },
+      "batch_size": 8,
+      "prefix_bytes": 4,
+      "scan_length": 16,
+      "ttl_every_writes": 0,
+      "ttl_ms": 0
+    },
+    {
+      "name": "inference-cache",
+      "kind": "inference_cache",
+      "distribution": {
+        "kind": "zipfian",
+        "theta": 0.99
+      },
+      "operation_mix": {
+        "reads": 90,
+        "writes": 10,
+        "deletes": 0,
+        "scans": 0
+      },
+      "batch_size": 8,
+      "prefix_bytes": 4,
+      "scan_length": 0,
+      "ttl_every_writes": 10,
+      "ttl_ms": 60000
+    },
+    {
+      "name": "feature-store",
+      "kind": "feature_store",
+      "distribution": {
+        "kind": "zipfian",
+        "theta": 0.9
+      },
+      "operation_mix": {
+        "reads": 75,
+        "writes": 20,
+        "deletes": 0,
+        "scans": 5
+      },
+      "batch_size": 16,
+      "prefix_bytes": 8,
+      "scan_length": 20,
+      "ttl_every_writes": 20,
+      "ttl_ms": 300000
+    },
+    {
+      "name": "embedding-storage",
+      "kind": "embedding_storage",
+      "distribution": {
+        "kind": "uniform"
+      },
+      "operation_mix": {
+        "reads": 50,
+        "writes": 50,
+        "deletes": 0,
+        "scans": 0
+      },
+      "batch_size": 8,
+      "prefix_bytes": 4,
+      "scan_length": 0,
+      "ttl_every_writes": 0,
+      "ttl_ms": 0
+    },
+    {
+      "name": "prefix-scan",
+      "kind": "prefix_scan",
+      "distribution": {
+        "kind": "uniform"
+      },
+      "operation_mix": {
+        "reads": 0,
+        "writes": 0,
+        "deletes": 0,
+        "scans": 100
+      },
+      "batch_size": 1,
+      "prefix_bytes": 2,
+      "scan_length": 20,
+      "ttl_every_writes": 0,
+      "ttl_ms": 0
+    },
+    {
+      "name": "range-scan",
+      "kind": "range_scan",
+      "distribution": {
+        "kind": "uniform"
+      },
+      "operation_mix": {
+        "reads": 0,
+        "writes": 0,
+        "deletes": 0,
+        "scans": 100
+      },
+      "batch_size": 1,
+      "prefix_bytes": 0,
+      "scan_length": 20,
+      "ttl_every_writes": 0,
+      "ttl_ms": 0
+    },
+    {
+      "name": "compaction",
+      "kind": "compaction",
+      "distribution": {
+        "kind": "uniform"
+      },
+      "operation_mix": {
+        "reads": 0,
+        "writes": 100,
+        "deletes": 0,
+        "scans": 0
+      },
+      "batch_size": 16,
+      "prefix_bytes": 0,
+      "scan_length": 0,
+      "ttl_every_writes": 0,
+      "ttl_ms": 0
+    }
+  ]
+}

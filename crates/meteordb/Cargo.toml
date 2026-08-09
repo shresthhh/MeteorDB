@@ -16,6 +16,16 @@ snap.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion = "0.5.1"
+meteordb-bench-support = { path = "../meteordb-bench-support" }
 proptest = "1.7.0"
 serde_json.workspace = true
 tempfile = "3.20.0"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "workloads"
+harness = false

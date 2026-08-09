@@ -1,0 +1,27 @@
+[package]
+name = "meteordb-rocks-bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "meteordb-rocks-bench"
+path = "src/main.rs"
+
+[features]
+default = []
+rocksdb-engine = ["dep:rocksdb"]
+
+[dependencies]
+clap = { version = "4.5.48", features = ["derive"] }
+libc.workspace = true
+meteordb = { path = "../meteordb" }
+meteordb-bench-support = { path = "../meteordb-bench-support" }
+rocksdb = { version = "0.24.0", default-features = false, features = ["bindgen-runtime", "snappy"], optional = true }
+serde_json.workspace = true
+tempfile = "3.20.0"
+
+[dev-dependencies]
+assert_cmd = "2.0.17"
+predicates = "3.1.3"
