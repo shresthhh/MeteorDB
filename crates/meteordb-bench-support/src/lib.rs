@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
+use std::time::Instant;
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -541,6 +542,42 @@ impl ComponentBenchmarkReport {
             amplification,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CounterSnapshot {
+    pub point_reads: u64,
+    pub sstable_probes: u64,
+}
+
+pub fn read_amplification_delta(before: CounterSnapshot, after: CounterSnapshot) -> Option<f64> {
+    let point_reads = after.point_reads.saturating_sub(before.point_reads);
+    let sstable_probes = after.sstable_probes.saturating_sub(before.sstable_probes);
+    (point_reads > 0).then(|| sstable_probes as f64 / point_reads as f64)
+}
+
+pub fn measure_prepared_samples<S, O>(
+    sample_count: usize,
+    mut prepare: impl FnMut() -> S,
+    mut operation: impl FnMut(S) -> O,
+    mut verify: impl FnMut(&O) -> bool,
+) -> Result<Vec<u64>, BenchError> {
+    require_positive("sample_count", sample_count)?;
+    let mut latencies = Vec::with_capacity(sample_count);
+    for sample_index in 0..sample_count {
+        let state = prepare();
+        let started = Instant::now();
+        let outcome = operation(state);
+        let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if !verify(&outcome) {
+            return Err(BenchError::Invalid(format!(
+                "sample {} performed no work",
+                sample_index + 1
+            )));
+        }
+        latencies.push(elapsed);
+    }
+    Ok(latencies)
 }
 
 pub fn write_component_report(

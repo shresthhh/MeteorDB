@@ -196,3 +196,53 @@ The RocksDB native compile/smoke remains unmeasured on this host because the
 listed prerequisites are absent. The exact-command contract has a hermetic
 test that supplies a deterministic missing-prerequisite checker, so it does
 not link RocksDB.
+
+## Measurement-validity follow-up
+
+- Flush and compaction Criterion iterations and 32-sample sidecar probes now
+  prepare a fresh deterministic dirty/overfull database before every timed
+  operation. Flush verifies an SSTable-count transition and compaction requires
+  `Engine::compact()` to return `true`; a no-op sample fails immediately.
+  Setup and post-operation verification/database sizing are outside the
+  sidecar latency interval.
+- Component read amplification now uses coherent stats snapshots immediately
+  before and after each reporting probe. The comparison runner similarly
+  subtracts each workload's post-warm-up snapshot from its final snapshot and
+  saturatingly aggregates only measured-operation deltas. Write-only, scan,
+  maintenance, and recovery probes report read amplification as unavailable
+  rather than inheriting reads from previous groups.
+- `measure_prepared_samples` tests prove every sample receives fresh setup and
+  rejects a simulated no-op. `read_amplification_delta` tests prove unrelated
+  prior reads leave a write-only probe at `None` and counter regression
+  saturates safely.
+
+Red/green evidence:
+
+```text
+cargo test -p meteordb-bench-support --test fixtures prepared_latency_probe -- --nocapture
+  RED: unresolved CounterSnapshot, measure_prepared_samples, and
+       read_amplification_delta imports
+cargo test -p meteordb-bench-support --test fixtures
+  GREEN: 16 passed
+```
+
+Final evidence:
+
+```text
+cargo test -p meteordb-rocks-bench --test cli
+  6 passed
+cargo bench -p meteordb --bench engine -- --test
+  passed; flush and compaction emitted 32-sample p95/p99 sidecars and every
+  sample passed its real-work transition check
+cargo bench -p meteordb --bench workloads -- --test
+  passed; 6 workload sidecars emitted
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo bench --no-run
+  passed
+cargo run -q -p meteordb-rocks-bench -- --engine meteordb --smoke
+  passed; schema 1, 7 workloads, ordered latency percentiles
+git diff --check
+  passed
+```

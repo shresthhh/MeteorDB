@@ -61,6 +61,10 @@ timing, emits its versioned JSON on stdout, and writes the same sidecar under
 nearest-rank p50/p95/p99, recursive database bytes, and available
 read/write/space amplification counters with explicit `null` values and notes
 when the engine does not expose a relevant physical counter.
+Flush and compaction prepare a fresh dirty or compactable database before
+every reporting sample, outside its timed interval, and reject any sample that
+does no work. Counter-based amplification uses coherent before/after snapshots
+for that reporting probe rather than process-lifetime totals.
 
 Criterion's own estimate format is distinct from both these component
 sidecars and the comparison JSON. The comparison runner records nearest-rank
@@ -118,7 +122,8 @@ explicit equivalence/non-equivalence notes.
 
 Database bytes include every per-workload database and the separate recovery
 fixture. Peak RSS is process high-water RSS, not isolated cache memory.
-MeteorDB read amplification is SSTable probes divided by point reads.
+MeteorDB read amplification is the measured-interval delta in SSTable probes
+divided by the measured-interval delta in point reads.
 Equivalent portable physical-byte and live-data counters are unavailable, so
 write/space amplification are `null`; RocksDB's read amplification is also
 `null`. The accompanying notes are part of the result and must not be dropped.

@@ -9,9 +9,9 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use meteordb::{Durability, Engine, Options, ScanBounds, WriteBatch as MeteorWriteBatch};
 use meteordb_bench_support::{
-    Amplification, ComparisonResult, CompressionConfig, Dataset, DurabilityConfig, LatencySummary,
-    WorkloadFile, WorkloadKind, WorkloadResult, WorkloadSpec, capture_environment,
-    compression_equivalence, smoke_workload,
+    Amplification, ComparisonResult, CompressionConfig, CounterSnapshot, Dataset, DurabilityConfig,
+    LatencySummary, WorkloadFile, WorkloadKind, WorkloadResult, WorkloadSpec, capture_environment,
+    compression_equivalence, read_amplification_delta, smoke_workload,
 };
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
@@ -80,7 +80,7 @@ trait KvEngine {
     fn scan_range(&self, start: &[u8], end: &[u8], limit: usize) -> BenchResult<usize>;
     fn flush(&self) -> BenchResult<()>;
     fn compact(&self) -> BenchResult<()>;
-    fn read_stats(&self) -> Option<(u64, u64)>;
+    fn read_stats(&self) -> Option<CounterSnapshot>;
     fn close(&self) -> BenchResult<()>;
 }
 
@@ -145,9 +145,12 @@ impl KvEngine for MeteorEngine {
         Ok(())
     }
 
-    fn read_stats(&self) -> Option<(u64, u64)> {
+    fn read_stats(&self) -> Option<CounterSnapshot> {
         let stats = self.inner.stats();
-        Some((stats.sstable_probes, stats.point_reads))
+        Some(CounterSnapshot {
+            point_reads: stats.point_reads,
+            sstable_probes: stats.sstable_probes,
+        })
     }
 
     fn close(&self) -> BenchResult<()> {
@@ -213,7 +216,7 @@ fn run_meteordb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Compari
             write: None,
             space: None,
             notes: vec![
-                "read is measured SSTable probes per point read".into(),
+                "read is measured-interval SSTable-probe deltas per point-read delta; warm-up and fixture setup are excluded".into(),
                 "physical bytes-written and live-data counters are unavailable; write and space amplification are null".into(),
             ],
         },
@@ -239,10 +242,12 @@ where
         fs::create_dir(&path)?;
         let engine = factory(&path)?;
         seed_engine(engine.as_ref(), dataset, spec)?;
-        let result = execute_workload(engine.as_ref(), dataset, spec, workload)?;
-        if let Some((engine_probes, engine_reads)) = engine.read_stats() {
-            probes = probes.saturating_add(engine_probes);
-            point_reads = point_reads.saturating_add(engine_reads);
+        let (result, before, after) = execute_workload(engine.as_ref(), dataset, spec, workload)?;
+        if let (Some(before), Some(after)) = (before, after) {
+            probes =
+                probes.saturating_add(after.sstable_probes.saturating_sub(before.sstable_probes));
+            point_reads =
+                point_reads.saturating_add(after.point_reads.saturating_sub(before.point_reads));
         }
         engine.close()?;
         results.push(result);
@@ -269,7 +274,16 @@ where
         results,
         recovery_time_ns,
         database_bytes: directory_bytes(root)?,
-        read_amplification: (point_reads > 0).then(|| probes as f64 / point_reads as f64),
+        read_amplification: read_amplification_delta(
+            CounterSnapshot {
+                point_reads: 0,
+                sstable_probes: 0,
+            },
+            CounterSnapshot {
+                point_reads,
+                sstable_probes: probes,
+            },
+        ),
     })
 }
 
@@ -295,15 +309,25 @@ fn execute_workload(
     dataset: &Dataset,
     spec: &WorkloadSpec,
     workload: &WorkloadFile,
-) -> BenchResult<WorkloadResult> {
+) -> BenchResult<(
+    WorkloadResult,
+    Option<CounterSnapshot>,
+    Option<CounterSnapshot>,
+)> {
     let total = workload.measurement.warmup_operations + workload.measurement.measured_operations;
     let indices = dataset.sample_indices(total, spec.distribution.clone())?;
     let mut writes = 0_usize;
     let mut latencies = Vec::new();
     let mut measured_elapsed_ns = 0_u64;
+    let mut before_measurement = (workload.measurement.warmup_operations == 0)
+        .then(|| engine.read_stats())
+        .flatten();
 
     for (operation, &key_index) in indices.iter().enumerate() {
         let measured = operation >= workload.measurement.warmup_operations;
+        if operation == workload.measurement.warmup_operations {
+            before_measurement = engine.read_stats();
+        }
         let started = Instant::now();
         execute_operation(engine, dataset, spec, operation, key_index, &mut writes)?;
         let elapsed = nanos(started.elapsed());
@@ -322,13 +346,18 @@ fn execute_workload(
     } else {
         operations as f64 * 1_000_000_000.0 / measured_elapsed_ns as f64
     };
-    Ok(WorkloadResult {
-        name: spec.name.clone(),
-        operations,
-        elapsed_ns: measured_elapsed_ns,
-        throughput_ops_per_second: throughput,
-        latency: LatencySummary::from_nanos(&latencies)?,
-    })
+    let after_measurement = engine.read_stats();
+    Ok((
+        WorkloadResult {
+            name: spec.name.clone(),
+            operations,
+            elapsed_ns: measured_elapsed_ns,
+            throughput_ops_per_second: throughput,
+            latency: LatencySummary::from_nanos(&latencies)?,
+        },
+        before_measurement,
+        after_measurement,
+    ))
 }
 
 fn execute_operation(
@@ -620,7 +649,7 @@ mod rocks {
             Ok(())
         }
 
-        fn read_stats(&self) -> Option<(u64, u64)> {
+        fn read_stats(&self) -> Option<CounterSnapshot> {
             None
         }
 

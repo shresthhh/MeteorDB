@@ -6,10 +6,12 @@ use std::time::{Duration, Instant};
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use meteordb::{Durability, Engine, Options, ScanBounds, WriteBatch};
 use meteordb_bench_support::{
-    Amplification, ComponentBenchmarkReport, Dataset, directory_bytes, smoke_workload,
-    write_component_report,
+    Amplification, ComponentBenchmarkReport, CounterSnapshot, Dataset, directory_bytes,
+    measure_prepared_samples, read_amplification_delta, smoke_workload, write_component_report,
 };
 use tempfile::TempDir;
+
+const REPORT_SAMPLES: usize = 32;
 
 fn criterion_config() -> Criterion {
     Criterion::default()
@@ -55,37 +57,111 @@ fn populated_engine() -> (TempDir, Engine, Dataset) {
 }
 
 fn report_component(path: &Path, engine: &Engine, benchmark: &str, mut operation: impl FnMut()) {
-    let mut latencies = Vec::with_capacity(32);
-    for _ in 0..32 {
+    let before = engine.stats();
+    let mut latencies = Vec::with_capacity(REPORT_SAMPLES);
+    for _ in 0..REPORT_SAMPLES {
         let started = Instant::now();
         operation();
         latencies.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
     }
-    let stats = engine.stats();
+    let after = engine.stats();
+    let read = read_amplification_delta(
+        CounterSnapshot {
+            point_reads: before.point_reads,
+            sstable_probes: before.sstable_probes,
+        },
+        CounterSnapshot {
+            point_reads: after.point_reads,
+            sstable_probes: after.sstable_probes,
+        },
+    );
+    let mut notes = vec![
+        "read is measured SSTable probes per point read within this reporting probe".into(),
+        "physical bytes-written and live-data counters are unavailable".into(),
+    ];
+    if read.is_none() {
+        notes.push("the reporting probe performed no point reads; read is unavailable".into());
+    }
     let report = ComponentBenchmarkReport::new(
         "engine",
         benchmark,
         &latencies,
         directory_bytes(path).expect("measure benchmark database"),
         Amplification {
-            read: Some(stats.read_amplification()),
+            read,
             write: None,
             space: None,
-            notes: vec![
-                "read is measured SSTable probes per point read".into(),
-                "physical bytes-written and live-data counters are unavailable".into(),
-            ],
+            notes,
         },
     )
     .expect("build component report");
+    emit_report(benchmark, &report);
+}
+
+fn emit_report(benchmark: &str, report: &ComponentBenchmarkReport) {
     let output = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/criterion/meteordb-sidecars/engine")
         .join(format!("{}.json", benchmark.replace('/', "-")));
-    write_component_report(&output, &report).expect("write component report");
+    write_component_report(&output, report).expect("write component report");
     println!(
         "meteordb-component-report {}",
-        serde_json::to_string(&report).expect("serialize component report")
+        serde_json::to_string(report).expect("serialize component report")
     );
+}
+
+fn sstable_count(path: &Path) -> usize {
+    std::fs::read_dir(path)
+        .expect("read benchmark database")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "sst")
+        })
+        .count()
+}
+
+fn prepare_flush_sample(dataset: &Dataset) -> (TempDir, Engine, usize) {
+    let directory = benchmark_tempdir();
+    let engine = Engine::open(options(directory.path())).expect("open benchmark database");
+    for index in 0..32 {
+        engine
+            .put(&dataset.keys[index], &dataset.cache_values[index])
+            .expect("prepare flush");
+    }
+    let before = sstable_count(directory.path());
+    (directory, engine, before)
+}
+
+fn run_flush_sample(sample: (TempDir, Engine, usize)) -> (TempDir, Engine, usize) {
+    let (directory, engine, before) = sample;
+    engine.flush().expect("flush");
+    (directory, engine, before)
+}
+
+fn flush_sample_did_work(sample: &(TempDir, Engine, usize)) -> bool {
+    sstable_count(sample.0.path()) > sample.2
+}
+
+fn prepare_compaction_sample(dataset: &Dataset) -> (TempDir, Engine) {
+    let directory = benchmark_tempdir();
+    let mut opts = options(directory.path());
+    opts.memtable_bytes = 8 * 1024;
+    opts.target_sstable_bytes = 8 * 1024;
+    let engine = Engine::open(opts).expect("open benchmark database");
+    for round in 0..6 {
+        for index in 0..32 {
+            engine
+                .put(
+                    &dataset.keys[index],
+                    &dataset.cache_values[(index + round) % 100],
+                )
+                .expect("prepare compaction");
+        }
+        engine.flush().expect("prepare compaction flush");
+    }
+    (directory, engine)
 }
 
 fn point_operations(c: &mut Criterion) {
@@ -222,50 +298,30 @@ fn scans(c: &mut Criterion) {
 }
 
 fn maintenance(c: &mut Criterion) {
+    let dataset = Dataset::generate(&smoke_workload()).expect("valid benchmark fixture");
     c.bench_function("engine/flush", |b| {
         b.iter_batched(
-            || {
-                let directory = benchmark_tempdir();
-                let engine =
-                    Engine::open(options(directory.path())).expect("open benchmark database");
-                let dataset =
-                    Dataset::generate(&smoke_workload()).expect("valid benchmark fixture");
-                for index in 0..32 {
-                    engine
-                        .put(&dataset.keys[index], &dataset.cache_values[index])
-                        .expect("prepare flush");
-                }
-                (directory, engine)
+            || prepare_flush_sample(&dataset),
+            |sample| {
+                let sample = run_flush_sample(sample);
+                assert!(
+                    flush_sample_did_work(&sample),
+                    "flush benchmark sample performed no work"
+                );
             },
-            |(_directory, engine)| engine.flush().expect("flush"),
             BatchSize::LargeInput,
         )
     });
 
     c.bench_function("engine/compaction", |b| {
         b.iter_batched(
-            || {
-                let directory = benchmark_tempdir();
-                let mut opts = options(directory.path());
-                opts.memtable_bytes = 8 * 1024;
-                opts.target_sstable_bytes = 8 * 1024;
-                let engine = Engine::open(opts).expect("open benchmark database");
-                let dataset =
-                    Dataset::generate(&smoke_workload()).expect("valid benchmark fixture");
-                for round in 0..6 {
-                    for index in 0..32 {
-                        engine
-                            .put(
-                                &dataset.keys[index],
-                                &dataset.cache_values[(index + round) % 100],
-                            )
-                            .expect("prepare compaction");
-                    }
-                    engine.flush().expect("prepare compaction flush");
-                }
-                (directory, engine)
+            || prepare_compaction_sample(&dataset),
+            |(_directory, engine)| {
+                assert!(
+                    black_box(engine.compact().expect("compact")),
+                    "compaction benchmark sample performed no work"
+                );
             },
-            |(_directory, engine)| black_box(engine.compact().expect("compact")),
             BatchSize::LargeInput,
         )
     });
@@ -286,51 +342,70 @@ fn maintenance(c: &mut Criterion) {
         )
     });
 
-    let flush_directory = benchmark_tempdir();
-    let flush_engine =
-        Engine::open(options(flush_directory.path())).expect("open flush report database");
-    let flush_dataset = Dataset::generate(&smoke_workload()).expect("valid benchmark fixture");
-    for index in 0..32 {
-        flush_engine
-            .put(
-                &flush_dataset.keys[index],
-                &flush_dataset.cache_values[index],
-            )
-            .expect("prepare flush report");
-    }
-    report_component(
-        flush_directory.path(),
-        &flush_engine,
-        "maintenance/flush",
-        || flush_engine.flush().expect("flush report"),
-    );
-
-    let compaction_directory = benchmark_tempdir();
-    let mut opts = options(compaction_directory.path());
-    opts.memtable_bytes = 8 * 1024;
-    opts.target_sstable_bytes = 8 * 1024;
-    let compaction_engine = Engine::open(opts).expect("open compaction report database");
-    for round in 0..6 {
-        for index in 0..32 {
-            compaction_engine
-                .put(
-                    &flush_dataset.keys[index],
-                    &flush_dataset.cache_values[(index + round) % 100],
-                )
-                .expect("prepare compaction report");
-        }
-        compaction_engine
-            .flush()
-            .expect("prepare compaction report");
-    }
-    report_component(
-        compaction_directory.path(),
-        &compaction_engine,
-        "maintenance/compaction",
-        || {
-            black_box(compaction_engine.compact().expect("compact report"));
+    let mut flush_database_bytes = 0;
+    let flush_latencies = measure_prepared_samples(
+        REPORT_SAMPLES,
+        || prepare_flush_sample(&dataset),
+        run_flush_sample,
+        |sample| {
+            flush_database_bytes =
+                directory_bytes(sample.0.path()).expect("measure flush report database");
+            flush_sample_did_work(sample)
         },
-    );
+    )
+    .expect("every flush reporting sample must perform work");
+    let flush_report = ComponentBenchmarkReport::new(
+        "engine",
+        "maintenance/flush",
+        &flush_latencies,
+        flush_database_bytes,
+        Amplification {
+            read: None,
+            write: None,
+            space: None,
+            notes: vec![
+                "every sample flushes a fresh dirty memtable prepared outside the timed interval"
+                    .into(),
+                "physical bytes-written and live-data counters are unavailable".into(),
+            ],
+        },
+    )
+    .expect("build flush report");
+    emit_report("maintenance/flush", &flush_report);
+
+    let mut compaction_database_bytes = 0;
+    let compaction_latencies = measure_prepared_samples(
+        REPORT_SAMPLES,
+        || prepare_compaction_sample(&dataset),
+        |(directory, engine)| {
+            let did_work = black_box(engine.compact().expect("compact report"));
+            (directory, did_work)
+        },
+        |(directory, did_work)| {
+            compaction_database_bytes =
+                directory_bytes(directory.path()).expect("measure compaction report database");
+            *did_work
+        },
+    )
+    .expect("every compaction reporting sample must perform work");
+    let compaction_report = ComponentBenchmarkReport::new(
+        "engine",
+        "maintenance/compaction",
+        &compaction_latencies,
+        compaction_database_bytes,
+        Amplification {
+            read: None,
+            write: None,
+            space: None,
+            notes: vec![
+                "every sample compacts a fresh overfull level prepared outside the timed interval"
+                    .into(),
+                "physical bytes-written and live-data counters are unavailable".into(),
+            ],
+        },
+    )
+    .expect("build compaction report");
+    emit_report("maintenance/compaction", &compaction_report);
 
     let (recovery_directory, recovery_engine, _dataset) = populated_engine();
     recovery_engine
@@ -341,16 +416,20 @@ fn maintenance(c: &mut Criterion) {
     let started = Instant::now();
     let recovered = Engine::open(options(&recovery_path)).expect("recover report database");
     let recovery_latency = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    recovered.close().expect("close recovery report database");
     let report = ComponentBenchmarkReport::new(
         "engine",
         "maintenance/recovery",
         &[recovery_latency],
         directory_bytes(&recovery_path).expect("measure recovery database"),
         Amplification {
-            read: Some(recovered.stats().read_amplification()),
+            read: None,
             write: None,
             space: None,
-            notes: vec!["recovery has no portable write/space amplification counters".into()],
+            notes: vec![
+                "the recovery probe performs no point reads; read is unavailable".into(),
+                "recovery has no portable write/space amplification counters".into(),
+            ],
         },
     )
     .expect("build recovery report");

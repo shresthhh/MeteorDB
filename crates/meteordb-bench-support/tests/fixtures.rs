@@ -1,7 +1,8 @@
 use meteordb_bench_support::{
-    AccessDistribution, Amplification, CACHE_VALUE_BYTES, ComponentBenchmarkReport, Dataset,
-    EMBEDDING_VALUE_BYTES, LatencySummary, WorkloadFile, WorkloadKind, capture_environment,
-    compression_equivalence, smoke_workload,
+    AccessDistribution, Amplification, CACHE_VALUE_BYTES, ComponentBenchmarkReport,
+    CounterSnapshot, Dataset, EMBEDDING_VALUE_BYTES, LatencySummary, WorkloadFile, WorkloadKind,
+    capture_environment, compression_equivalence, measure_prepared_samples,
+    read_amplification_delta, smoke_workload,
 };
 
 #[test]
@@ -205,4 +206,83 @@ fn component_report_schema_has_tail_latency_size_and_amplification() {
     assert_eq!(value["amplification"]["read"], 1.25);
     assert!(value["amplification"].get("write").unwrap().is_null());
     assert!(value["amplification"].get("space").unwrap().is_null());
+}
+
+#[test]
+fn prepared_latency_probe_rejects_a_no_op_sample() {
+    let mut setups = 0;
+    let error = measure_prepared_samples(
+        3,
+        || {
+            setups += 1;
+            setups
+        },
+        |sample| sample,
+        |&sample| sample != 2,
+    )
+    .unwrap_err();
+
+    assert_eq!(setups, 2);
+    assert!(error.to_string().contains("sample 2 performed no work"));
+}
+
+#[test]
+fn prepared_latency_probe_prepares_every_sample_outside_the_operation() {
+    let mut setups = 0;
+    let latencies = measure_prepared_samples(
+        4,
+        || {
+            setups += 1;
+            setups
+        },
+        |sample| sample,
+        |&sample| sample > 0,
+    )
+    .unwrap();
+
+    assert_eq!(setups, 4);
+    assert_eq!(latencies.len(), 4);
+}
+
+#[test]
+fn unrelated_prior_reads_do_not_change_write_probe_amplification() {
+    let clean = read_amplification_delta(
+        CounterSnapshot {
+            point_reads: 0,
+            sstable_probes: 0,
+        },
+        CounterSnapshot {
+            point_reads: 0,
+            sstable_probes: 0,
+        },
+    );
+    let after_prior_reads = read_amplification_delta(
+        CounterSnapshot {
+            point_reads: 500,
+            sstable_probes: 750,
+        },
+        CounterSnapshot {
+            point_reads: 500,
+            sstable_probes: 750,
+        },
+    );
+
+    assert_eq!(clean, None);
+    assert_eq!(after_prior_reads, clean);
+}
+
+#[test]
+fn read_amplification_uses_saturating_probe_deltas() {
+    let amplification = read_amplification_delta(
+        CounterSnapshot {
+            point_reads: 10,
+            sstable_probes: 20,
+        },
+        CounterSnapshot {
+            point_reads: 14,
+            sstable_probes: 18,
+        },
+    );
+
+    assert_eq!(amplification, Some(0.0));
 }
