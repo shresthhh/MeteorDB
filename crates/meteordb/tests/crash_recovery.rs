@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use meteordb::{
-    Durability, DurableFs, Engine, Error, FaultEvent, FaultOperation, FaultyFs, Options, WriteBatch,
+    Durability, DurableFile, DurableFs, DurableReadFile, Engine, Error, FaultEvent, FaultOperation,
+    FaultyFs, Options, WriteBatch,
 };
 
 fn options(path: &Path) -> Options {
@@ -87,6 +88,30 @@ fn explicit_crash_loses_buffered_writes_without_a_successful_sync() {
 
     db.put(b"buffered", b"lost").unwrap();
     fs.crash().unwrap();
+    drop(db);
+
+    let reopened = Engine::open(options(dir.path())).unwrap();
+    assert_eq!(reopened.get(b"buffered").unwrap(), None);
+}
+
+#[test]
+fn buffered_rotation_crash_reopens_at_the_last_durable_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let faulty = Arc::new(FaultyFs::recording());
+    let gate = Arc::new(FlushGate::default());
+    let fs = Arc::new(BlockedFlushFs {
+        inner: faulty.clone(),
+        gate: gate.clone(),
+    });
+    let mut configured = options(dir.path());
+    configured.durability = Durability::Buffered;
+    configured.memtable_bytes = 1;
+    let db = Engine::open_with_fs(configured, fs).unwrap();
+
+    db.put(b"buffered", b"lost").unwrap();
+    gate.wait_until_blocked();
+    faulty.crash().unwrap();
+    gate.release();
     drop(db);
 
     let reopened = Engine::open(options(dir.path())).unwrap();
@@ -290,6 +315,91 @@ fn run_workload(path: &Path, fs: Arc<FaultyFs>) -> WorkloadOutcome {
     }
     drop(db);
     outcome
+}
+
+#[derive(Default)]
+struct FlushGate {
+    state: Mutex<(bool, bool)>,
+    changed: Condvar,
+}
+
+impl FlushGate {
+    fn block_then_fail(&self) -> std::io::Result<Box<dyn DurableFile>> {
+        let mut state = self.state.lock().unwrap();
+        state.0 = true;
+        self.changed.notify_all();
+        while !state.1 {
+            state = self.changed.wait(state).unwrap();
+        }
+        Err(std::io::Error::other("blocked flush"))
+    }
+
+    fn wait_until_blocked(&self) {
+        let mut state = self.state.lock().unwrap();
+        while !state.0 {
+            state = self.changed.wait(state).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.1 = true;
+        self.changed.notify_all();
+    }
+}
+
+struct BlockedFlushFs {
+    inner: Arc<FaultyFs>,
+    gate: Arc<FlushGate>,
+}
+
+impl DurableFs for BlockedFlushFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        if path.to_string_lossy().ends_with(".sst.tmp") {
+            return self.gate.block_then_fail();
+        }
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn append_existing(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append_existing(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        self.inner.open_read(path)
+    }
+
+    fn read_file(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+        self.inner.read_file(path)
+    }
+
+    fn sync_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_file(path)
+    }
+
+    fn truncate_file(&self, path: &Path, length: u64) -> std::io::Result<()> {
+        self.inner.truncate_file(path, length)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
+
+    fn atomic_install(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_install(source, destination)
+    }
+
+    fn remove_file(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.remove_file(path)
+    }
 }
 
 fn assert_required_crash_classes(events: &[FaultEvent]) {

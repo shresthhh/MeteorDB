@@ -1165,7 +1165,6 @@ fn rotate_memtable(
     edit.set_next_file_number(state.next_file_number);
     edit.set_log_number(oldest_required);
     edit.set_active_log_number(new_number);
-    edit.set_wal_sequence(largest_sequence);
     state.versions.apply(edit)?;
     let old = std::mem::replace(
         &mut state.mutable,
