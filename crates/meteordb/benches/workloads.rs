@@ -1,12 +1,16 @@
 use std::hint::black_box;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use meteordb::{
     Embedding, EmbeddingKey, EmbeddingStore, Engine, FeatureKey, FeatureRecord, FeatureStore,
     FeatureValue, InferenceCache, InferenceEntry, InferenceKey, Options,
 };
-use meteordb_bench_support::{Dataset, smoke_workload};
+use meteordb_bench_support::{
+    Amplification, ComponentBenchmarkReport, Dataset, directory_bytes, smoke_workload,
+    write_component_report,
+};
 
 fn criterion_config() -> Criterion {
     Criterion::default()
@@ -36,8 +40,41 @@ fn engine() -> (tempfile::TempDir, Engine, Dataset) {
     (directory, engine, dataset)
 }
 
+fn report_component(path: &Path, benchmark: &str, mut operation: impl FnMut()) {
+    let mut latencies = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let started = Instant::now();
+        operation();
+        latencies.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    let report = ComponentBenchmarkReport::new(
+        "workloads",
+        benchmark,
+        &latencies,
+        directory_bytes(path).expect("measure benchmark database"),
+        Amplification {
+            read: None,
+            write: None,
+            space: None,
+            notes: vec![
+                "AI-store wrappers do not expose per-workload physical amplification counters"
+                    .into(),
+            ],
+        },
+    )
+    .expect("build component report");
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/criterion/meteordb-sidecars/workloads")
+        .join(format!("{}.json", benchmark.replace('/', "-")));
+    write_component_report(&output, &report).expect("write component report");
+    println!(
+        "meteordb-component-report {}",
+        serde_json::to_string(&report).expect("serialize component report")
+    );
+}
+
 fn inference_cache(c: &mut Criterion) {
-    let (_directory, engine, dataset) = engine();
+    let (directory, engine, dataset) = engine();
     let cache = InferenceCache::new(engine, b"criterion").expect("create cache");
     let keys = (0..dataset.keys.len())
         .map(|index| InferenceKey::new(b"model", b"v1", &dataset.keys[index]))
@@ -77,10 +114,38 @@ fn inference_cache(c: &mut Criterion) {
         })
     });
     group.finish();
+    let report_indices = dataset
+        .sample_indices(
+            32,
+            meteordb_bench_support::AccessDistribution::Zipfian { theta: 0.99 },
+        )
+        .expect("sample report accesses");
+    let mut report_cursor = 0;
+    report_component(directory.path(), "inference-cache/zipfian-hit-1kib", || {
+        black_box(
+            cache
+                .get(&keys[report_indices[report_cursor % report_indices.len()]])
+                .expect("cache report get"),
+        );
+        report_cursor += 1;
+    });
+    report_component(
+        directory.path(),
+        "inference-cache/put-with-ttl-1kib",
+        || {
+            cache
+                .put(
+                    &keys[0],
+                    InferenceEntry::new(&dataset.cache_values[0]),
+                    Some(60_000),
+                )
+                .expect("cache report put");
+        },
+    );
 }
 
 fn feature_store(c: &mut Criterion) {
-    let (_directory, engine, _dataset) = engine();
+    let (directory, engine, _dataset) = engine();
     let store = FeatureStore::new(engine, b"criterion").expect("create feature store");
     let keys = (0..100)
         .map(|index| FeatureKey::new(b"user", b"42", b"ranking", index as i64))
@@ -112,10 +177,20 @@ fn feature_store(c: &mut Criterion) {
         })
     });
     group.finish();
+    report_component(directory.path(), "feature-store/point-get", || {
+        black_box(store.get(&keys[42]).expect("feature report get"));
+    });
+    report_component(directory.path(), "feature-store/history-scan", || {
+        black_box(
+            store
+                .history(b"user", b"42", b"ranking", i64::MIN..=i64::MAX, 20)
+                .expect("feature report history"),
+        );
+    });
 }
 
 fn embedding_storage(c: &mut Criterion) {
-    let (_directory, engine, dataset) = engine();
+    let (directory, engine, dataset) = engine();
     let store = EmbeddingStore::new(engine, b"criterion").expect("create embedding store");
     let keys = (0..dataset.keys.len())
         .map(|index| EmbeddingKey::new(&dataset.keys[index]).with_model(b"encoder", b"v1"))
@@ -155,6 +230,26 @@ fn embedding_storage(c: &mut Criterion) {
         })
     });
     group.finish();
+    report_component(
+        directory.path(),
+        "embedding-storage/batch-get-8x6kib",
+        || {
+            black_box(
+                store
+                    .get_many(keys[..8].iter())
+                    .expect("embedding report get"),
+            );
+        },
+    );
+    report_component(
+        directory.path(),
+        "embedding-storage/batch-put-8x6kib",
+        || {
+            store
+                .put_many(keys[..8].iter().zip(&embeddings[..8]))
+                .expect("embedding report put");
+        },
+    );
 }
 
 criterion_group! {

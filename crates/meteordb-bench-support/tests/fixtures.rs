@@ -1,6 +1,7 @@
 use meteordb_bench_support::{
-    AccessDistribution, CACHE_VALUE_BYTES, Dataset, EMBEDDING_VALUE_BYTES, LatencySummary,
-    WorkloadFile, WorkloadKind, capture_environment, smoke_workload,
+    AccessDistribution, Amplification, CACHE_VALUE_BYTES, ComponentBenchmarkReport, Dataset,
+    EMBEDDING_VALUE_BYTES, LatencySummary, WorkloadFile, WorkloadKind, capture_environment,
+    compression_equivalence, smoke_workload,
 };
 
 #[test]
@@ -142,4 +143,66 @@ fn generated_keys_form_repeatable_prefix_scan_groups() {
         .count();
 
     assert!(matching >= 16, "matching prefix keys: {matching}");
+}
+
+#[test]
+fn comparison_workloads_reject_parallel_foreground_threads() {
+    let mut workload = smoke_workload();
+    workload.engine.threads = 2;
+
+    let error = workload.validate().unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("engine.threads must be 1 foreground workload thread"),
+        "{error}"
+    );
+}
+
+#[test]
+fn compression_equivalence_is_derived_from_the_selected_codec() {
+    let none = compression_equivalence(meteordb_bench_support::CompressionConfig::None);
+    assert!(
+        none.semantic
+            .iter()
+            .any(|note| note.contains("both engines are configured with no compression"))
+    );
+    assert!(none.non_equivalent.is_empty());
+
+    let snappy = compression_equivalence(meteordb_bench_support::CompressionConfig::Snappy);
+    assert!(snappy.semantic.is_empty());
+    assert!(
+        snappy
+            .non_equivalent
+            .iter()
+            .any(|note| note.contains("RocksDB uses Snappy"))
+    );
+}
+
+#[test]
+fn component_report_schema_has_tail_latency_size_and_amplification() {
+    let report = ComponentBenchmarkReport::new(
+        "workloads",
+        "inference-cache/zipfian-hit-1kib",
+        &[10, 20, 30, 40, 50],
+        4096,
+        Amplification {
+            read: Some(1.25),
+            write: None,
+            space: None,
+            notes: vec!["write and space unavailable".into()],
+        },
+    )
+    .unwrap();
+
+    let value = serde_json::to_value(&report).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["suite"], "workloads");
+    assert_eq!(value["benchmark"], "inference-cache/zipfian-hit-1kib");
+    assert_eq!(value["latency"]["p95_ns"], 50);
+    assert_eq!(value["latency"]["p99_ns"], 50);
+    assert_eq!(value["database_bytes"], 4096);
+    assert_eq!(value["amplification"]["read"], 1.25);
+    assert!(value["amplification"].get("write").unwrap().is_null());
+    assert!(value["amplification"].get("space").unwrap().is_null());
 }

@@ -1,10 +1,14 @@
 use std::hint::black_box;
 use std::ops::Bound;
-use std::time::Duration;
+use std::path::Path;
+use std::time::{Duration, Instant};
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use meteordb::{Durability, Engine, Options, ScanBounds, WriteBatch};
-use meteordb_bench_support::{Dataset, smoke_workload};
+use meteordb_bench_support::{
+    Amplification, ComponentBenchmarkReport, Dataset, directory_bytes, smoke_workload,
+    write_component_report,
+};
 use tempfile::TempDir;
 
 fn criterion_config() -> Criterion {
@@ -50,8 +54,42 @@ fn populated_engine() -> (TempDir, Engine, Dataset) {
     (directory, engine, dataset)
 }
 
+fn report_component(path: &Path, engine: &Engine, benchmark: &str, mut operation: impl FnMut()) {
+    let mut latencies = Vec::with_capacity(32);
+    for _ in 0..32 {
+        let started = Instant::now();
+        operation();
+        latencies.push(u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+    }
+    let stats = engine.stats();
+    let report = ComponentBenchmarkReport::new(
+        "engine",
+        benchmark,
+        &latencies,
+        directory_bytes(path).expect("measure benchmark database"),
+        Amplification {
+            read: Some(stats.read_amplification()),
+            write: None,
+            space: None,
+            notes: vec![
+                "read is measured SSTable probes per point read".into(),
+                "physical bytes-written and live-data counters are unavailable".into(),
+            ],
+        },
+    )
+    .expect("build component report");
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/criterion/meteordb-sidecars/engine")
+        .join(format!("{}.json", benchmark.replace('/', "-")));
+    write_component_report(&output, &report).expect("write component report");
+    println!(
+        "meteordb-component-report {}",
+        serde_json::to_string(&report).expect("serialize component report")
+    );
+}
+
 fn point_operations(c: &mut Criterion) {
-    let (_directory, engine, dataset) = populated_engine();
+    let (directory, engine, dataset) = populated_engine();
     let mut group = c.benchmark_group("engine/point");
     group.throughput(Throughput::Elements(1));
     let present = &dataset.keys[42];
@@ -75,6 +113,20 @@ fn point_operations(c: &mut Criterion) {
         b.iter(|| engine.delete(black_box(absent)).expect("point delete"))
     });
     group.finish();
+    report_component(directory.path(), &engine, "point/get-present", || {
+        black_box(engine.get(black_box(present)).expect("point get"));
+    });
+    report_component(directory.path(), &engine, "point/get-absent", || {
+        black_box(engine.get(black_box(absent)).expect("absent get"));
+    });
+    report_component(directory.path(), &engine, "point/put-1kib", || {
+        engine
+            .put(black_box(present), black_box(value))
+            .expect("point put");
+    });
+    report_component(directory.path(), &engine, "point/delete", || {
+        engine.delete(black_box(absent)).expect("point delete");
+    });
 }
 
 fn batch_write(c: &mut Criterion) {
@@ -96,12 +148,24 @@ fn batch_write(c: &mut Criterion) {
                 engine.write(batch).expect("batch write");
             })
         });
+        report_component(
+            directory.path(),
+            &engine,
+            &format!("batch-write/{size}"),
+            || {
+                let mut batch = WriteBatch::default();
+                for index in 0..size {
+                    batch.put(&dataset.keys[index], &dataset.cache_values[index]);
+                }
+                engine.write(batch).expect("batch write report");
+            },
+        );
     }
     group.finish();
 }
 
 fn scans(c: &mut Criterion) {
-    let (_directory, engine, dataset) = populated_engine();
+    let (directory, engine, dataset) = populated_engine();
     let mut group = c.benchmark_group("engine/scans");
     group.throughput(Throughput::Elements(20));
     let prefix = &dataset.keys[0][..1];
@@ -134,6 +198,27 @@ fn scans(c: &mut Criterion) {
         })
     });
     group.finish();
+    report_component(directory.path(), &engine, "scans/prefix", || {
+        black_box(
+            engine
+                .scan_prefix(prefix, 20)
+                .expect("prefix scan")
+                .collect::<meteordb::Result<Vec<_>>>()
+                .expect("consume prefix scan"),
+        );
+    });
+    report_component(directory.path(), &engine, "scans/range", || {
+        black_box(
+            engine
+                .scan(
+                    ScanBounds::new(Bound::Included(start.clone()), Bound::Excluded(end.clone())),
+                    20,
+                )
+                .expect("range scan")
+                .collect::<meteordb::Result<Vec<_>>>()
+                .expect("consume range scan"),
+        );
+    });
 }
 
 fn maintenance(c: &mut Criterion) {
@@ -200,6 +285,82 @@ fn maintenance(c: &mut Criterion) {
             BatchSize::LargeInput,
         )
     });
+
+    let flush_directory = benchmark_tempdir();
+    let flush_engine =
+        Engine::open(options(flush_directory.path())).expect("open flush report database");
+    let flush_dataset = Dataset::generate(&smoke_workload()).expect("valid benchmark fixture");
+    for index in 0..32 {
+        flush_engine
+            .put(
+                &flush_dataset.keys[index],
+                &flush_dataset.cache_values[index],
+            )
+            .expect("prepare flush report");
+    }
+    report_component(
+        flush_directory.path(),
+        &flush_engine,
+        "maintenance/flush",
+        || flush_engine.flush().expect("flush report"),
+    );
+
+    let compaction_directory = benchmark_tempdir();
+    let mut opts = options(compaction_directory.path());
+    opts.memtable_bytes = 8 * 1024;
+    opts.target_sstable_bytes = 8 * 1024;
+    let compaction_engine = Engine::open(opts).expect("open compaction report database");
+    for round in 0..6 {
+        for index in 0..32 {
+            compaction_engine
+                .put(
+                    &flush_dataset.keys[index],
+                    &flush_dataset.cache_values[(index + round) % 100],
+                )
+                .expect("prepare compaction report");
+        }
+        compaction_engine
+            .flush()
+            .expect("prepare compaction report");
+    }
+    report_component(
+        compaction_directory.path(),
+        &compaction_engine,
+        "maintenance/compaction",
+        || {
+            black_box(compaction_engine.compact().expect("compact report"));
+        },
+    );
+
+    let (recovery_directory, recovery_engine, _dataset) = populated_engine();
+    recovery_engine
+        .close()
+        .expect("close before recovery report");
+    drop(recovery_engine);
+    let recovery_path = recovery_directory.path().to_path_buf();
+    let started = Instant::now();
+    let recovered = Engine::open(options(&recovery_path)).expect("recover report database");
+    let recovery_latency = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let report = ComponentBenchmarkReport::new(
+        "engine",
+        "maintenance/recovery",
+        &[recovery_latency],
+        directory_bytes(&recovery_path).expect("measure recovery database"),
+        Amplification {
+            read: Some(recovered.stats().read_amplification()),
+            write: None,
+            space: None,
+            notes: vec!["recovery has no portable write/space amplification counters".into()],
+        },
+    )
+    .expect("build recovery report");
+    let output = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/criterion/meteordb-sidecars/engine/maintenance-recovery.json");
+    write_component_report(output, &report).expect("write recovery report");
+    println!(
+        "meteordb-component-report {}",
+        serde_json::to_string(&report).expect("serialize recovery report")
+    );
 }
 
 criterion_group! {

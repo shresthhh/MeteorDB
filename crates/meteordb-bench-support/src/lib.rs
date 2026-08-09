@@ -95,7 +95,7 @@ pub enum DurabilityConfig {
     Buffered,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CompressionConfig {
     None,
@@ -116,9 +116,36 @@ pub struct EngineConfig {
 impl EngineConfig {
     fn validate(&self) -> Result<(), BenchError> {
         require_positive("engine.cache_bytes", self.cache_bytes)?;
-        require_positive("engine.threads", self.threads)?;
+        if self.threads != 1 {
+            return Err(BenchError::Invalid(
+                "engine.threads must be 1 foreground workload thread; RocksDB background jobs are configured separately"
+                    .into(),
+            ));
+        }
         require_positive("engine.write_buffer_bytes", self.write_buffer_bytes)?;
         require_positive("engine.target_file_bytes", self.target_file_bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompressionEquivalence {
+    pub semantic: Vec<String>,
+    pub non_equivalent: Vec<String>,
+}
+
+pub fn compression_equivalence(compression: CompressionConfig) -> CompressionEquivalence {
+    match compression {
+        CompressionConfig::None => CompressionEquivalence {
+            semantic: vec!["both engines are configured with no compression".into()],
+            non_equivalent: Vec::new(),
+        },
+        CompressionConfig::Snappy => CompressionEquivalence {
+            semantic: Vec::new(),
+            non_equivalent: vec![
+                "RocksDB uses Snappy compression while MeteorDB writes uncompressed SSTables"
+                    .into(),
+            ],
+        },
     }
 }
 
@@ -482,6 +509,70 @@ pub struct Amplification {
     pub write: Option<f64>,
     pub space: Option<f64>,
     pub notes: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ComponentBenchmarkReport {
+    pub schema_version: u32,
+    pub suite: String,
+    pub benchmark: String,
+    pub latency: LatencySummary,
+    pub database_bytes: u64,
+    pub amplification: Amplification,
+}
+
+impl ComponentBenchmarkReport {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn new(
+        suite: impl Into<String>,
+        benchmark: impl Into<String>,
+        latency_nanos: &[u64],
+        database_bytes: u64,
+        amplification: Amplification,
+    ) -> Result<Self, BenchError> {
+        Ok(Self {
+            schema_version: Self::SCHEMA_VERSION,
+            suite: suite.into(),
+            benchmark: benchmark.into(),
+            latency: LatencySummary::from_nanos(latency_nanos)?,
+            database_bytes,
+            amplification,
+        })
+    }
+}
+
+pub fn write_component_report(
+    path: impl AsRef<Path>,
+    report: &ComponentBenchmarkReport,
+) -> Result<(), BenchError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(report)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+pub fn directory_bytes(path: impl AsRef<Path>) -> Result<u64, BenchError> {
+    fn visit(path: &Path) -> Result<u64, std::io::Error> {
+        let mut bytes = 0_u64;
+        for entry in fs::read_dir(path)? {
+            let entry = entry?;
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                bytes = bytes.saturating_add(visit(&entry.path())?);
+            } else if metadata.is_file() {
+                bytes = bytes.saturating_add(metadata.len());
+            }
+        }
+        Ok(bytes)
+    }
+
+    Ok(visit(path.as_ref())?)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

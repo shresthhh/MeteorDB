@@ -129,3 +129,70 @@ C++ compiler or libclang for `librocksdb-sys`; therefore the feature-enabled
 RocksDB build and smoke measurement could not run locally. The dependency
 checker verified that this condition fails clearly before Cargo and gives
 installation instructions.
+
+## Review fixes
+
+- `engine.threads` now means foreground workload concurrency and validation
+  rejects every value except `1` before either engine frontend runs. RocksDB's
+  two background jobs are configured independently rather than being derived
+  from that field.
+- Compression equivalence is derived from the selected codec. `none` says both
+  engines are uncompressed; RocksDB Snappy is explicitly non-equivalent to
+  MeteorDB's uncompressed SSTables. Pretty and compact JSON retain those
+  labels.
+- The brief's exact
+  `cargo run -p meteordb-rocks-bench -- --engine rocksdb --smoke` command now
+  checks native prerequisites and automatically re-invokes the feature-gated
+  native implementation. Users no longer need an undocumented feature flag,
+  while ordinary workspace builds remain independent of RocksDB native tools.
+- Both Criterion harnesses run fixed 32-operation reporting probes outside
+  Criterion's measured closures. They emit versioned JSON and write 18
+  component sidecars under `target/criterion/meteordb-sidecars`, each with
+  p95/p99 latency, recursive database bytes, and explicit read/write/space
+  amplification values or availability notes.
+
+Red-green regressions:
+
+```text
+cargo test -p meteordb-bench-support --test fixtures comparison_workloads_reject_parallel_foreground_threads
+  RED: validation returned Ok; GREEN: 1 passed
+cargo test -p meteordb-bench-support --test fixtures compression_equivalence_is_derived_from_the_selected_codec -- --exact
+  RED: unresolved compression_equivalence import; GREEN: 1 passed
+cargo test -p meteordb-rocks-bench --test cli rocksdb_exact_smoke_command_auto_enables_native_implementation_or_fails_on_prerequisites -- --exact
+  RED: old "rerun with --features" diagnostic; GREEN: 1 passed
+cargo test -p meteordb-bench-support --test fixtures component_report_schema_has_tail_latency_size_and_amplification -- --exact
+  RED: unresolved ComponentBenchmarkReport import; GREEN: 1 passed
+```
+
+Final review-fix validation:
+
+```text
+cargo test -p meteordb-bench-support --test fixtures
+  12 passed
+cargo test -p meteordb-rocks-bench --test cli
+  6 passed
+cargo fmt --all -- --check
+  passed
+cargo clippy --workspace --all-targets -- -D warnings
+  passed
+cargo test --workspace
+  passed
+cargo bench -p meteordb --bench engine -- --test
+cargo bench -p meteordb --bench workloads -- --test
+  passed; 18 sidecars validated with schema 1, ordered p95/p99,
+  database_bytes > 0, and stable amplification fields
+cargo bench --no-run
+  passed
+cargo run -q -p meteordb-rocks-bench -- --engine meteordb --smoke
+  passed; schema 1, 7 workloads, ordered p95/p99, database_bytes > 0
+cargo run -q -p meteordb-rocks-bench -- --engine rocksdb --smoke
+  exited 1 before native Cargo build with actionable missing cc/c++/CMake/
+  pkg-config/libclang diagnostics
+git diff --check
+  passed
+```
+
+The RocksDB native compile/smoke remains unmeasured on this host because the
+listed prerequisites are absent. The exact-command contract has a hermetic
+test that supplies a deterministic missing-prerequisite checker, so it does
+not link RocksDB.

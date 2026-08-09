@@ -3,13 +3,15 @@ use std::fs;
 use std::io::{self, Write};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use meteordb::{Durability, Engine, Options, ScanBounds, WriteBatch as MeteorWriteBatch};
 use meteordb_bench_support::{
     Amplification, ComparisonResult, CompressionConfig, Dataset, DurabilityConfig, LatencySummary,
-    WorkloadFile, WorkloadKind, WorkloadResult, WorkloadSpec, capture_environment, smoke_workload,
+    WorkloadFile, WorkloadKind, WorkloadResult, WorkloadSpec, capture_environment,
+    compression_equivalence, smoke_workload,
 };
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
@@ -187,6 +189,14 @@ fn run_meteordb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Compari
     };
     let summary = execute_suite(&workload, &dataset, root.path(), factory)?;
     let environment = capture_environment(std::env::current_dir()?)?;
+    let semantic_equivalence = equivalence_notes(&workload);
+    let non_equivalence = engine_non_equivalence(
+        &workload,
+        vec![
+            "MeteorDB compacts one highest-priority level; RocksDB compact_range compacts the full key range".into(),
+            "foreground workload concurrency is one; MeteorDB background scheduling is engine-internal".into(),
+        ],
+    );
     Ok(ComparisonResult {
         schema_version: ComparisonResult::SCHEMA_VERSION,
         engine: "meteordb".into(),
@@ -207,11 +217,8 @@ fn run_meteordb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Compari
                 "physical bytes-written and live-data counters are unavailable; write and space amplification are null".into(),
             ],
         },
-        semantic_equivalence: equivalence_notes(),
-        non_equivalence: vec![
-            "MeteorDB compacts one highest-priority level; RocksDB compact_range compacts the full key range".into(),
-            "thread count records the single foreground runner thread; engine-internal background scheduling differs".into(),
-        ],
+        semantic_equivalence,
+        non_equivalence,
     })
 }
 
@@ -472,20 +479,68 @@ fn peak_rss_bytes() -> Option<u64> {
     }
 }
 
-fn equivalence_notes() -> Vec<String> {
-    vec![
+fn equivalence_notes(workload: &WorkloadFile) -> Vec<String> {
+    let mut notes = vec![
         "identical versioned workload JSON, seed, generated keys/values, access schedule, warm-up exclusion, and sample interval".into(),
-        "sync/buffered durability, no compression, cache budget, write buffer target, and target file size are mapped explicitly".into(),
+        "sync/buffered durability, cache budget, write buffer target, and target file size are mapped explicitly".into(),
         "point, absent, prefix/range, cache, feature, embedding batch, and compaction workloads use the same logical operations".into(),
-    ]
+        "foreground workload concurrency is one operation stream for both engines".into(),
+    ];
+    notes.extend(compression_equivalence(workload.engine.compression).semantic);
+    notes
+}
+
+fn engine_non_equivalence(workload: &WorkloadFile, mut notes: Vec<String>) -> Vec<String> {
+    notes.extend(compression_equivalence(workload.engine.compression).non_equivalent);
+    notes
 }
 
 #[cfg(not(feature = "rocksdb-engine"))]
-fn run_rocksdb(_workload: WorkloadFile, _dataset: Dataset) -> BenchResult<ComparisonResult> {
-    Err(
-        "RocksDB support is not compiled; install native dependencies and rerun with --features rocksdb-engine (or use scripts/check-rocksdb-bench-deps.sh)"
-            .into(),
-    )
+fn run_rocksdb(workload: WorkloadFile, _dataset: Dataset) -> BenchResult<ComparisonResult> {
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let dependency_check = Command::new("bash")
+        .arg(repository.join("scripts/check-rocksdb-bench-deps.sh"))
+        .current_dir(&repository)
+        .output()?;
+    if !dependency_check.status.success() {
+        return Err(String::from_utf8_lossy(&dependency_check.stderr)
+            .trim()
+            .to_owned()
+            .into());
+    }
+
+    let base = repository.join("target/benchmark-tmp");
+    fs::create_dir_all(&base)?;
+    let workload_file = tempfile::Builder::new()
+        .prefix("rocksdb-workload-")
+        .suffix(".json")
+        .tempfile_in(base)?;
+    serde_json::to_writer(workload_file.as_file(), &workload)?;
+
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "meteordb-rocks-bench",
+            "--features",
+            "rocksdb-engine",
+            "--",
+            "--engine",
+            "rocksdb",
+            "--workload",
+        ])
+        .arg(workload_file.path())
+        .current_dir(&repository)
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "RocksDB benchmark build/run failed after dependency checks:\n{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )
+        .into());
+    }
+    Ok(serde_json::from_slice(&output.stdout)?)
 }
 
 #[cfg(feature = "rocksdb-engine")]
@@ -496,6 +551,8 @@ mod rocks {
     };
 
     use super::*;
+
+    const ROCKSDB_BACKGROUND_JOBS: i32 = 2;
 
     pub(super) struct RocksEngine {
         db: DB,
@@ -578,7 +635,7 @@ mod rocks {
         options.create_if_missing(true);
         options.set_write_buffer_size(workload.engine.write_buffer_bytes);
         options.set_target_file_size_base(workload.engine.target_file_bytes as u64);
-        options.set_max_background_jobs(i32::try_from(workload.engine.threads)?);
+        options.set_max_background_jobs(ROCKSDB_BACKGROUND_JOBS);
         options.set_compression_type(match workload.engine.compression {
             CompressionConfig::None => DBCompressionType::None,
             CompressionConfig::Snappy => DBCompressionType::Snappy,
@@ -603,6 +660,15 @@ fn run_rocksdb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Comparis
     };
     let summary = execute_suite(&workload, &dataset, root.path(), factory)?;
     let environment = capture_environment(std::env::current_dir()?)?;
+    let semantic_equivalence = equivalence_notes(&workload);
+    let non_equivalence = engine_non_equivalence(
+        &workload,
+        vec![
+            "RocksDB has no per-entry TTL in this runner; TTL-marked writes persist and expiry is not measured".into(),
+            "RocksDB compact_range covers the full key range while MeteorDB compacts one highest-priority level".into(),
+            "RocksDB uses two background jobs independently of the one foreground workload thread; cache implementation, file format, Bloom filters, and recovery algorithms are engine-specific".into(),
+        ],
+    );
     Ok(ComparisonResult {
         schema_version: ComparisonResult::SCHEMA_VERSION,
         engine: "rocksdb".into(),
@@ -622,11 +688,7 @@ fn run_rocksdb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Comparis
                 "portable rust-rocksdb counters do not expose equivalent probes or physical bytes-written; amplification fields are null".into(),
             ],
         },
-        semantic_equivalence: equivalence_notes(),
-        non_equivalence: vec![
-            "RocksDB has no per-entry TTL in this runner; TTL-marked writes persist and expiry is not measured".into(),
-            "RocksDB compact_range covers the full key range while MeteorDB compacts one highest-priority level".into(),
-            "cache implementation, background scheduling, file format, Bloom filters, and recovery algorithms are engine-specific".into(),
-        ],
+        semantic_equivalence,
+        non_equivalence,
     })
 }
