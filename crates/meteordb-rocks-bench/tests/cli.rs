@@ -18,6 +18,7 @@ fn meteordb_smoke_emits_versioned_result_schema() {
     let result: ComparisonResult = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result.schema_version, ComparisonResult::SCHEMA_VERSION);
     assert_eq!(result.engine, "meteordb");
+    assert_eq!(result.engine_version, "1.0.0");
     assert!(!result.results.is_empty());
     assert_eq!(result.results.len(), result.workload.workloads.len());
     assert!(result.results.iter().all(|entry| {

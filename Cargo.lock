@@ -722,7 +722,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meteordb"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "crc32c",
@@ -741,7 +741,7 @@ dependencies = [
 
 [[package]]
 name = "meteordb-bench-support"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rand 0.8.7",
  "rand_chacha 0.3.1",
@@ -752,7 +752,7 @@ dependencies = [
 
 [[package]]
 name = "meteordb-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -766,7 +766,7 @@ dependencies = [
 
 [[package]]
 name = "meteordb-rocks-bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "assert_cmd",
  "clap",

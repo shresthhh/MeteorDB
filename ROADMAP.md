@@ -1,7 +1,8 @@
 # Roadmap and status
 
-MeteorDB is pre-alpha. Checked items are implemented on this branch; unchecked
-items are directional and are not delivery commitments.
+MeteorDB 1.x has a stable public API version and database-format compatibility
+generation. Checked items are implemented; unchecked items are directional and
+are not delivery commitments.
 
 ## Implemented
 
@@ -15,11 +16,12 @@ items are directional and are not delivery commitments.
 - [x] Bounded read-only inspection CLI and benchmark smoke
 - [x] Deterministic component and MeteorDB/RocksDB comparison harnesses
 - [x] Corruption, crash-recovery, concurrency, model, fuzz, and property tests
+- [x] Public API version 1 and database format generation 1 compatibility policy
 
-## Planned release hardening
+## Planned hardening
 
-- [ ] Stable API and file-format compatibility policy with migrations
 - [ ] Backup/checkpoint and restore tooling
+- [ ] Explicit tooling for any future cross-generation migration
 - [ ] Offline repair/salvage workflow
 - [ ] Continuous compaction scheduling and richer write-stall telemetry
 - [ ] Encryption-at-rest integration guidance

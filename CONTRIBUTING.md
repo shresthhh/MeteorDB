@@ -61,8 +61,8 @@ In particular:
 - Add recovery and corruption tests for changes to WAL, manifest, SSTable, or
   filesystem behavior.
 - Document any persistent-format change and its compatibility consequences.
-  The project is pre-alpha, but format changes must still be deliberate and
-  testable.
+  A release may remain database format generation 1 only while its reader
+  accepts every documented generation-1 component encoding.
 
 ## Tests and documentation
 

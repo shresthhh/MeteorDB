@@ -4,6 +4,8 @@
 
 - [ ] Capability table, roadmap, Rustdoc, examples, changelog, and crate version
       agree with the exact code being released.
+- [ ] `PUBLIC_API_VERSION`, `DATABASE_FORMAT_VERSION`, the crate major version,
+      and the file-format compatibility table agree.
 - [ ] `license`, `repository`, `readme`, categories, keywords, and MSRV are
       correct; `cargo package -p meteordb --allow-dirty` contains no internal
       artifacts or generated benchmark results.
@@ -22,6 +24,7 @@ cargo run -p meteordb --example quickstart
 cargo run -p meteordb --example ai_adapters
 cargo bench -p meteordb --bench engine -- --test
 scripts/check-doc-links.sh
+scripts/check-release-contract.sh
 cargo package -p meteordb --allow-dirty
 git diff --check
 ```

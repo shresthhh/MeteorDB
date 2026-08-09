@@ -123,6 +123,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test -p meteordb --examples
 cargo bench -p meteordb --bench engine -- --test
 scripts/check-doc-links.sh
+scripts/check-release-contract.sh
 cargo package -p meteordb --allow-dirty
 git diff --check
 ```

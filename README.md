@@ -6,8 +6,12 @@ MeteorDB is a synchronous Rust key/value engine with a persistent LSM tree,
 atomic batches, MVCC snapshots, scans, TTLs, and typed adapters for inference
 caches, feature history, and embedding storage.
 
-> **Pre-alpha:** API and file-format compatibility are not guaranteed between
-> releases. Keep another copy of important data and test recovery before use.
+MeteorDB 1.x exposes public API version `1`.
+It writes database format generation `1`.
+Component encodings retain independent, truthful versions
+(for example, generation 1 currently writes SSTable component version 2).
+See the exact [compatibility contract](docs/file-formats.md#compatibility-policy)
+before moving a database between releases.
 
 ## Capabilities
 

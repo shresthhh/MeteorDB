@@ -253,7 +253,7 @@ impl TableBuilder {
     ///
     /// Data blocks are written first, followed by Bloom-filter, index, and
     /// properties blocks. The final fixed footer stores three checked
-    /// offset/size handles, format version `1`, and `METEOR01` magic.
+    /// offset/size handles, [`SSTABLE_FORMAT_VERSION`], and `METEOR01` magic.
     ///
     /// # Errors
     ///

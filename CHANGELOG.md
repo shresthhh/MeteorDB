@@ -1,9 +1,10 @@
 # Changelog
 
-All notable changes are documented here. MeteorDB is pre-alpha and does not yet
-promise API or file-format compatibility.
+All notable changes are documented here.
 
 ## [Unreleased]
+
+## [1.0.0] - 2026-08-09
 
 ### Added
 
@@ -17,7 +18,9 @@ promise API or file-format compatibility.
 
 ### Compatibility
 
-- Current adapter and external JSON schemas are version 1.
-- Current SSTable and manifest writer versions are 2; compatible readers accept
-  the documented version-1 predecessors.
-- No migration guarantee or RocksDB compatibility is provided.
+- Stable public API version 1 and database format generation 1.
+- Generation 1 writes SSTable and manifest component version 2 and reads their
+  component versions 1 and 2. WAL batches, engine values, and adapter schemas
+  remain component/schema version 1.
+- Unknown component versions are rejected. Forward compatibility, automatic
+  cross-generation migration, and RocksDB compatibility are not provided.

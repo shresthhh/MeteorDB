@@ -29,4 +29,5 @@ jobs:
       - run: cargo test -p meteordb --examples
       - run: cargo bench -p meteordb --bench engine -- --test
       - run: scripts/check-doc-links.sh
+      - run: scripts/check-release-contract.sh
       - run: cargo package -p meteordb --allow-dirty

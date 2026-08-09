@@ -1,8 +1,9 @@
 //! Embedded ordered key/value storage with MVCC, TTL, and workload adapters.
 //!
-//! MeteorDB's current public contract and adapter schemas are version 1.
-//! Storage files remain pre-alpha: the SSTable and manifest writer versions are
-//! documented separately and can change without a migration path.
+//! MeteorDB 1.x implements public API version [`PUBLIC_API_VERSION`] and
+//! database format generation [`DATABASE_FORMAT_VERSION`]. Component encodings
+//! keep independent versions within that generation; for example, the current
+//! SSTable writer uses [`SSTABLE_FORMAT_VERSION`].
 //!
 //! # Open and put/get
 //!
@@ -135,6 +136,15 @@
 //! ```
 
 #![deny(missing_docs)]
+
+/// Stable public API compatibility version implemented by this crate.
+pub const PUBLIC_API_VERSION: u32 = 1;
+
+/// Persistent database compatibility generation written by this crate.
+///
+/// Component formats such as SSTables have independent encoding versions
+/// within this database-wide generation.
+pub const DATABASE_FORMAT_VERSION: u32 = 1;
 
 mod background;
 mod batch;
