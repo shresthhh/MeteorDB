@@ -5,14 +5,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::thread;
 
-use crate::background::BackgroundSignal;
+use crate::background::{BackgroundSignal, ObsoleteSstables};
+use crate::batch::MAX_WRITE_BATCH_OPERATIONS;
+use crate::compaction::{CompactionContext, CompactionPicker, DEFAULT_L0_COMPACTION_TRIGGER};
+use crate::iter::{
+    ChildIterator, InternalEntry, ReadLifetime, disk_entry, overlaps_bounds, prefix_bounds,
+    user_key_in_bounds,
+};
 use crate::sstable::TableLookup;
 use crate::stats::ReadStats;
 use crate::{
-    BlockCache, DurableFs, Error, FileMeta, InternalKey, MemTable, Options, OsDurableFs, Result,
-    SequenceNumber, SnapshotGuard, SnapshotRegistry, StatsSnapshot, TableBuildResult, TableBuilder,
-    TableReader, TableReaderOptions, ValueKind, ValueRecord, VersionEdit, VersionSet, WalWriter,
-    WriteBatch, WriteOp, replay_wal_with_fs,
+    BlockCache, Clock, DurableFs, Error, FileMeta, InternalKey, KvIterator, MemTable, Options,
+    OsDurableFs, Result, ScanBounds, SequenceNumber, SnapshotGuard, SnapshotRegistry,
+    StatsSnapshot, SystemClock, TableBuildResult, TableBuilder, TableReader, TableReaderOptions,
+    ValueRecord, VersionEdit, VersionSet, WalWriter, WriteBatch, WriteOp, replay_wal_with_fs,
 };
 
 /// A cloneable handle to MeteorDB's durable engine.
@@ -20,9 +26,42 @@ pub struct Engine {
     inner: Arc<EngineInner>,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WriteBatchLimits {
+    max_payload_bytes: usize,
+    max_operations: usize,
+}
+
+impl WriteBatchLimits {
+    pub(crate) fn validate_next_put(
+        self,
+        batch: &WriteBatch,
+        key: &[u8],
+        value: &[u8],
+    ) -> Result<()> {
+        if batch.len() >= self.max_operations {
+            return Err(Error::InvalidArgument(format!(
+                "write batch operation count would exceed {}",
+                self.max_operations
+            )));
+        }
+        let projected_bytes = batch.projected_put_bytes(key, value).ok_or_else(|| {
+            Error::InvalidArgument("write batch payload byte count overflow".into())
+        })?;
+        if projected_bytes > self.max_payload_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "write batch payload {projected_bytes} exceeds max_batch_bytes {}",
+                self.max_payload_bytes
+            )));
+        }
+        Ok(())
+    }
+}
+
 struct EngineInner {
     options: Options,
     fs: Arc<dyn DurableFs>,
+    clock: Arc<dyn Clock>,
     write_state: Mutex<WriteState>,
     background: Arc<BackgroundSignal>,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
@@ -32,6 +71,12 @@ struct EngineInner {
     snapshots: SnapshotRegistry,
     block_cache: Arc<BlockCache>,
     read_stats: Arc<ReadStats>,
+    #[cfg(test)]
+    snapshot_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    implicit_read_sequence_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    write_state_lock_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct WriteState {
@@ -43,6 +88,8 @@ struct WriteState {
     next_file_number: u64,
     next_sequence: SequenceNumber,
     flush_running: bool,
+    obsolete_sstables: VecDeque<ObsoleteSstables>,
+    reader_versions: Vec<ReaderVersion>,
     closed: bool,
     terminal_failure: Option<TerminalFailure>,
     background_failure: bool,
@@ -64,6 +111,11 @@ struct TerminalFailure {
     path: Option<PathBuf>,
     source_kind: Option<io::ErrorKind>,
     message: String,
+}
+
+struct ReaderVersion {
+    version: Weak<crate::Version>,
+    lease: Weak<()>,
 }
 
 impl TerminalFailure {
@@ -101,13 +153,51 @@ impl TerminalFailure {
 }
 
 impl Engine {
+    pub(crate) fn write_batch_limits(&self) -> WriteBatchLimits {
+        WriteBatchLimits {
+            max_payload_bytes: self.inner.options.max_batch_bytes,
+            max_operations: MAX_WRITE_BATCH_OPERATIONS,
+        }
+    }
+
     /// Opens or recovers an engine using the operating system's durable filesystem.
+    ///
+    /// The database directory is a trusted local engine directory. Use the
+    /// bounded `meteordb check` or `dump-sstable` commands to inspect untrusted
+    /// files without trusting their metadata allocation sizes.
     pub fn open(options: Options) -> Result<Self> {
-        Self::open_with_fs(options, Arc::new(OsDurableFs))
+        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), Arc::new(SystemClock))
     }
 
     /// Opens or recovers an engine with injectable crash-sensitive filesystem operations.
     pub fn open_with_fs(options: Options, fs: Arc<dyn DurableFs>) -> Result<Self> {
+        Self::open_with_fs_and_clock(options, fs, Arc::new(SystemClock))
+    }
+
+    /// Opens or recovers an engine with an injectable wall clock.
+    ///
+    /// The clock controls TTL deadline creation and expiration checks. MVCC
+    /// snapshots still freeze only their sequence number; they do not freeze
+    /// wall-clock time. Custom clock values must not decrease while this engine
+    /// is open or when that clock is reused for a same-process reopen.
+    ///
+    /// Persisted deadlines remain absolute Unix timestamps across process
+    /// restart. Host wall-clock rollback between processes is unsupported; the
+    /// new process must not start behind wall time observed by the previous
+    /// process. MeteorDB deliberately does not persist a watermark during reads.
+    pub fn open_with_clock(options: Options, clock: Arc<dyn Clock>) -> Result<Self> {
+        Self::open_with_fs_and_clock(options, Arc::new(OsDurableFs), clock)
+    }
+
+    /// Opens or recovers an engine with injectable filesystem and wall-clock operations.
+    ///
+    /// The clock follows the same non-decreasing and cross-restart requirements
+    /// documented by [`Engine::open_with_clock`].
+    pub fn open_with_fs_and_clock(
+        options: Options,
+        fs: Arc<dyn DurableFs>,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self> {
         options.validate()?;
         std::fs::create_dir_all(&options.path).map_err(|source| Error::Io {
             operation: "create database directory",
@@ -261,6 +351,7 @@ impl Engine {
             inner: Arc::new(EngineInner {
                 options,
                 fs,
+                clock,
                 write_state: Mutex::new(WriteState {
                     versions,
                     wal,
@@ -272,6 +363,8 @@ impl Engine {
                         Error::InvalidArgument("sequence number space is exhausted".into())
                     })?,
                     flush_running: false,
+                    obsolete_sstables: VecDeque::new(),
+                    reader_versions: Vec::new(),
                     closed: false,
                     terminal_failure: None,
                     background_failure: false,
@@ -284,6 +377,12 @@ impl Engine {
                 snapshots: SnapshotRegistry::default(),
                 block_cache,
                 read_stats: Arc::new(ReadStats::default()),
+                #[cfg(test)]
+                snapshot_sequence_hook: Mutex::new(None),
+                #[cfg(test)]
+                implicit_read_sequence_hook: Mutex::new(None),
+                #[cfg(test)]
+                write_state_lock_hook: Mutex::new(None),
             }),
         };
         engine.start_background_worker()?;
@@ -300,6 +399,37 @@ impl Engine {
         self.write(batch)
     }
 
+    /// Stores `value` under `key` until `ttl_ms` wall-clock milliseconds elapse.
+    ///
+    /// The duration is converted once, at write time, to a persisted absolute
+    /// Unix-millisecond deadline. Zero is valid and makes the new version
+    /// immediately invisible. Negative durations and deadlines beyond
+    /// [`u64::MAX`] are rejected without writing.
+    pub fn put_with_ttl(
+        &self,
+        key: impl AsRef<[u8]>,
+        value: impl AsRef<[u8]>,
+        ttl_ms: i64,
+    ) -> Result<()> {
+        let key = key.as_ref().to_vec();
+        let value = value.as_ref().to_vec();
+        self.write_serialized(move || {
+            let ttl_ms = u64::try_from(ttl_ms)
+                .map_err(|_| Error::InvalidArgument("ttl_ms must not be negative".into()))?;
+            let expires_at_unix_ms = self
+                .inner
+                .clock
+                .now_unix_ms()
+                .checked_add(ttl_ms)
+                .ok_or_else(|| {
+                    Error::InvalidArgument("TTL expiration timestamp overflow".into())
+                })?;
+            let mut batch = WriteBatch::default();
+            batch.put_with_expiration(key, value, Some(expires_at_unix_ms));
+            Ok(batch)
+        })
+    }
+
     /// Writes a tombstone for `key`.
     pub fn delete(&self, key: impl AsRef<[u8]>) -> Result<()> {
         let mut batch = WriteBatch::default();
@@ -309,8 +439,14 @@ impl Engine {
 
     /// Commits every operation in `batch` at one sequence number.
     pub fn write(&self, batch: WriteBatch) -> Result<()> {
+        self.write_serialized(|| Ok(batch))
+    }
+
+    fn write_serialized(&self, prepare: impl FnOnce() -> Result<WriteBatch>) -> Result<()> {
+        self.run_write_state_lock_hook();
         let mut state = self.lock_state();
         ensure_writable(&state)?;
+        let batch = prepare()?;
         validate_batch(&self.inner.options, &batch)?;
         if state.immutables.len() >= self.inner.options.max_immutable_memtables {
             return Err(Error::WriteStall {
@@ -348,8 +484,41 @@ impl Engine {
 
     /// Returns the current value for `key`, or `None` for absence or deletion.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
+        let key = key.as_ref();
+        let state = self.lock_state();
+        ensure_readable(&state)?;
+        validate_length(
+            "key",
+            key.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
+        self.inner.read_stats.record_point_read();
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
-        self.get_at(key.as_ref(), sequence)
+        self.run_implicit_read_sequence_hook();
+        let _guard = self.inner.snapshots.acquire(sequence);
+        self.get_from_state(key, sequence, read_time_unix_ms, state)
+    }
+
+    /// Scans visible keys in ascending byte order within `bounds`.
+    ///
+    /// `limit` counts emitted live keys, not hidden versions or tombstones.
+    pub fn scan(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        self.scan_current(bounds, limit)
+    }
+
+    /// Scans visible keys beginning with `prefix` in ascending byte order.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>, limit: usize) -> Result<KvIterator> {
+        let prefix = prefix.as_ref();
+        ensure_readable(&self.lock_state())?;
+        validate_length(
+            "prefix",
+            prefix.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
+        self.scan_current(prefix_bounds(prefix), limit)
     }
 
     /// Captures structured read-path and block-cache statistics.
@@ -359,15 +528,25 @@ impl Engine {
 
     /// Captures a stable read view at the current committed sequence.
     pub fn snapshot(&self) -> Result<Snapshot> {
+        let state = self.lock_state();
+        ensure_readable(&state)?;
         let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        #[cfg(test)]
+        if let Some(hook) = self
+            .inner
+            .snapshot_sequence_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
         {
-            let state = self.lock_state();
-            ensure_readable(&state)?;
+            hook();
         }
+        let guard = self.inner.snapshots.acquire(sequence);
+        drop(state);
         Ok(Snapshot {
             engine: self.clone(),
             sequence,
-            _guard: self.inner.snapshots.acquire(sequence),
+            _guard: guard,
         })
     }
 
@@ -406,6 +585,102 @@ impl Engine {
             ensure_writable(&state)?;
         }
         Ok(())
+    }
+
+    /// Runs one highest-priority leveled compaction, if any level is overfull.
+    ///
+    /// Outputs are synchronized before one manifest edit atomically publishes
+    /// them and removes all inputs. Input files remain on disk while a scan or
+    /// point read still retains the previous immutable version.
+    pub fn compact(&self) -> Result<bool> {
+        self.flush()?;
+        let plan = {
+            let mut state = self.lock_state();
+            ensure_writable(&state)?;
+            reclaim_obsolete_sstables(&self.inner, &mut state)?;
+            let level_base =
+                u64::try_from(self.inner.options.target_sstable_bytes).unwrap_or(u64::MAX);
+            CompactionPicker::new(DEFAULT_L0_COMPACTION_TRIGGER, level_base)
+                .pick(&state.versions.current())
+        };
+        let Some(plan) = plan else {
+            return Ok(false);
+        };
+        self.execute_compaction_plan(plan)?;
+        Ok(true)
+    }
+
+    pub(crate) fn execute_compaction_plan(&self, plan: crate::CompactionPlan) -> Result<()> {
+        let mut state = self.lock_state();
+        ensure_writable(&state)?;
+        if !state.immutables.is_empty() || state.flush_running {
+            return Err(Error::Background(
+                "cannot compact while a memtable flush is running".into(),
+            ));
+        }
+        let old_version = state.versions.current();
+        validate_compaction_plan(&plan, &old_version)?;
+
+        let result = self.execute_valid_compaction_plan(plan, state, old_version);
+        if let Err(error) = result {
+            state = self.lock_state();
+            let error = record_background_failure(&mut state, error);
+            self.inner.background.wake_all();
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn execute_valid_compaction_plan(
+        &self,
+        plan: crate::CompactionPlan,
+        mut state: MutexGuard<'_, WriteState>,
+        old_version: Arc<crate::Version>,
+    ) -> Result<()> {
+        let mut output = crate::compaction::run(
+            &plan,
+            CompactionContext {
+                directory: &self.inner.options.path,
+                options: &self.inner.options,
+                fs: self.inner.fs.clone(),
+                block_cache: self.inner.block_cache.clone(),
+                read_stats: self.inner.read_stats.clone(),
+                version: &old_version,
+                oldest_active_snapshot: self.inner.snapshots.oldest_active(),
+                read_time_unix_ms: self.inner.clock.now_unix_ms(),
+                next_file_number: state.next_file_number,
+            },
+        )?;
+        let obsolete = plan
+            .input_files()
+            .iter()
+            .chain(plan.overlap_files())
+            .map(FileMeta::number)
+            .collect::<VecDeque<_>>();
+        let mut edit = VersionEdit::new();
+        for file in plan.input_files() {
+            edit.delete_file(plan.input_level(), file.number());
+        }
+        for file in plan.overlap_files() {
+            edit.delete_file(plan.output_level(), file.number());
+        }
+        for file in &output.files {
+            edit.add_file(plan.output_level(), file.clone());
+        }
+        edit.set_next_file_number(output.next_file_number);
+        if let Err(failure) = state.versions.apply_with_visibility(edit) {
+            if failure.edit_may_be_visible {
+                output.preserve_files();
+            }
+            return Err(failure.error);
+        }
+        output.preserve_files();
+        state.next_file_number = output.next_file_number;
+        state.obsolete_sstables.push_back(ObsoleteSstables {
+            version: old_version,
+            files: obsolete,
+        });
+        reclaim_obsolete_sstables(&self.inner, &mut state)
     }
 
     /// Synchronizes every required WAL and closes this shared engine.
@@ -452,24 +727,66 @@ impl Engine {
         Ok(())
     }
 
-    fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
-        if key.len() > self.inner.options.max_key_bytes {
-            return Err(Error::InvalidArgument(format!(
-                "key length {} exceeds max_key_bytes {}",
-                key.len(),
-                self.inner.options.max_key_bytes
-            )));
+    #[cfg(test)]
+    fn run_implicit_read_sequence_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .implicit_read_sequence_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
         }
-        self.inner.read_stats.record_point_read();
+    }
+
+    #[cfg(not(test))]
+    fn run_implicit_read_sequence_hook(&self) {}
+
+    #[cfg(test)]
+    fn run_write_state_lock_hook(&self) {
+        if let Some(hook) = self
+            .inner
+            .write_state_lock_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+        {
+            hook();
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run_write_state_lock_hook(&self) {}
+
+    fn get_at(&self, key: &[u8], sequence: SequenceNumber) -> Result<Option<Vec<u8>>> {
         let state = self.lock_state();
         ensure_readable(&state)?;
+        validate_length(
+            "key",
+            key.len(),
+            "max_key_bytes",
+            self.inner.options.max_key_bytes,
+        )?;
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
+        self.inner.read_stats.record_point_read();
+        self.get_from_state(key, sequence, read_time_unix_ms, state)
+    }
+
+    fn get_from_state(
+        &self,
+        key: &[u8],
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+        mut state: MutexGuard<'_, WriteState>,
+    ) -> Result<Option<Vec<u8>>> {
         if let Some((_, record)) = state
             .mutable
             .table
             .get_entry(key, sequence)?
             .map(clone_candidate)
         {
-            return Ok(record_into_value(record));
+            return Ok(record_into_value(record, read_time_unix_ms));
         }
         for immutable in state.immutables.iter().rev() {
             if let Some((_, record)) = immutable
@@ -477,14 +794,17 @@ impl Engine {
                 .get_entry(key, sequence)?
                 .map(clone_candidate)
             {
-                return Ok(record_into_value(record));
+                return Ok(record_into_value(record, read_time_unix_ms));
             }
         }
 
         let version = state.versions.current();
+        let _reader_lease = register_reader_version(&mut state, &version);
         drop(state);
         for file in version.files(0).iter().filter(|file| overlaps(file, key)) {
-            if let Some(value) = self.read_table_candidate(file, 0, key, sequence)? {
+            if let Some(value) =
+                self.read_table_candidate(file, 0, key, sequence, read_time_unix_ms)?
+            {
                 return Ok(value);
             }
         }
@@ -493,12 +813,105 @@ impl Engine {
             let index = files.partition_point(|file| file.largest().user_key() < key);
             let candidate = files.get(index).filter(|file| overlaps(file, key));
             if let Some(file) = candidate
-                && let Some(value) = self.read_table_candidate(file, level, key, sequence)?
+                && let Some(value) =
+                    self.read_table_candidate(file, level, key, sequence, read_time_unix_ms)?
             {
                 return Ok(value);
             }
         }
         Ok(None)
+    }
+
+    fn scan_current(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        let state = self.lock_state();
+        ensure_no_background_failure(&state)?;
+        validate_scan_bounds(&self.inner.options, &bounds)?;
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
+        if limit == 0 {
+            let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+            return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
+        }
+        ensure_open(&state)?;
+        let sequence = self.inner.committed_sequence.load(Ordering::Acquire);
+        self.run_implicit_read_sequence_hook();
+        let guard = self.inner.snapshots.acquire(sequence);
+        self.scan_from_state(bounds, limit, sequence, read_time_unix_ms, state, guard)
+    }
+
+    fn scan_at(
+        &self,
+        bounds: ScanBounds,
+        limit: usize,
+        sequence: SequenceNumber,
+    ) -> Result<KvIterator> {
+        let state = self.lock_state();
+        ensure_no_background_failure(&state)?;
+        validate_scan_bounds(&self.inner.options, &bounds)?;
+        let read_time_unix_ms = self.inner.clock.now_unix_ms();
+        if limit == 0 {
+            return Ok(KvIterator::empty(bounds, sequence, read_time_unix_ms));
+        }
+        ensure_open(&state)?;
+        let guard = self.inner.snapshots.acquire(sequence);
+        self.scan_from_state(bounds, limit, sequence, read_time_unix_ms, state, guard)
+    }
+
+    fn scan_from_state(
+        &self,
+        bounds: ScanBounds,
+        limit: usize,
+        sequence: SequenceNumber,
+        read_time_unix_ms: u64,
+        mut state: MutexGuard<'_, WriteState>,
+        guard: SnapshotGuard,
+    ) -> Result<KvIterator> {
+        let mut children = Vec::with_capacity(1 + state.immutables.len());
+        push_memtable_child(&mut children, &state.mutable.table, &bounds);
+        for immutable in state.immutables.iter().rev() {
+            push_memtable_child(&mut children, &immutable.table, &bounds);
+        }
+        let version = state.versions.current();
+        let reader_lease = register_reader_version(&mut state, &version);
+        drop(state);
+
+        for level in 0..crate::NUM_LEVELS {
+            for file in version.files(level).iter().filter(|file| {
+                overlaps_bounds(
+                    file.smallest().user_key(),
+                    file.largest().user_key(),
+                    &bounds,
+                )
+            }) {
+                let reader = TableReader::open_cached(
+                    self.inner
+                        .options
+                        .path
+                        .join(format!("{:06}.sst", file.number())),
+                    file.number(),
+                    self.inner.block_cache.clone(),
+                    self.inner.read_stats.clone(),
+                    TableReaderOptions {
+                        max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+                        max_metadata_bytes: usize::MAX,
+                    },
+                    self.inner.fs.clone(),
+                )?;
+                validate_table_length(&reader, file)?;
+                let engine_encoded = reader.properties().engine_value_encoding;
+                children.push(Box::new(reader.into_iter().map(move |entry| {
+                    entry.and_then(|(key, value)| disk_entry(key, value, engine_encoded))
+                })));
+            }
+        }
+
+        Ok(KvIterator::new(
+            children,
+            bounds,
+            sequence,
+            read_time_unix_ms,
+            limit,
+            ReadLifetime::new(version, guard, reader_lease),
+        ))
     }
 
     fn read_table_candidate(
@@ -507,6 +920,7 @@ impl Engine {
         level: usize,
         key: &[u8],
         sequence: SequenceNumber,
+        read_time_unix_ms: u64,
     ) -> Result<Option<Option<Vec<u8>>>> {
         self.inner.read_stats.record_table_probe(level);
         let reader = TableReader::open_cached(
@@ -519,16 +933,18 @@ impl Engine {
             self.inner.read_stats.clone(),
             TableReaderOptions {
                 max_uncompressed_data_block_bytes: reader_block_limit(&self.inner.options),
+                max_metadata_bytes: usize::MAX,
             },
+            self.inner.fs.clone(),
         )?;
+        validate_table_length(&reader, file)?;
         match reader.get_visible(key, sequence)? {
             TableLookup::BloomNegative | TableLookup::Absent => Ok(None),
             TableLookup::Found(internal_key, value) => {
-                if internal_key.kind() == ValueKind::Deletion {
-                    Ok(Some(None))
-                } else {
-                    Ok(Some(Some(value)))
-                }
+                let engine_encoded = reader.properties().engine_value_encoding;
+                let record =
+                    ValueRecord::decode_sstable(internal_key.kind(), value, engine_encoded)?;
+                Ok(Some(record_into_value(record, read_time_unix_ms)))
             }
         }
     }
@@ -539,6 +955,21 @@ impl Engine {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn validate_table_length(reader: &TableReader, file: &FileMeta) -> Result<()> {
+    if reader.file_size() != file.file_size() {
+        return Err(Error::Corruption {
+            context: "SSTable",
+            detail: format!(
+                "{:06}.sst has length {}, expected {}",
+                file.number(),
+                reader.file_size(),
+                file.file_size()
+            ),
+        });
+    }
+    Ok(())
 }
 
 impl Clone for Engine {
@@ -585,6 +1016,24 @@ impl Snapshot {
     /// Reads `key` at the snapshot's fixed sequence number.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Result<Option<Vec<u8>>> {
         self.engine.get_at(key.as_ref(), self.sequence)
+    }
+
+    /// Scans keys visible at this snapshot's fixed sequence.
+    pub fn scan(&self, bounds: ScanBounds, limit: usize) -> Result<KvIterator> {
+        self.engine.scan_at(bounds, limit, self.sequence)
+    }
+
+    /// Scans a prefix at this snapshot's fixed sequence.
+    pub fn scan_prefix(&self, prefix: impl AsRef<[u8]>, limit: usize) -> Result<KvIterator> {
+        let prefix = prefix.as_ref();
+        validate_length(
+            "prefix",
+            prefix.len(),
+            "max_key_bytes",
+            self.engine.inner.options.max_key_bytes,
+        )?;
+        self.engine
+            .scan_at(prefix_bounds(prefix), limit, self.sequence)
     }
 }
 
@@ -686,12 +1135,9 @@ fn build_sstable(
         crate::Compression::None,
         inner.fs.clone(),
     )?;
+    builder.use_engine_value_encoding();
     for (key, record) in table.iter() {
-        let value = match record {
-            ValueRecord::Value { value, .. } => value.as_slice(),
-            ValueRecord::Tombstone => &[],
-        };
-        builder.add(key, value)?;
+        builder.add(key, &record.encode_engine_value())?;
     }
     let built = builder.finish()?;
     inner
@@ -719,7 +1165,6 @@ fn rotate_memtable(
     edit.set_next_file_number(state.next_file_number);
     edit.set_log_number(oldest_required);
     edit.set_active_log_number(new_number);
-    edit.set_wal_sequence(largest_sequence);
     state.versions.apply(edit)?;
     let old = std::mem::replace(
         &mut state.mutable,
@@ -761,6 +1206,102 @@ fn retire_obsolete_wals(inner: &EngineInner, state: &mut WriteState) -> Result<(
             .map_err(|source| io_error("sync WAL retirement", &inner.options.path, source))?;
     }
     Ok(())
+}
+
+fn validate_compaction_plan(plan: &crate::CompactionPlan, version: &crate::Version) -> Result<()> {
+    let inputs_are_live = plan
+        .input_files()
+        .iter()
+        .all(|input| version.files(plan.input_level()).contains(input));
+    let overlaps_are_live = plan
+        .overlap_files()
+        .iter()
+        .all(|input| version.files(plan.output_level()).contains(input));
+    if !inputs_are_live || !overlaps_are_live {
+        return Err(Error::InvalidArgument(
+            "compaction plan no longer matches the current version".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reclaim_obsolete_sstables(inner: &EngineInner, state: &mut WriteState) -> Result<()> {
+    state
+        .reader_versions
+        .retain(|reader| reader.lease.strong_count() > 0 && reader.version.strong_count() > 0);
+    let protected_versions = state
+        .obsolete_sstables
+        .iter()
+        .filter(|obsolete| !obsolete.is_unreferenced())
+        .map(|obsolete| obsolete.version.clone())
+        .chain(
+            state
+                .reader_versions
+                .iter()
+                .filter(|reader| reader.lease.strong_count() > 0)
+                .filter_map(|reader| reader.version.upgrade()),
+        );
+    let mut protected = BTreeSet::new();
+    for version in protected_versions {
+        for level in 0..crate::NUM_LEVELS {
+            protected.extend(version.files(level).iter().map(FileMeta::number));
+        }
+    }
+    let mut removed = false;
+    let mut retained = VecDeque::new();
+    while let Some(mut obsolete) = state.obsolete_sstables.pop_front() {
+        let mut still_protected = VecDeque::new();
+        while let Some(number) = obsolete.files.pop_front() {
+            if protected.contains(&number) {
+                still_protected.push_back(number);
+                continue;
+            }
+            let path = inner.options.path.join(format!("{number:06}.sst"));
+            if let Err(source) = inner.fs.remove_file(&path) {
+                still_protected.push_front(number);
+                still_protected.append(&mut obsolete.files);
+                obsolete.files = still_protected;
+                retained.push_front(obsolete);
+                retained.append(&mut state.obsolete_sstables);
+                state.obsolete_sstables = retained;
+                return Err(io_error("remove obsolete SSTable", &path, source));
+            }
+            removed = true;
+        }
+        if !still_protected.is_empty() {
+            obsolete.files = still_protected;
+            retained.push_back(obsolete);
+        }
+    }
+    state.obsolete_sstables = retained;
+    if removed {
+        inner
+            .fs
+            .sync_directory(&inner.options.path)
+            .map_err(|source| {
+                io_error(
+                    "sync obsolete SSTable retirement",
+                    &inner.options.path,
+                    source,
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn register_reader_version(state: &mut WriteState, version: &Arc<crate::Version>) -> Arc<()> {
+    const READER_LEASE_PRUNE_INTERVAL: usize = 64;
+    if state.reader_versions.len() >= READER_LEASE_PRUNE_INTERVAL {
+        state
+            .reader_versions
+            .retain(|reader| reader.lease.strong_count() > 0 && reader.version.strong_count() > 0);
+    }
+    let lease = Arc::new(());
+    state.reader_versions.push(ReaderVersion {
+        version: Arc::downgrade(version),
+        lease: Arc::downgrade(&lease),
+    });
+    lease
 }
 
 fn remove_unpublished_sstables(
@@ -882,9 +1423,34 @@ fn clone_candidate(entry: (&InternalKey, &ValueRecord)) -> (SequenceNumber, Valu
     (entry.0.sequence(), entry.1.clone())
 }
 
-fn record_into_value(record: ValueRecord) -> Option<Vec<u8>> {
+fn push_memtable_child(children: &mut Vec<ChildIterator>, table: &MemTable, bounds: &ScanBounds) {
+    let entries = table
+        .owned_entries_matching(|key| user_key_in_bounds(bounds, key.user_key()))
+        .into_iter()
+        .map(|(key, record)| Ok(InternalEntry { key, record }));
+    children.push(Box::new(entries));
+}
+
+fn validate_scan_bounds(options: &Options, bounds: &ScanBounds) -> Result<()> {
+    for key in [bounds.start(), bounds.end()]
+        .into_iter()
+        .filter_map(|bound| match bound {
+            std::ops::Bound::Included(key) | std::ops::Bound::Excluded(key) => Some(key),
+            std::ops::Bound::Unbounded => None,
+        })
+    {
+        validate_length("bound", key.len(), "max_key_bytes", options.max_key_bytes)?;
+    }
+    Ok(())
+}
+
+fn record_into_value(record: ValueRecord, read_time_unix_ms: u64) -> Option<Vec<u8>> {
     match record {
-        ValueRecord::Value { value, .. } => Some(value),
+        ValueRecord::Value {
+            value,
+            expires_at_unix_ms,
+        } if expires_at_unix_ms.is_none_or(|expires| expires > read_time_unix_ms) => Some(value),
+        ValueRecord::Value { .. } => None,
         ValueRecord::Tombstone => None,
     }
 }
@@ -920,6 +1486,11 @@ fn ensure_writable(state: &WriteState) -> Result<()> {
 }
 
 fn ensure_readable(state: &WriteState) -> Result<()> {
+    ensure_no_background_failure(state)?;
+    ensure_open(state)
+}
+
+fn ensure_no_background_failure(state: &WriteState) -> Result<()> {
     if state.background_failure {
         Err(state
             .terminal_failure
@@ -927,11 +1498,14 @@ fn ensure_readable(state: &WriteState) -> Result<()> {
             .expect("a background failure stores its diagnostic")
             .to_error())
     } else {
-        ensure_open(state)
+        Ok(())
     }
 }
 
 fn record_terminal_failure(state: &mut WriteState, error: Error) -> Error {
+    if let Some(failure) = &state.terminal_failure {
+        return failure.to_error();
+    }
     let failure = TerminalFailure::from_error(error);
     let returned = failure.to_error();
     state.terminal_failure = Some(failure);
@@ -949,6 +1523,13 @@ fn validate_batch(options: &Options, batch: &WriteBatch) -> Result<()> {
         return Err(Error::InvalidArgument(
             "cannot write an empty batch".to_owned(),
         ));
+    }
+    if batch.len() > MAX_WRITE_BATCH_OPERATIONS {
+        return Err(Error::InvalidArgument(format!(
+            "write batch operation count {} exceeds {}",
+            batch.len(),
+            MAX_WRITE_BATCH_OPERATIONS
+        )));
     }
     if batch.approximate_bytes() > options.max_batch_bytes {
         return Err(Error::InvalidArgument(format!(
@@ -1031,5 +1612,294 @@ mod filename_tests {
         ] {
             assert_eq!(parse_numbered_name(name, ".wal"), None, "{name}");
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_setup_tests {
+    use super::*;
+    use crate::memtable::{owned_entry_clone_count, reset_owned_entry_clone_count};
+    use std::sync::{Condvar, mpsc};
+
+    #[test]
+    fn zero_limit_does_not_copy_any_memtable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(Options::new(dir.path())).unwrap();
+        db.put(b"a", b"value").unwrap();
+        reset_owned_entry_clone_count();
+
+        assert!(db.scan(ScanBounds::all(), 0).unwrap().next().is_none());
+        assert_eq!(owned_entry_clone_count(), 0);
+    }
+
+    #[test]
+    fn completed_point_reads_do_not_accumulate_dead_reader_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut options = Options::new(dir.path());
+        options.memtable_bytes = 64;
+        let db = Engine::open(options).unwrap();
+        db.put(b"key", vec![b'v'; 128]).unwrap();
+        db.flush().unwrap();
+
+        for _ in 0..10_000 {
+            assert!(db.get(b"key").unwrap().is_some());
+        }
+
+        let state = db.lock_state();
+        assert!(
+            state.reader_versions.len() <= 64,
+            "dead reader lease registry grew to {} entries",
+            state.reader_versions.len()
+        );
+    }
+
+    #[derive(Default)]
+    struct WriteLockGate {
+        state: Mutex<(bool, bool)>,
+        changed: Condvar,
+    }
+
+    impl WriteLockGate {
+        fn pause(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.0 = true;
+            self.changed.notify_all();
+            while !state.1 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn wait_until_paused(&self) {
+            let mut state = self.state.lock().unwrap();
+            while !state.0 {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.1 = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[test]
+    fn ttl_starts_when_the_serialized_write_path_acquires_write_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(crate::ManualClock::new(1_000));
+        let db = Engine::open_with_clock(Options::new(dir.path()), clock.clone()).unwrap();
+        let gate = Arc::new(WriteLockGate::default());
+        *db.inner
+            .write_state_lock_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+            let gate = gate.clone();
+            Arc::new(move || gate.pause())
+        });
+
+        let writer_db = db.clone();
+        let writer = thread::spawn(move || {
+            writer_db.put_with_ttl(b"key", b"value", 10).unwrap();
+        });
+        gate.wait_until_paused();
+        clock.set(2_000).unwrap();
+        gate.release();
+        writer.join().unwrap();
+
+        clock.set(2_009).unwrap();
+        assert_eq!(db.get(b"key").unwrap().as_deref(), Some(&b"value"[..]));
+        clock.set(2_010).unwrap();
+        assert_eq!(db.get(b"key").unwrap(), None);
+    }
+
+    #[cfg(test)]
+    mod snapshot_registration_tests {
+        use super::*;
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct SnapshotGate {
+            state: Mutex<(bool, bool)>,
+            changed: Condvar,
+        }
+
+        impl SnapshotGate {
+            fn pause(&self) {
+                let mut state = self.state.lock().unwrap();
+                state.0 = true;
+                self.changed.notify_all();
+                while !state.1 {
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+
+            fn wait_until_paused(&self) {
+                let mut state = self.state.lock().unwrap();
+                while !state.0 {
+                    state = self.changed.wait(state).unwrap();
+                }
+            }
+
+            fn release(&self) {
+                let mut state = self.state.lock().unwrap();
+                state.1 = true;
+                self.changed.notify_all();
+            }
+        }
+
+        #[test]
+        fn snapshot_registers_its_sequence_before_a_writer_can_compact() {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Engine::open(Options::new(dir.path())).unwrap();
+            db.put(b"history", b"old").unwrap();
+            db.flush().unwrap();
+            for index in 0..4 {
+                db.put(format!("key-{index}"), b"value").unwrap();
+                db.flush().unwrap();
+            }
+
+            let gate = Arc::new(SnapshotGate::default());
+            *db.inner
+                .snapshot_sequence_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+                let gate = gate.clone();
+                Arc::new(move || gate.pause())
+            });
+
+            let snapshot_db = db.clone();
+            let snapshot_thread = thread::spawn(move || snapshot_db.snapshot().unwrap());
+            gate.wait_until_paused();
+
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let writer_db = db.clone();
+            let writer_thread = thread::spawn(move || {
+                writer_db.put(b"history", b"new").unwrap();
+                writer_db.flush().unwrap();
+                assert!(writer_db.compact().unwrap());
+                finished_tx.send(()).unwrap();
+            });
+            let writer_finished_while_snapshot_was_paused =
+                finished_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
+            gate.release();
+            let snapshot = snapshot_thread.join().unwrap();
+            writer_thread.join().unwrap();
+
+            assert!(
+                !writer_finished_while_snapshot_was_paused,
+                "writes and compaction must wait until the captured sequence is registered"
+            );
+            assert_eq!(
+                snapshot.get(b"history").unwrap().as_deref(),
+                Some(&b"old"[..])
+            );
+        }
+
+        #[derive(Clone, Copy)]
+        enum ImplicitRead {
+            Get,
+            Scan,
+            ScanPrefix,
+        }
+
+        fn assert_implicit_read_captures_sequence_atomically(read: ImplicitRead) {
+            let dir = tempfile::tempdir().unwrap();
+            let db = Engine::open(Options::new(dir.path())).unwrap();
+            db.put(b"history", b"old").unwrap();
+            db.flush().unwrap();
+            for index in 0..4 {
+                db.put(format!("key-{index}"), b"value").unwrap();
+                db.flush().unwrap();
+            }
+
+            let gate = Arc::new(SnapshotGate::default());
+            *db.inner
+                .implicit_read_sequence_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some({
+                let gate = gate.clone();
+                Arc::new(move || gate.pause())
+            });
+
+            let reader_db = db.clone();
+            let reader_thread = thread::spawn(move || match read {
+                ImplicitRead::Get => reader_db
+                    .get(b"history")
+                    .unwrap()
+                    .map(|value| vec![(b"history".to_vec(), value)])
+                    .unwrap_or_default(),
+                ImplicitRead::Scan => reader_db
+                    .scan(ScanBounds::all(), usize::MAX)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+                ImplicitRead::ScanPrefix => reader_db
+                    .scan_prefix(b"hist", usize::MAX)
+                    .unwrap()
+                    .collect::<Result<Vec<_>>>()
+                    .unwrap(),
+            });
+            gate.wait_until_paused();
+
+            let (finished_tx, finished_rx) = mpsc::channel();
+            let writer_db = db.clone();
+            let writer_thread = thread::spawn(move || {
+                writer_db.put(b"history", b"new").unwrap();
+                writer_db.flush().unwrap();
+                assert!(writer_db.compact().unwrap());
+                finished_tx.send(()).unwrap();
+            });
+            let writer_finished_while_read_was_paused =
+                finished_rx.recv_timeout(Duration::from_millis(250)).is_ok();
+
+            gate.release();
+            let entries = reader_thread.join().unwrap();
+            writer_thread.join().unwrap();
+
+            assert!(
+                !writer_finished_while_read_was_paused,
+                "writes and compaction must wait until an implicit read protects its sequence"
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(key, _)| key.as_slice() == b"history")
+                    .map(|(_, value)| value.as_slice()),
+                Some(&b"old"[..])
+            );
+        }
+
+        #[test]
+        fn get_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::Get);
+        }
+
+        #[test]
+        fn scan_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::Scan);
+        }
+
+        #[test]
+        fn scan_prefix_captures_implicit_sequence_before_compaction_can_prune() {
+            assert_implicit_read_captures_sequence_atomically(ImplicitRead::ScanPrefix);
+        }
+    }
+
+    #[test]
+    fn scan_bounds_only_copy_relevant_memtable_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Engine::open(Options::new(dir.path())).unwrap();
+        for key in [b"a", b"b", b"c", b"d", b"e"] {
+            db.put(key, key).unwrap();
+        }
+        reset_owned_entry_clone_count();
+
+        let bounds = ScanBounds::new(
+            std::ops::Bound::Included(b"b".to_vec()),
+            std::ops::Bound::Excluded(b"d".to_vec()),
+        );
+        assert_eq!(db.scan(bounds, usize::MAX).unwrap().count(), 2);
+        assert_eq!(owned_entry_clone_count(), 2);
     }
 }

@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use meteordb::{
-    BlockHandle, Compression, DurableFile, DurableFs, Error, InternalKey, SSTABLE_FOOTER_BYTES,
-    SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, TableBuilder, TableReader, TableReaderOptions,
+    BlockHandle, Compression, DurableFile, DurableFs, DurableReadFile, Error, InternalKey,
+    OsDurableFs, SSTABLE_FOOTER_BYTES, SSTABLE_FORMAT_VERSION, SSTABLE_MAGIC, TableBuilder,
+    TableReader, TableReaderOptions,
 };
 
 fn build_table(
@@ -27,6 +28,74 @@ fn build_table(
     }
     let result = builder.finish().unwrap();
     (entries, result)
+}
+
+#[test]
+fn table_reader_uses_one_injected_handle_for_metadata_and_lazy_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000042.sst");
+    let (entries, _) = build_table(&path, Compression::None);
+    let fs = Arc::new(SwapAfterOpenFs {
+        inner: OsDurableFs,
+        original: dir.path().join("original.sst"),
+        opens: AtomicUsize::new(0),
+    });
+
+    let reader =
+        TableReader::open_with_fs(&path, TableReaderOptions::default(), fs.clone()).unwrap();
+    assert_eq!(fs.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        reader.get(&entries[39].0).unwrap(),
+        Some(entries[39].1.clone())
+    );
+    assert_eq!(fs.opens.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn table_reader_rejects_a_symlink_even_when_the_target_is_valid() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.sst");
+    build_table(&target, Compression::None);
+    let link = dir.path().join("000042.sst");
+    symlink(&target, &link).unwrap();
+
+    assert!(TableReader::open(link).is_err());
+}
+
+struct SwapAfterOpenFs {
+    inner: OsDurableFs,
+    original: std::path::PathBuf,
+    opens: AtomicUsize,
+}
+
+impl DurableFs for SwapAfterOpenFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let file = self.inner.open_read(path)?;
+        if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+            std::fs::rename(path, &self.original)?;
+            std::fs::write(path, b"replacement")?;
+        }
+        Ok(file)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 #[test]
@@ -133,6 +202,7 @@ fn reader_limit_rejects_untrusted_snappy_size_declarations() {
 
     let options = TableReaderOptions {
         max_uncompressed_data_block_bytes: 64,
+        max_metadata_bytes: 1024,
     };
     assert!(matches!(
         TableReader::open_with_options(&path, options),
@@ -175,6 +245,7 @@ fn snappy_block_header_cannot_exceed_reader_limit() {
         &path,
         TableReaderOptions {
             max_uncompressed_data_block_bytes: 64,
+            max_metadata_bytes: 1024,
         },
     )
     .unwrap();
@@ -184,6 +255,92 @@ fn snappy_block_header_cannot_exceed_reader_limit() {
             context: "SSTable data block",
             detail,
         }) if detail.contains("reader limit")
+    ));
+}
+
+#[test]
+fn metadata_handles_are_rejected_before_large_block_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-metadata.sst");
+    let block_size = 1024 * 1024_u64;
+    let footer_start = block_size * 3;
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    file.set_len(footer_start + SSTABLE_FOOTER_BYTES as u64)
+        .unwrap();
+    file.seek(SeekFrom::Start(footer_start)).unwrap();
+    file.write_all(&test_footer(
+        BlockHandle::new(block_size, block_size),
+        BlockHandle::new(0, block_size),
+        BlockHandle::new(block_size * 2, block_size),
+    ))
+    .unwrap();
+    file.sync_all().unwrap();
+
+    assert!(matches!(
+        TableReader::open_with_options(
+            &path,
+            TableReaderOptions {
+                max_uncompressed_data_block_bytes: 64,
+                max_metadata_bytes: 1024,
+            },
+        ),
+        Err(Error::Corruption {
+            context: "SSTable footer",
+            detail,
+        }) if detail.contains("metadata allocation limit")
+    ));
+}
+
+#[test]
+fn inspection_rejects_property_keys_over_the_output_byte_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("000042.sst.tmp");
+    build_table(&path, Compression::None);
+    let reader = TableReader::open(&path).unwrap();
+
+    assert!(matches!(
+        reader.inspect_with_limits(1, 1, 1),
+        Err(Error::InvalidArgument(message))
+            if message.contains("property key bytes") && message.contains("max_bytes 1")
+    ));
+}
+
+#[test]
+fn oversized_property_key_length_is_rejected_without_allocating_the_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversized-property-key.sst.tmp");
+    build_table(&path, Compression::None);
+
+    let properties = footer_handle(&path, 40);
+    let mut stored = read_at(&path, properties.offset(), properties.size() as usize);
+    let payload_end = stored.len() - 5;
+    let mut cursor = 0;
+    for _ in 0..3 {
+        cursor = skip_varint(&stored[..payload_end], cursor);
+    }
+    cursor += 1;
+    cursor = skip_varint(&stored[..payload_end], cursor);
+    stored[cursor..cursor + 10]
+        .copy_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+    rewrite_stored_checksum(&mut stored);
+    write_at(&path, properties.offset(), &stored);
+
+    assert!(matches!(
+        TableReader::open_with_options(
+            &path,
+            TableReaderOptions {
+                max_uncompressed_data_block_bytes: 1024,
+                max_metadata_bytes: 1024,
+            },
+        ),
+        Err(Error::Corruption {
+            context: "SSTable properties",
+            ..
+        })
     ));
 }
 

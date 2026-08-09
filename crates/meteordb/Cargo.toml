@@ -1,17 +1,37 @@
 [package]
 name = "meteordb"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Embedded ordered key-value storage with MVCC, TTL, and AI workload adapters"
+readme = "README.md"
+documentation = "https://docs.rs/meteordb"
+categories = ["database-implementations", "embedded"]
+keywords = ["database", "embedded", "lsm", "key-value", "ai"]
 
 [dependencies]
+blake3.workspace = true
 crc32c.workspace = true
 fs2.workspace = true
 libc.workspace = true
+postcard.workspace = true
+serde.workspace = true
 snap.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+criterion = "0.5.1"
+meteordb-bench-support = { path = "../meteordb-bench-support" }
 proptest = "1.7.0"
+serde_json.workspace = true
 tempfile = "3.20.0"
+
+[[bench]]
+name = "engine"
+harness = false
+
+[[bench]]
+name = "workloads"
+harness = false

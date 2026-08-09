@@ -2,10 +2,10 @@
 
 ## Supported versions
 
-MeteorDB is pre-alpha. Released versions do not have a long-term security
-support window, and the file format and API may change without migration
-support. Security reports that reproduce against the current `main` branch are
-reviewed.
+MeteorDB 1.x has public API version 1 and database format generation 1.
+Released versions do not have a long-term security support window. Security
+reports that reproduce against the latest 1.x release or current `main` branch
+are reviewed.
 
 ## Report a vulnerability
 

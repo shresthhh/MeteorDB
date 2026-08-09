@@ -8,6 +8,8 @@ API convenience.
 
 - Read the [development guide](docs/development.md) and
   [architecture reference](docs/architecture.md).
+- Use the [documentation map](docs/README.md) and review the
+  [file-format policy](docs/file-formats.md) for persistent changes.
 - Check the [roadmap](ROADMAP.md) before implementing a planned capability.
 - Search existing issues and pull requests to avoid duplicate work.
 - For a substantial behavior, API, or on-disk-format change, open an issue
@@ -59,8 +61,8 @@ In particular:
 - Add recovery and corruption tests for changes to WAL, manifest, SSTable, or
   filesystem behavior.
 - Document any persistent-format change and its compatibility consequences.
-  The project is pre-alpha, but format changes must still be deliberate and
-  testable.
+  A release may remain database format generation 1 only while its reader
+  accepts every documented generation-1 component encoding.
 
 ## Tests and documentation
 
@@ -86,6 +88,10 @@ requesting review:
 - include benchmark methodology and results for performance claims; and
 - call out durability, recovery, corruption, concurrency, or compatibility
   risks explicitly.
+
+Maintainers preparing a release must also complete the
+[release checklist](docs/release-checklist.md) and update
+[`CHANGELOG.md`](CHANGELOG.md).
 
 Do not include credentials, private database contents, or other secrets in
 issues, logs, tests, commits, or pull requests.

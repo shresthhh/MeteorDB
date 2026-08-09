@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -11,11 +10,14 @@ use crate::sstable::{
 };
 use crate::stats::ReadStats;
 use crate::{
-    BlockCache, BlockKind, BloomFilter, Compression, Error, InternalKey, Result, SequenceNumber,
+    BlockCache, BlockKind, BloomFilter, Compression, DurableFs, DurableReadFile, Error,
+    InternalKey, OsDurableFs, Result, SequenceNumber,
 };
 
 /// Conservative default ceiling for one uncompressed SSTable data block.
 pub const DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES: usize = 64 * 1024 * 1024;
+/// Conservative default ceiling for all eagerly read SSTable metadata blocks.
+pub const DEFAULT_MAX_METADATA_BYTES: usize = 64 * 1024 * 1024;
 
 /// Trusted resource limits applied while opening and reading an SSTable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,12 +27,18 @@ pub struct TableReaderOptions {
     /// This limit comes from the caller, not the file. It bounds stored-block
     /// reads and Snappy output before allocation or decompression.
     pub max_uncompressed_data_block_bytes: usize,
+    /// Maximum combined stored bytes in index, filter, and properties blocks.
+    ///
+    /// Footer handles are checked against this caller-trusted limit before any
+    /// metadata payload buffer is allocated.
+    pub max_metadata_bytes: usize,
 }
 
 impl Default for TableReaderOptions {
     fn default() -> Self {
         Self {
             max_uncompressed_data_block_bytes: DEFAULT_MAX_UNCOMPRESSED_DATA_BLOCK_BYTES,
+            max_metadata_bytes: DEFAULT_MAX_METADATA_BYTES,
         }
     }
 }
@@ -43,7 +51,7 @@ impl Default for TableReaderOptions {
 /// table data size and allowing a Bloom negative to avoid data I/O entirely.
 pub struct TableReader {
     path: PathBuf,
-    file: Mutex<File>,
+    file: Mutex<Box<dyn DurableReadFile>>,
     file_size: u64,
     data_end: u64,
     index: Vec<(Vec<u8>, BlockHandle)>,
@@ -54,6 +62,69 @@ pub struct TableReader {
     cache: Option<Arc<BlockCache>>,
     stats: Option<Arc<ReadStats>>,
     user_key_filter: bool,
+}
+
+/// Stable metadata for one checked SSTable block.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableBlockInspection {
+    /// Zero-based data-block position.
+    pub index: usize,
+    /// Byte offset of the stored block.
+    pub offset: u64,
+    /// Stored payload bytes, excluding its trailer.
+    pub size: u64,
+}
+
+/// Bounded display record from a fully checked SSTable.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableEntryInspection {
+    /// Internal key encoded as lowercase hexadecimal.
+    pub key_hex: String,
+    /// User key encoded as lowercase hexadecimal.
+    pub user_key_hex: String,
+    /// MVCC sequence number.
+    pub sequence: SequenceNumber,
+    /// `value` or `deletion`.
+    pub kind: String,
+    /// Stored value length in bytes.
+    pub value_bytes: usize,
+}
+
+/// Read-only SSTable metadata produced by the checked table reader.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct SstableInspection {
+    /// Version of this inspection document schema.
+    pub format_version: u32,
+    /// Complete immutable file length.
+    pub file_bytes: u64,
+    /// Persistent file number from the properties block.
+    pub file_number: u64,
+    /// Number of checked records.
+    pub entries: u64,
+    /// Number of independently checked data blocks.
+    pub data_blocks: u64,
+    /// Compression name.
+    pub compression: String,
+    /// Smallest internal key in lowercase hexadecimal.
+    pub smallest_key_hex: String,
+    /// Largest internal key in lowercase hexadecimal.
+    pub largest_key_hex: String,
+    /// Largest declared uncompressed data-block payload.
+    pub max_data_block_bytes: u64,
+    /// Whether values use engine-record encoding.
+    pub engine_value_encoding: bool,
+    /// Checked data-block locations.
+    pub blocks: Vec<SstableBlockInspection>,
+    /// Whether additional checked blocks were omitted.
+    pub blocks_truncated: bool,
+    /// First records, bounded by the caller.
+    pub shown: Vec<SstableEntryInspection>,
+    /// Raw key bytes retained across property bounds and shown records.
+    pub shown_bytes: usize,
+    /// Whether records were omitted because the retained-byte limit was reached.
+    pub bytes_truncated: bool,
+    /// Whether additional records were checked but omitted.
+    pub truncated: bool,
 }
 
 pub(crate) enum TableLookup {
@@ -81,7 +152,16 @@ impl TableReader {
     /// Returns [`Error::InvalidArgument`] for a zero limit and otherwise the
     /// same errors as [`TableReader::open`].
     pub fn open_with_options(path: impl AsRef<Path>, options: TableReaderOptions) -> Result<Self> {
-        Self::open_internal(path, options, None, None, None)
+        Self::open_with_fs(path, options, Arc::new(OsDurableFs))
+    }
+
+    /// Opens an SSTable through an injectable no-follow filesystem abstraction.
+    pub fn open_with_fs(
+        path: impl AsRef<Path>,
+        options: TableReaderOptions,
+        fs: Arc<dyn DurableFs>,
+    ) -> Result<Self> {
+        Self::open_internal(path, options, None, None, None, fs)
     }
 
     pub(crate) fn open_cached(
@@ -90,8 +170,16 @@ impl TableReader {
         cache: Arc<BlockCache>,
         stats: Arc<ReadStats>,
         options: TableReaderOptions,
+        fs: Arc<dyn DurableFs>,
     ) -> Result<Self> {
-        Self::open_internal(path, options, Some(file_number), Some(cache), Some(stats))
+        Self::open_internal(
+            path,
+            options,
+            Some(file_number),
+            Some(cache),
+            Some(stats),
+            fs,
+        )
     }
 
     fn open_internal(
@@ -100,19 +188,25 @@ impl TableReader {
         file_number: Option<u64>,
         cache: Option<Arc<BlockCache>>,
         stats: Option<Arc<ReadStats>>,
+        fs: Arc<dyn DurableFs>,
     ) -> Result<Self> {
         if options.max_uncompressed_data_block_bytes == 0 {
             return Err(Error::InvalidArgument(
                 "max_uncompressed_data_block_bytes must be greater than zero".to_owned(),
             ));
         }
+        if options.max_metadata_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "max_metadata_bytes must be greater than zero".to_owned(),
+            ));
+        }
         let path = path.as_ref().to_path_buf();
-        let mut file =
-            File::open(&path).map_err(|source| io_error("open SSTable", &path, source))?;
+        let mut file = fs
+            .open_read(&path)
+            .map_err(|source| io_error("open SSTable", &path, source))?;
         let file_size = file
-            .metadata()
-            .map_err(|source| io_error("stat SSTable", &path, source))?
-            .len();
+            .len()
+            .map_err(|source| io_error("stat SSTable", &path, source))?;
         let footer_size = u64::try_from(SSTABLE_FOOTER_BYTES).expect("footer size fits u64");
         let footer_start = file_size
             .checked_sub(footer_size)
@@ -141,9 +235,15 @@ impl TableReader {
         let filter_handle = decode_fixed_handle(&footer, 20, footer_start)?;
         let properties_handle = decode_fixed_handle(&footer, 40, footer_start)?;
         validate_metadata_handles(index_handle, filter_handle, properties_handle, footer_start)?;
+        validate_metadata_allocation_limit(
+            index_handle,
+            filter_handle,
+            properties_handle,
+            options.max_metadata_bytes,
+        )?;
 
         let (index_payload, index_miss) = read_cached_metadata(
-            &mut file,
+            file.as_mut(),
             &path,
             file_number,
             cache.as_deref(),
@@ -151,14 +251,14 @@ impl TableReader {
             BlockKind::Index,
         )?;
         let (filter_payload, filter_miss) = read_cached_metadata(
-            &mut file,
+            file.as_mut(),
             &path,
             file_number,
             cache.as_deref(),
             filter_handle,
             BlockKind::Filter,
         )?;
-        let properties_payload = read_metadata_block(&mut file, &path, properties_handle)?;
+        let properties_payload = read_metadata_block(file.as_mut(), &path, properties_handle)?;
         let index_block = Block::decode(index_payload.as_ref())?;
         let mut index = Vec::with_capacity(index_block.len());
         let mut previous_end = 0_u64;
@@ -261,6 +361,120 @@ impl TableReader {
         self.file_size
     }
 
+    /// Checks every data block and returns bounded, stable inspection metadata.
+    pub fn inspect(&self, max_entries: usize, max_blocks: usize) -> Result<SstableInspection> {
+        self.inspect_internal(max_entries, max_blocks, usize::MAX)
+    }
+
+    /// Checks every data block while bounding retained records, blocks, and key bytes.
+    ///
+    /// The byte budget includes the smallest and largest property keys. If
+    /// those mandatory fields alone exceed the budget, inspection rejects the
+    /// table instead of allocating or emitting an over-budget document.
+    pub fn inspect_with_limits(
+        &self,
+        max_entries: usize,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<SstableInspection> {
+        if max_entries == 0 || max_blocks == 0 || max_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "SSTable inspection limits must be greater than zero".to_owned(),
+            ));
+        }
+        self.inspect_internal(max_entries, max_blocks, max_bytes)
+    }
+
+    fn inspect_internal(
+        &self,
+        max_entries: usize,
+        max_blocks: usize,
+        max_bytes: usize,
+    ) -> Result<SstableInspection> {
+        let property_key_bytes = self
+            .properties
+            .smallest
+            .as_bytes()
+            .len()
+            .checked_add(self.properties.largest.as_bytes().len())
+            .ok_or_else(|| {
+                Error::InvalidArgument("SSTable property key byte count exceeds usize".to_owned())
+            })?;
+        if property_key_bytes > max_bytes {
+            return Err(Error::InvalidArgument(format!(
+                "SSTable property key bytes {property_key_bytes} exceed max_bytes {max_bytes}"
+            )));
+        }
+        let mut shown = Vec::with_capacity(max_entries.min(self.index.len()));
+        let mut shown_bytes = property_key_bytes;
+        let mut bytes_truncated = false;
+        let mut checked_entries = 0_u64;
+        for entry in self.iter() {
+            let (key, value) = entry?;
+            checked_entries = checked_entries.saturating_add(1);
+            if shown.len() < max_entries {
+                let retained = key.as_bytes().len().saturating_add(key.user_key().len());
+                if shown_bytes
+                    .checked_add(retained)
+                    .is_some_and(|total| total <= max_bytes)
+                {
+                    shown_bytes += retained;
+                    shown.push(SstableEntryInspection {
+                        key_hex: encode_hex(key.as_bytes()),
+                        user_key_hex: encode_hex(key.user_key()),
+                        sequence: key.sequence(),
+                        kind: match key.kind() {
+                            crate::ValueKind::Value => "value",
+                            crate::ValueKind::Deletion => "deletion",
+                        }
+                        .to_owned(),
+                        value_bytes: value.len(),
+                    });
+                } else {
+                    bytes_truncated = true;
+                }
+            }
+        }
+        if checked_entries != self.properties.entries {
+            return Err(properties_corruption(format!(
+                "record count {checked_entries} does not match declared {}",
+                self.properties.entries
+            )));
+        }
+        Ok(SstableInspection {
+            format_version: 1,
+            file_bytes: self.file_size,
+            file_number: self.properties.file_number,
+            entries: checked_entries,
+            data_blocks: self.properties.data_blocks,
+            compression: match self.properties.compression {
+                Compression::None => "none",
+                Compression::Snappy => "snappy",
+            }
+            .to_owned(),
+            smallest_key_hex: encode_hex(self.properties.smallest.as_bytes()),
+            largest_key_hex: encode_hex(self.properties.largest.as_bytes()),
+            max_data_block_bytes: self.properties.max_data_block_bytes,
+            engine_value_encoding: self.properties.engine_value_encoding,
+            blocks: self
+                .index
+                .iter()
+                .take(max_blocks)
+                .enumerate()
+                .map(|(index, (_, handle))| SstableBlockInspection {
+                    index,
+                    offset: handle.offset(),
+                    size: handle.size(),
+                })
+                .collect(),
+            blocks_truncated: self.index.len() > max_blocks,
+            shown_bytes,
+            bytes_truncated,
+            truncated: checked_entries > shown.len() as u64,
+            shown,
+        })
+    }
+
     /// Reports the Bloom filter's answer for an internal key's user key.
     ///
     /// Version 1 tables retain exact-internal-key filters for compatibility;
@@ -350,6 +564,15 @@ impl TableReader {
         }
     }
 
+    pub(crate) fn into_iter(self) -> OwnedTableIter {
+        OwnedTableIter {
+            reader: self,
+            block_index: 0,
+            entries: Vec::new().into_iter(),
+            failed: false,
+        }
+    }
+
     fn read_data_block(&self, handle: BlockHandle) -> Result<Block> {
         validate_handle(handle, self.data_end, "data block")?;
         if let (Some(cache), Some(file_number)) = (&self.cache, self.file_number)
@@ -369,7 +592,7 @@ impl TableReader {
             .file
             .lock()
             .map_err(|_| Error::Background("SSTable file lock was poisoned".to_owned()))?;
-        let encoded = read_exact_range(&mut file, &self.path, handle, "data block")?;
+        let encoded = read_exact_range(file.as_mut(), &self.path, handle, "data block")?;
         let (payload, marker) = decode_stored_block(&encoded)?;
         let expected_marker = match self.properties.compression {
             Compression::None => NO_COMPRESSION,
@@ -429,6 +652,16 @@ impl TableReader {
     }
 }
 
+fn encode_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
 fn maximum_stored_data_block_bytes(uncompressed_limit: usize) -> Result<u64> {
     let maximum = uncompressed_limit
         .checked_add(32)
@@ -456,33 +689,67 @@ impl Iterator for TableIter<'_> {
     type Item = Result<(InternalKey, Vec<u8>)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed {
-            return None;
-        }
-        loop {
-            if let Some((key, value)) = self.entries.next() {
-                return Some(match InternalKey::decode(key) {
-                    Ok(key) => Ok((key, value)),
-                    Err(error) => {
-                        self.failed = true;
-                        Err(error)
-                    }
-                });
-            }
-            let (_, handle) = self.reader.index.get(self.block_index)?;
-            self.block_index += 1;
-            match self.reader.read_data_block(*handle) {
-                Ok(block) => match block.iter().collect::<Result<Vec<_>>>() {
-                    Ok(entries) => self.entries = entries.into_iter(),
-                    Err(error) => {
-                        self.failed = true;
-                        return Some(Err(error));
-                    }
-                },
+        next_table_entry(
+            self.reader,
+            &mut self.block_index,
+            &mut self.entries,
+            &mut self.failed,
+        )
+    }
+}
+
+pub(crate) struct OwnedTableIter {
+    reader: TableReader,
+    block_index: usize,
+    entries: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    failed: bool,
+}
+
+impl Iterator for OwnedTableIter {
+    type Item = Result<(InternalKey, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        next_table_entry(
+            &self.reader,
+            &mut self.block_index,
+            &mut self.entries,
+            &mut self.failed,
+        )
+    }
+}
+
+fn next_table_entry(
+    reader: &TableReader,
+    block_index: &mut usize,
+    entries: &mut std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+    failed: &mut bool,
+) -> Option<Result<(InternalKey, Vec<u8>)>> {
+    if *failed {
+        return None;
+    }
+    loop {
+        if let Some((key, value)) = entries.next() {
+            return Some(match InternalKey::decode(key) {
+                Ok(key) => Ok((key, value)),
                 Err(error) => {
-                    self.failed = true;
+                    *failed = true;
+                    Err(error)
+                }
+            });
+        }
+        let (_, handle) = reader.index.get(*block_index)?;
+        *block_index += 1;
+        match reader.read_data_block(*handle) {
+            Ok(block) => match block.iter().collect::<Result<Vec<_>>>() {
+                Ok(block_entries) => *entries = block_entries.into_iter(),
+                Err(error) => {
+                    *failed = true;
                     return Some(Err(error));
                 }
+            },
+            Err(error) => {
+                *failed = true;
+                return Some(Err(error));
             }
         }
     }
@@ -524,6 +791,29 @@ fn validate_metadata_handles(
     Ok(())
 }
 
+fn validate_metadata_allocation_limit(
+    index: BlockHandle,
+    filter: BlockHandle,
+    properties: BlockHandle,
+    maximum: usize,
+) -> Result<()> {
+    let maximum = u64::try_from(maximum)
+        .map_err(|_| Error::InvalidArgument("metadata byte limit exceeds u64".to_owned()))?;
+    let total = [index, filter, properties]
+        .into_iter()
+        .try_fold(0_u64, |total, handle| {
+            total
+                .checked_add(handle.size())
+                .ok_or_else(|| footer_corruption("metadata byte count overflows u64"))
+        })?;
+    if total > maximum {
+        return Err(footer_corruption(format!(
+            "metadata handle bytes {total} exceed metadata allocation limit {maximum}"
+        )));
+    }
+    Ok(())
+}
+
 fn checked_handle_end(handle: BlockHandle, kind: &'static str) -> Result<u64> {
     handle
         .offset()
@@ -548,7 +838,11 @@ fn validate_handle(handle: BlockHandle, limit: u64, kind: &'static str) -> Resul
     Ok(())
 }
 
-fn read_metadata_block(file: &mut File, path: &Path, handle: BlockHandle) -> Result<Vec<u8>> {
+fn read_metadata_block(
+    file: &mut dyn DurableReadFile,
+    path: &Path,
+    handle: BlockHandle,
+) -> Result<Vec<u8>> {
     let encoded = read_exact_range(file, path, handle, "metadata block")?;
     let (payload, marker) = decode_stored_block(&encoded)?;
     if marker != NO_COMPRESSION {
@@ -559,7 +853,7 @@ fn read_metadata_block(file: &mut File, path: &Path, handle: BlockHandle) -> Res
 }
 
 fn read_cached_metadata(
-    file: &mut File,
+    file: &mut dyn DurableReadFile,
     path: &Path,
     file_number: Option<u64>,
     cache: Option<&BlockCache>,
@@ -575,7 +869,7 @@ fn read_cached_metadata(
 }
 
 fn read_exact_range(
-    file: &mut File,
+    file: &mut dyn DurableReadFile,
     path: &Path,
     handle: BlockHandle,
     kind: &'static str,
@@ -614,9 +908,19 @@ fn decode_properties(encoded: &[u8]) -> Result<TableProperties> {
         read_property_varint(encoded, &mut cursor, "maximum data block bytes")?;
     let smallest = read_property_key(encoded, &mut cursor, "smallest key")?;
     let largest = read_property_key(encoded, &mut cursor, "largest key")?;
-    if cursor != encoded.len() {
-        return Err(properties_corruption("trailing bytes after properties"));
-    }
+    let remaining = encoded
+        .get(cursor..)
+        .ok_or_else(|| properties_corruption("property cursor exceeds encoded bytes"))?;
+    let engine_value_encoding = match remaining {
+        [] => false,
+        [0xe1, 1] => true,
+        [0xe1, version] => {
+            return Err(properties_corruption(format!(
+                "unsupported engine value property version {version}"
+            )));
+        }
+        _ => return Err(properties_corruption("malformed engine value property")),
+    };
     if smallest > largest {
         return Err(properties_corruption(
             "smallest internal key is greater than largest",
@@ -635,6 +939,7 @@ fn decode_properties(encoded: &[u8]) -> Result<TableProperties> {
         smallest,
         largest,
         max_data_block_bytes,
+        engine_value_encoding,
     })
 }
 

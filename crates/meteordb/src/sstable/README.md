@@ -37,4 +37,4 @@ inconsistent properties.
 `TableBuilder::finish` synchronizes the temporary file. Installation,
 directory synchronization, manifest publication, and temporary-file cleanup
 belong to the engine and manifest paths described in the
-[architecture reference](../../../../docs/architecture.md#flush-and-recovery).
+[architecture reference](../../../../docs/architecture.md#flush-and-compaction).

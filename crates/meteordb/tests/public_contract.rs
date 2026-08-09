@@ -1,4 +1,12 @@
-use meteordb::{Durability, Error, Options, WriteBatch, WriteOp};
+use meteordb::{Durability, Error, Options, SystemClock, WriteBatch, WriteOp};
+
+#[test]
+fn system_clock_retains_unit_struct_and_copy_construction_compatibility() {
+    let clock = SystemClock;
+    let copied = clock;
+    let _still_available = clock;
+    let _: SystemClock = copied;
+}
 
 #[test]
 fn options_report_the_exact_invalid_field() {

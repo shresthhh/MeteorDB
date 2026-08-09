@@ -1,41 +1,29 @@
 # MeteorDB documentation
 
-Use this index to choose the shortest path to the information you need.
+## Use MeteorDB
 
-## Users
+- [Project quickstarts and status](../README.md)
+- [Storage-engine concepts](storage-engine.md)
+- [Durability, TTL clocks, and failures](durability.md)
+- [Inspection and operations](operations.md)
+- [API documentation](https://docs.rs/meteordb)
 
-- Start with the [project README](../README.md) for capabilities and a runnable
-  quickstart.
-- Read [storage-engine concepts](storage-engine.md) for the behavior and
-  trade-offs behind the API.
-- Check the [roadmap](../ROADMAP.md) before depending on a planned capability.
+## Evaluate the implementation
 
-## Evaluators
+- [Architecture and invariants](architecture.md)
+- [Persistent file formats and compatibility](file-formats.md)
+- [Reproducible benchmark methodology](benchmarks.md)
+- [Roadmap and non-goals](../ROADMAP.md)
 
-- Review the [architecture](architecture.md) for current data paths,
-  concurrency, recovery, and correctness invariants.
-- Run the [complete quickstart](../crates/meteordb/examples/quickstart.rs).
-- Inspect the
-  [cross-component tests](../crates/meteordb/tests) for executable durability
-  and recovery scenarios.
+## Contribute and release
 
-## Contributors
+- [Contribution guide](../CONTRIBUTING.md)
+- [Development and validation](development.md)
+- [Release checklist](release-checklist.md)
+- [Changelog](../CHANGELOG.md)
+- [Security policy](../SECURITY.md)
 
-- Follow the [contribution guide](../CONTRIBUTING.md) for issue, correctness,
-  test, and review expectations.
-- Use the [development guide](development.md) for setup, focused tests, fault
-  injection, property tests, and required validation.
-- Keep storage changes within the module boundaries in the
-  [architecture module map](architecture.md#module-map).
-- Add integration coverage under
-  [`crates/meteordb/tests`](../crates/meteordb/tests) when behavior crosses
-  subsystem boundaries.
-
-## Maintainers
-
-- Treat the [correctness invariants](architecture.md#correctness-invariants) as
-  release constraints.
-- Keep the capability table and [roadmap](../ROADMAP.md) synchronized with
-  code on `main`.
-- Review persistent-format changes for recovery compatibility and explicit
-  corruption handling.
+Implementation is in [`crates/meteordb`](../crates/meteordb); public examples
+are in [`crates/meteordb/examples`](../crates/meteordb/examples), integration
+tests in [`crates/meteordb/tests`](../crates/meteordb/tests), and CLI tooling in
+[`crates/meteordb-cli`](../crates/meteordb-cli).

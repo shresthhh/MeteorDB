@@ -293,7 +293,7 @@ fn fits_in_budget(usage_bytes: usize, entry_bytes: usize, capacity_bytes: usize)
 }
 
 /// Owned statistics for one independently budgeted cache partition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CachePartitionSnapshot {
     /// Configured byte budget.
     pub capacity_bytes: usize,
@@ -312,7 +312,7 @@ pub struct CachePartitionSnapshot {
 }
 
 /// Owned statistics for the metadata and data cache partitions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CacheSnapshot {
     /// Index and filter partition.
     pub metadata: CachePartitionSnapshot,

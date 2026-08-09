@@ -1,230 +1,122 @@
 # Architecture
 
-## System overview
+MeteorDB is an embedded LSM engine. An `Engine` owns the writer lock, current
+WAL, mutable and immutable MVCC memtables, immutable version metadata, block
+cache, statistics, and a flush worker.
 
-MeteorDB is an embedded LSM storage engine. One `Engine` owns the active WAL,
-mutable and immutable memtables, a background flush worker, the durable
-manifest, live SSTable metadata, a partitioned block cache, and read
-statistics.
+## Data paths
+
+```mermaid
+sequenceDiagram
+  participant A as Application
+  participant E as Serialized engine state
+  participant W as WAL
+  participant M as Mutable memtable
+  participant F as Flush worker
+  participant S as SSTables
+  participant V as Manifest/version
+  A->>E: write(batch)
+  E->>E: validate all operations
+  E->>W: append one sequenced record
+  W-->>E: append / sync succeeds
+  E->>M: publish complete batch
+  E-->>A: success
+  M-->>F: rotate at size target
+  F->>S: build, sync, install
+  F->>V: sync manifest edit
+```
+
+Every batch receives one sequence number. The write mutex establishes order;
+publication occurs only after the WAL append succeeds. `Sync` durability syncs
+before returning. `Buffered` defers that guarantee to `sync` or `close`.
 
 ```mermaid
 flowchart TB
-    App[Application threads]
-
-    subgraph Foreground[Foreground engine]
-        Open[Engine::open and VersionSet]
-        API[Engine API]
-        Writer[Serialized write state]
-        Mutable[Mutable MVCC memtable]
-        Immutable[Immutable memtable queue]
-        Versions[Current immutable version]
-        Reader[TableReader]
-        Stats[Read statistics]
-    end
-
-    subgraph Durable[Database directory]
-        WAL[Numbered WAL segments]
-        Tables[Immutable level 0 SSTables]
-        Manifest[Numbered manifest]
-        Current[CURRENT pointer]
-        Lock[LOCK]
-    end
-
-    subgraph Background[Background flush worker]
-        Builder[SSTable builder]
-    end
-
-    subgraph Cache[Partitioned LRU block cache]
-        Metadata[Metadata: index and Bloom blocks]
-        Data[Data blocks]
-    end
-
-    App --> Open
-    Open --> API
-    Open --> Versions
-    Open -->|held until all handles and snapshots drop| Lock
-    API --> Writer
-    Writer --> WAL
-    Writer --> Mutable
-    Mutable --> Immutable
-    Immutable --> Builder
-    Builder --> Tables
-    Builder --> Manifest
-    Manifest --> Versions
-    Current --> Manifest
-    API --> Versions
-    Versions --> Reader
-    API --> Reader
-    Reader -->|checks| Metadata
-    Reader -->|checks| Data
-    Metadata -->|hit or miss| Reader
-    Data -->|hit or miss| Reader
-    Reader -->|on miss: read checksummed block| Tables
-    Reader -->|admit validated content| Metadata
-    Reader -->|admit validated content| Data
-    API --> Stats
+  Read[get / scan / snapshot read] --> Seq[Choose sequence and wall time]
+  Seq --> Mutable[Mutable + immutable memtables]
+  Seq --> Version[Retained immutable version]
+  Version --> L0[Overlapping L0, newest first]
+  Version --> Ln[At most one candidate per higher level]
+  L0 --> Bloom[Bloom filter]
+  Ln --> Bloom
+  Bloom -->|possible| Blocks[Index/data blocks]
+  Blocks <--> Cache[Metadata/data LRU partitions]
+  Mutable --> Merge[MVCC merge]
+  Blocks --> Merge
+  Merge --> Result[Live ordered user keys]
 ```
 
-New flush output enters level 0. The version model represents seven levels and
-the point-read path understands their lookup rules, but automatic compaction
-between levels is not implemented.
+Point reads and lazy scans use the latest published sequence; snapshots retain
+their captured sequence and version lifetime. TTL visibility is evaluated
+against wall time selected when the read/iterator is created. Bloom negatives
+avoid data-block reads. Positives can be false and always require lookup.
 
-## Write path
+## Flush and compaction
 
-```mermaid
-sequenceDiagram
-    participant A as Application
-    participant E as Engine write state
-    participant W as Active WAL
-    participant M as Mutable memtable
-    participant F as Flush worker
+Rotation creates and durably records a new WAL before queueing the old
+memtable. Flush builds a temporary SSTable, installs and synchronizes it, then
+publishes it in the manifest. Only durable replacement state permits WAL
+retirement.
 
-    A->>E: write(batch)
-    E->>E: Validate complete batch
-    E->>W: Append one sequenced logical record
-    W-->>E: Append or sync complete
-    E->>M: Apply every operation
-    E->>E: Publish committed sequence
-    E-->>A: Success
-    opt Memtable reaches configured size
-        E->>E: Create next WAL and persist ownership
-        E->>F: Queue immutable memtable
-    end
-```
+`Engine::compact` first flushes, then selects one highest-priority overfull
+level. It merges the input level and overlapping next-level tables, drops
+versions hidden from every active snapshot, removes expired values at the
+compaction clock time, splits output near the target size, installs all output,
+and atomically publishes additions/removals in one manifest edit. Readers
+retaining the old version keep input files alive until their leases end.
 
-A mutex gives writers a total order. Every operation in a batch receives one
-sequence number. With synchronous durability, the WAL is synchronized before
-the batch reaches the memtable; buffered durability requires an explicit
-`sync` or `close` to upgrade acknowledged writes.
+LSM trade-offs are explicit: sequential foreground writes and immutable files
+cost write amplification during compaction; overlapping L0 tables increase
+read amplification; obsolete versions consume space until eligible
+compaction. Size settings are targets, not hard file limits.
 
-## Point-read path
+## Recovery
 
-```mermaid
-sequenceDiagram
-    participant A as Application
-    participant E as Engine
-    participant M as Memtables
-    participant V as Current version
-    participant T as TableReader
-    participant C as Block cache
-    participant S as SSTable file
+Open acquires `LOCK`, follows `CURRENT`, validates and replays the manifest,
+validates referenced tables, removes unpublished temporary/table output,
+replays the required contiguous WAL range, creates a fresh active WAL, records
+recovery counters, and resumes pending flushes.
 
-    A->>E: get(key) or snapshot.get(key)
-    E->>M: Find newest visible version
-    alt Found in mutable or immutable memory
-        M-->>E: Value, tombstone, or absence
-    else Not found in memory
-        E->>V: Retain current live-file metadata
-        E->>T: Probe overlapping level 0 files newest first
-        E->>T: Probe at most one candidate per higher level
-        T->>C: Look up index, Bloom, or data block
-        alt Cache hit
-            C-->>T: Validated decoded block bytes
-        else Cache miss
-            C-->>T: Miss
-            T->>S: Read checksummed block
-            S-->>T: Stored block bytes
-            T->>T: Validate checksum and decode structure
-            T->>C: Admit validated decoded block bytes
-        end
-        T-->>E: Visible value, tombstone, or absence
-    end
-    E-->>A: Value or None
-```
+A structurally incomplete final WAL record is treated as a torn tail. An
+incomplete final manifest record is truncated to its last complete boundary.
+Checksum mismatches, invalid fragment ordering, non-canonical encodings,
+sequence gaps, missing required files, and inconsistent metadata are typed
+errors—not misses or empty data. See [durability](durability.md).
 
-An ordinary read uses the latest published sequence. A snapshot captures a
-fixed sequence and retains it for its lifetime. Bloom-filter negatives avoid
-data-block reads but positive results still require a key lookup. The engine
-constructs a `TableReader` for a candidate file; the reader, not the SSTable
-file, checks and fills the block cache.
+## Concurrency and ownership
 
-## Flush and recovery
-
-When the active memtable crosses `memtable_bytes`, MeteorDB creates a new WAL,
-persists the new WAL ownership in the manifest, and moves the old memtable to
-the immutable queue. The flush worker builds a temporary SSTable, atomically
-installs it, synchronizes the directory, and appends a manifest edit that
-publishes the file in level 0. Only then can the corresponding obsolete WAL be
-removed.
-
-On open, MeteorDB:
-
-1. acquires the database lock;
-2. creates a manifest or follows `CURRENT` to recover the existing one;
-3. validates referenced SSTables and removes unpublished table files;
-4. replays every required WAL in sequence order into immutable memtables;
-5. creates a fresh active WAL and durably records recovery counters; and
-6. starts the flush worker to persist recovered memtables.
-
-Recovery distinguishes an incomplete final append from damage to complete
-bytes. A structurally short final WAL header or payload, or an unfinished final
-fragment chain, is treated as a torn tail and ignored. The same structural
-cases at the end of a manifest are truncated back to the last complete record
-before appending resumes. Checksum mismatches, invalid fragment ordering,
-missing required WAL or SSTable files, sequence gaps, and inconsistent manifest
-metadata instead return typed corruption or I/O errors; none is accepted as a
-partial logical write.
-
-## On-disk ownership
-
-| File | Owner and lifetime |
-| --- | --- |
-| `LOCK` | Acquired during `Engine::open` and held by the shared `VersionSet` until every `Engine` clone and `Snapshot` is dropped; `Engine::close` alone does not release it |
-| `CURRENT` | Names the active manifest |
-| `MANIFEST-NNNNNN` | Append-only version edits and recovery counters |
-| `NNNNNN.wal` | Owned by one mutable or immutable memtable until flush is durable |
-| `NNNNNN.sst` | Immutable table owned by every live version that references it |
-| `NNNNNN.sst.tmp` | In-progress flush output; removed during recovery if unpublished |
-
-File numbers are allocated monotonically across WALs, manifests, and SSTables
-so recovery does not silently reuse durable names.
-
-## Concurrency model
-
-- `Engine` is cloneable and shares one internal state.
-- A single mutex serializes writes, rotation, manifest publication, and
-  in-memory version selection.
-- Reads inspect memtables while holding that state lock, retain an immutable
-  version, then perform SSTable I/O without the write-state lock.
-- One background thread flushes immutable memtables in queue order.
-- Snapshot registration is thread-safe and fixes visibility to one sequence.
-- The block cache has independent metadata and data budgets under its own
+- `Engine` clones share one process-local engine; `LOCK` excludes another
+  writer.
+- Writes, rotation, and version publication are serialized.
+- Reads retain an immutable version and perform table I/O without the writer
   mutex.
-- A terminal WAL, manifest, or background flush failure prevents unsafe
-  continued operation.
+- A single worker drains immutable memtables. Compaction is caller-driven.
+- Terminal WAL/manifest/background failures prevent unsafe continued writes.
+- `close` closes shared engine state; the OS lock remains owned until all
+  handles, snapshots, and iterators release it.
 
 ## Correctness invariants
 
-1. A batch becomes visible only after its complete WAL record succeeds.
-2. One batch has one sequence number and is never partially applied.
-3. Readers never observe a sequence newer than their selected read sequence.
-4. A flushed SSTable is installed and synchronized before the manifest
-   publishes it.
-5. A WAL remains owned until all data that requires it is represented by
-   durable recovery state.
-6. `CURRENT` identifies the manifest used for recovery.
-7. Level 0 files may overlap; files within each higher level must not overlap.
-8. SSTables and published versions are immutable.
-9. Structurally incomplete final WAL records are ignored and incomplete final
-   manifest records are truncated according to their recovery rules.
-10. Corrupt checksums, invalid fragment or sequence ordering, missing required
-    files, and inconsistent recovery metadata fail open with typed errors.
+1. No batch is visible before its complete WAL append succeeds.
+2. A batch is all-or-nothing at one sequence.
+3. A read never observes a sequence newer than its selected sequence.
+4. Files are installed and synchronized before metadata publishes them.
+5. WALs and compaction inputs remain owned until replacement state is durable
+   and no live reader retains them.
+6. Complete corruption is never downgraded to a miss or torn tail.
+7. Level 0 may overlap; each higher level is non-overlapping.
+8. Published SSTables and versions are immutable.
+9. TTL does not alter MVCC sequence semantics and snapshots do not freeze time.
 
 ## Module map
 
 | Module | Responsibility |
 | --- | --- |
-| `engine` | Public operations, sequencing, rotation, flush, recovery, and point reads |
-| `wal` | Checksummed fragmented batch log and replay |
-| `memtable` | Ordered in-memory MVCC versions |
-| `sstable` | Immutable table format, builder, reader, index, and Bloom blocks |
-| `manifest` | Durable version edits, `CURRENT`, locking, and recovery |
-| `version` | Immutable live-file metadata and level invariants |
-| `cache` | Partitioned LRU cache for metadata and data blocks |
-| `stats` | Point-read, Bloom, level-probe, and cache snapshots |
-| `snapshot` | Active snapshot sequence tracking |
-| `fs` | Durable filesystem boundary used by production and crash tests |
-| `options` | Resource limits and durability configuration |
-| `batch` | Owned atomic write batches |
-| `internal_key` | User-key, sequence, and value-kind ordering |
-| `background` | Flush-worker signaling |
+| `engine`, `background` | API, sequencing, recovery, flush, lifecycle |
+| `wal`, `manifest`, `version` | durable log and live-file metadata |
+| `memtable`, `sstable`, `iter` | MVCC storage and merged reads |
+| `compaction` | selection, merge, version/file reclamation |
+| `cache`, `bloom`, `stats` | read avoidance and observability |
+| `clock` | injectable non-decreasing wall time |
+| `workloads` | inference, feature, and embedding adapters |
+| `fs` | production and fault-injection filesystem boundary |

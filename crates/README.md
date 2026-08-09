@@ -1,14 +1,12 @@
 # Workspace crates
 
-The Cargo workspace currently contains one crate:
+| Crate | Purpose | Publication |
+| --- | --- | --- |
+| [`meteordb`](meteordb) | Embedded engine and workload adapters | public library |
+| [`meteordb-cli`](meteordb-cli) | Read-only inspector and diagnostic benchmark | repository tool |
+| [`meteordb-bench-support`](meteordb-bench-support) | Shared deterministic workload/result schema | internal |
+| [`meteordb-rocks-bench`](meteordb-rocks-bench) | MeteorDB/RocksDB comparison frontend | internal |
 
-- [`meteordb`](meteordb) implements the embedded storage engine and exposes
-  its Rust API.
-
-Add a crate here only when it has an independently useful responsibility,
-dependency boundary, and test surface. Keep storage-engine internals in
-`meteordb`; workload adapters, command-line tools, or reusable test utilities
-may become separate crates when they no longer belong in the core library.
-
-Register new members in the workspace [`Cargo.toml`](../Cargo.toml) and keep
-shared dependency versions in `[workspace.dependencies]`.
+The optional RocksDB build is a benchmark comparator, not a compatibility
+layer. Workspace commands intentionally compile the comparator without its
+native `rocksdb-engine` feature.

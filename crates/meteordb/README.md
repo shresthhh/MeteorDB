@@ -1,36 +1,23 @@
-# `meteordb` crate
+# meteordb
 
-This crate implements MeteorDB's embedded LSM storage engine. It owns write
-sequencing, WAL recovery, MVCC memtables and snapshots, immutable SSTables,
-durable version metadata, background flush, point reads, block caching, and
-read statistics.
+`meteordb` is an embedded ordered key/value engine with atomic batches, WAL
+recovery, MVCC snapshots and scans, SSTables, Bloom filters, block cache,
+leveled compaction, TTLs, and typed AI-workload storage adapters. Version 1.x
+implements public API version 1 and database format generation 1.
 
-## Public surface
+```rust
+use meteordb::{Engine, Options};
 
-Applications normally use `Engine`, `Options`, `WriteBatch`, `Snapshot`, and
-the crate-wide `Result` and `Error` types. The crate root also exports lower
-level WAL, memtable, SSTable, manifest, cache, filesystem, and version types
-used to test and evolve their contracts.
+# fn run(path: &std::path::Path) -> meteordb::Result<()> {
+let db = Engine::open(Options::new(path))?;
+db.put("key", "value")?;
+assert_eq!(db.get("key")?.as_deref(), Some(&b"value"[..]));
+db.close()
+# }
+```
 
-The engine supports atomic batches, point `get`, snapshots, explicit `sync`
-and `flush`, and deterministic `close`. Synchronous durability is the default;
-buffered writes require `sync` or `close` for a stable-storage guarantee.
-Recovery validates checksums and persistent structure, accepts only documented
-torn-tail cases, and returns errors for complete corruption or missing required
-files.
-
-The API and file formats are pre-alpha and may change without migration
-support. See the root [roadmap](../../ROADMAP.md) for changing capability
-status and planned work.
-
-## Code and validation
-
-- [`src`](src) contains the library modules.
-- [`examples`](examples) contains runnable public-API examples.
-- [`tests`](tests) contains public-contract and cross-component integration
-  tests.
-
-See the repository [architecture reference](../../docs/architecture.md) for
-write, read, flush, recovery, concurrency, and durability invariants. Local
-build and validation commands are in the
-[development guide](../../docs/development.md).
+Component format versions and the exact generation-1 read/write contract are
+documented in the file-format policy. MeteorDB does not provide ANN search or
+RocksDB format/API compatibility. See the
+[repository README](../../README.md), [durability contract](../../docs/durability.md),
+and [file-format policy](../../docs/file-formats.md).

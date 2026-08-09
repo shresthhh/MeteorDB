@@ -1,56 +1,41 @@
-# Roadmap
+# Roadmap and status
 
-MeteorDB is pre-alpha. The order below is directional and not a delivery
-commitment. Checked items are available in code on `main`; unchecked items
-describe intended capability milestones.
+MeteorDB 1.x has a stable public API version and database-format compatibility
+generation. Checked items are implemented; unchecked items are directional and
+are not delivery commitments.
 
-## Available in the current pre-alpha
+## Implemented
 
-- [x] Checksummed, fragmented WAL segments
-- [x] Atomic write batches
-- [x] MVCC snapshot point reads
-- [x] Memtable rotation and background flush
-- [x] Immutable level 0 SSTables
-- [x] Per-table Bloom filters
-- [x] Durable manifest and WAL recovery
-- [x] Level-aware point-read routing
-- [x] Partitioned metadata and data block cache
-- [x] Structured read-path and cache statistics
+- [x] Checksummed WAL, atomic batches, recovery, and durable manifest
+- [x] MVCC point reads, snapshots, ordered range/prefix scans
+- [x] Memtable rotation, background flush, immutable SSTables, Bloom filters
+- [x] Partitioned block cache and structured statistics
+- [x] Leveled compaction with snapshot-safe obsolete-file reclamation
+- [x] Wall-clock TTL visibility and expiry-aware compaction
+- [x] Inference-cache, feature-store, and embedding-storage adapters
+- [x] Bounded read-only inspection CLI and benchmark smoke
+- [x] Deterministic component and MeteorDB/RocksDB comparison harnesses
+- [x] Corruption, crash-recovery, concurrency, model, fuzz, and property tests
+- [x] Public API version 1 and database format generation 1 compatibility policy
 
-## Storage-engine completeness
+## Planned hardening
 
-- [ ] Range and prefix scans
-- [ ] Automatic compaction across levels
-- [ ] Safe obsolete-version and file reclamation
-- [ ] TTL enforcement during reads and maintenance
-- [ ] Stable file-format compatibility and migrations
-- [ ] Backup, checkpoint, and repair workflows
-
-## AI workload surfaces
-
-- [ ] Inference-cache adapter and key conventions
-- [ ] Feature-value adapter
-- [ ] Embedding metadata and vector-value storage surface
-- [ ] Approximate-nearest-neighbor indexing and search integration
-
-These surfaces will build on the ordered byte API. They are not present in the
-current crate.
-
-## Performance and operations
-
-- [ ] Reproducible benchmark harness and documented datasets
-- [ ] Published results with hardware and configuration disclosure
-- [ ] Workload-oriented cache and write-stall telemetry
-- [ ] Operational guidance for sizing and durability modes
-- [ ] Crash and corruption compatibility matrix
-
-The project publishes no benchmark results or comparative performance claims
-today.
+- [ ] Backup/checkpoint and restore tooling
+- [ ] Explicit tooling for any future cross-generation migration
+- [ ] Offline repair/salvage workflow
+- [ ] Continuous compaction scheduling and richer write-stall telemetry
+- [ ] Encryption-at-rest integration guidance
+- [ ] Published repeatable results from disclosed hardware (not universal
+      performance claims)
 
 ## Explicit non-goals
 
-- A SQL parser, relational query planner, or relational schema layer
-- A distributed consensus system or transparent multi-node database
-- A network database service in the core storage-engine crate
-- General multi-key transactions in the current architecture
-- Replacing model-serving, feature-computation, or orchestration systems
+- Approximate-nearest-neighbor indexing or similarity search
+- RocksDB/LevelDB file, WAL, manifest, API, or options compatibility
+- SQL, relational schemas, or a query planner
+- Distributed consensus, replication, sharding, or a network server
+- General multi-key transactions beyond atomic write batches and read snapshots
+- Model serving, feature computation, or orchestration
+
+Embedding values are storage records. Applications needing ANN should use a
+dedicated vector index and treat MeteorDB as metadata/value storage.

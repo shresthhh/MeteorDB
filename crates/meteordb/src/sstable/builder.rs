@@ -37,6 +37,8 @@ pub struct TableProperties {
     pub largest: InternalKey,
     /// Largest uncompressed data-block payload in this table.
     pub max_data_block_bytes: u64,
+    /// Whether values use MeteorDB's checked engine-record encoding.
+    pub engine_value_encoding: bool,
 }
 
 /// Durable result returned after an SSTable file has been fully synchronized.
@@ -96,6 +98,7 @@ pub struct TableBuilder {
     smallest: Option<InternalKey>,
     largest: Option<InternalKey>,
     max_data_block_bytes: u64,
+    engine_value_encoding: bool,
 }
 
 impl TableBuilder {
@@ -181,7 +184,12 @@ impl TableBuilder {
             smallest: None,
             largest: None,
             max_data_block_bytes: 0,
+            engine_value_encoding: false,
         })
+    }
+
+    pub(crate) fn use_engine_value_encoding(&mut self) {
+        self.engine_value_encoding = true;
     }
 
     /// Adds one internal key and value.
@@ -245,7 +253,7 @@ impl TableBuilder {
     ///
     /// Data blocks are written first, followed by Bloom-filter, index, and
     /// properties blocks. The final fixed footer stores three checked
-    /// offset/size handles, format version `1`, and `METEOR01` magic.
+    /// offset/size handles, [`SSTABLE_FORMAT_VERSION`], and `METEOR01` magic.
     ///
     /// # Errors
     ///
@@ -288,6 +296,7 @@ impl TableBuilder {
                 .expect("nonempty table has a first key"),
             largest: self.largest.clone().expect("nonempty table has a last key"),
             max_data_block_bytes: self.max_data_block_bytes,
+            engine_value_encoding: self.engine_value_encoding,
         };
         let properties_handle =
             self.write_payload(&encode_properties(&properties)?, Compression::None)?;
@@ -405,6 +414,9 @@ pub(super) fn encode_properties(properties: &TableProperties) -> Result<Vec<u8>>
                 .map_err(|_| Error::InvalidArgument("property key length exceeds u64".into()))?,
         );
         encoded.extend_from_slice(key.as_bytes());
+    }
+    if properties.engine_value_encoding {
+        encoded.extend_from_slice(&[0xe1, 1]);
     }
     Ok(encoded)
 }

@@ -29,8 +29,8 @@ cargo test --workspace
 cargo run -p meteordb --example quickstart
 ```
 
-The workspace currently contains the `meteordb` crate. Use `-p meteordb` for
-crate-focused commands.
+The workspace also contains the inspector and benchmark-support/comparison
+crates. Use `-p meteordb` for engine-focused commands.
 
 ## Focused tests
 
@@ -118,6 +118,13 @@ Before requesting review, run:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+RUSTDOCFLAGS="-D warnings" cargo test --workspace --doc
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo test -p meteordb --examples
+cargo bench -p meteordb --bench engine -- --test
+scripts/check-doc-links.sh
+scripts/check-release-contract.sh
+cargo package -p meteordb --allow-dirty
 git diff --check
 ```
 
@@ -138,3 +145,8 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 When editing Markdown, verify every relative link resolves from the file that
 contains it. When editing GitHub forms, parse the YAML and confirm each form
 has `name`, `description`, `title`, `body`, and valid unique field IDs.
+
+The comparison runner requires extra native dependencies only for its optional
+RocksDB feature. Run `scripts/check-rocksdb-bench-deps.sh` first; an actionable
+failure means the native comparison is unavailable, while normal workspace
+gates must still pass.

@@ -38,6 +38,12 @@ pub enum Error {
         /// The version number found in persistent data.
         version: u32,
     },
+    /// An operation recursively attempted to wait on work owned by this thread.
+    #[error("reentrant operation would deadlock: {operation}")]
+    Reentrant {
+        /// The operation that detected recursive ownership.
+        operation: &'static str,
+    },
     /// Another process or database handle owns the lock at the given path.
     #[error("database is locked: {}", .0.display())]
     Locked(PathBuf),

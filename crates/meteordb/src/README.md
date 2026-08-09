@@ -10,7 +10,7 @@ that merely consume the row.
 | Module | Responsibility | Direct collaborators used |
 | --- | --- | --- |
 | `lib` | Declares modules and assembles the crate-root API. | All library modules |
-| `engine` | Coordinates open, recovery, writes, reads, snapshots, rotation, flush, synchronization, and close. | `background`, `batch`, `cache`, `error`, `fs`, `internal_key`, `manifest`, `memtable`, `options`, `snapshot`, `sstable`, `stats`, `version`, `wal` |
+| `engine` | Coordinates open, recovery, writes, reads/scans, snapshots, rotation, flush, compaction, synchronization, and close. | `background`, `batch`, `cache`, `compaction`, `error`, `fs`, `internal_key`, `iter`, `manifest`, `memtable`, `options`, `snapshot`, `sstable`, `stats`, `version`, `wal` |
 | `options` | Defines and validates durability, compression, size, and resource settings. | `error` |
 | `batch` | Owns ordered atomic mutations and their WAL encoding. | `error` (`Error`/`Result` for checked encoding, decoding, and validation) |
 | `error` | Defines structured public failures. | `thiserror` |
@@ -22,6 +22,7 @@ that merely consume the row.
 | `wal` | Frames, checksums, synchronizes, and replays atomic batches. | `batch`, `error`, `fs`, `internal_key`, `options`, `crc32c` |
 | `manifest` | Owns `LOCK`, `CURRENT`, append-only version edits, recovery counters, and version publication. | `error`, `fs`, `internal_key`, `version`, `fs2`, `crc32c` |
 | `background` | Provides synchronization signals for flush progress and worker wakeups. | No other crate module |
+| `compaction` | Selects overfull levels, merges files, and builds snapshot-safe replacement tables. | `engine`, `iter`, `sstable`, `version` |
 
 ## MVCC and read path
 
@@ -33,6 +34,7 @@ that merely consume the row.
 | `version` | Validates immutable live-file metadata and level lookup rules. | `internal_key`, `error` |
 | `bloom` | Builds and checks deterministic probabilistic key filters. | `error` |
 | `cache` | Maintains independently budgeted LRU metadata and data-block partitions. | `error` |
+| `iter` | Merges memory/table iterators and emits visible ordered keys lazily. | `internal_key`, `memtable`, `snapshot`, `sstable`, `version` |
 
 ## Table format and metadata
 
@@ -45,8 +47,9 @@ that merely consume the row.
 | Module | Responsibility | Direct collaborators used |
 | --- | --- | --- |
 | `stats` | Aggregates point-read, Bloom, level-probe, and cache counters. | `cache`, `version::NUM_LEVELS` |
-| `clock` | Exposes the public clock abstraction reserved for deterministic expiration integration; no current engine path consumes it or enforces TTL. | No other crate module |
+| `clock` | Supplies non-decreasing wall time for persisted TTL deadlines and expiration checks. | `error` |
 | `fs` | Defines durable file operations and the production OS implementation. | `libc` on Unix |
+| `workloads` | Implements inference-cache, feature-store, and embedding-storage adapters. | `engine`, `iter`, `blake3`, `postcard`, `serde` |
 
 For system-level data flow and invariants, see the
 [architecture reference](../../../docs/architecture.md).

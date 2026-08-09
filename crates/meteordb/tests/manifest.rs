@@ -1,10 +1,12 @@
 use std::fs::OpenOptions;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use meteordb::{
-    DurableFile, DurableFs, Error, FileMeta, InternalKey, OsDurableFs, VersionEdit, VersionSet,
+    DurableFile, DurableFs, DurableReadFile, Error, FileMeta, InternalKey,
+    ManifestInspectionOptions, OsDurableFs, VersionEdit, VersionSet, inspect_manifest_with_fs,
 };
 
 fn meta(number: u64, smallest: &[u8], largest: &[u8]) -> FileMeta {
@@ -15,6 +17,140 @@ fn meta(number: u64, smallest: &[u8], largest: &[u8]) -> FileMeta {
         InternalKey::value(largest, 1),
     )
     .unwrap()
+}
+
+#[test]
+fn manifest_inspection_reads_metadata_and_bytes_from_one_injected_handle() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(VersionSet::create(dir.path()).unwrap());
+    let fs = Arc::new(SwapManifestAfterOpenFs {
+        inner: OsDurableFs,
+        swapped: AtomicBool::new(false),
+    });
+
+    let inspection = inspect_manifest_with_fs(
+        dir.path(),
+        ManifestInspectionOptions {
+            max_edits: 1,
+            max_files: 1,
+            max_bytes: 1024,
+            ..ManifestInspectionOptions::default()
+        },
+        fs.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(inspection.edits_total, 1);
+    assert!(fs.swapped.load(Ordering::SeqCst));
+}
+
+#[test]
+fn manifest_inspection_bounds_historical_file_number_tracking() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    create_sstable(dir.path(), 3);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+
+    let mut add_two = VersionEdit::new();
+    add_two
+        .add_file(0, meta(2, b"a", b"m"))
+        .set_next_file_number(3);
+    versions.apply(add_two).unwrap();
+    let mut delete_two = VersionEdit::new();
+    delete_two.delete_file(0, 2);
+    versions.apply(delete_two).unwrap();
+    let mut add_three = VersionEdit::new();
+    add_three
+        .add_file(0, meta(3, b"n", b"z"))
+        .set_next_file_number(4);
+    versions.apply(add_three).unwrap();
+    let mut delete_three = VersionEdit::new();
+    delete_three.delete_file(0, 3);
+    versions.apply(delete_three).unwrap();
+    drop(versions);
+
+    assert!(matches!(
+        meteordb::inspect_manifest_with_options(
+            dir.path(),
+            ManifestInspectionOptions {
+                max_historical_files: 2,
+                ..ManifestInspectionOptions::default()
+            },
+        ),
+        Err(Error::InvalidArgument(message))
+            if message.contains("historical file number count exceeds max_historical_files 2")
+    ));
+}
+
+#[test]
+fn manifest_inspection_still_detects_reuse_within_the_historical_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    create_sstable(dir.path(), 2);
+    let mut versions = VersionSet::create(dir.path()).unwrap();
+    let mut add = VersionEdit::new();
+    add.add_file(0, meta(2, b"a", b"z")).set_next_file_number(3);
+    versions.apply(add).unwrap();
+    let mut delete = VersionEdit::new();
+    delete.delete_file(0, 2);
+    versions.apply(delete).unwrap();
+    drop(versions);
+    append_raw_edit(
+        &dir.path().join("MANIFEST-000001"),
+        None,
+        &[],
+        &[(1, meta(2, b"a", b"z"))],
+    );
+
+    assert!(matches!(
+        meteordb::inspect_manifest_with_options(
+            dir.path(),
+            ManifestInspectionOptions {
+                max_historical_files: 2,
+                ..ManifestInspectionOptions::default()
+            },
+        ),
+        Err(Error::Corruption {
+            context: "manifest",
+            detail,
+        }) if detail.contains("already been used")
+    ));
+}
+
+struct SwapManifestAfterOpenFs {
+    inner: OsDurableFs,
+    swapped: AtomicBool,
+}
+
+impl DurableFs for SwapManifestAfterOpenFs {
+    fn create(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.create(path)
+    }
+
+    fn append(&self, path: &Path) -> std::io::Result<Box<dyn DurableFile>> {
+        self.inner.append(path)
+    }
+
+    fn open_read(&self, path: &Path) -> std::io::Result<Box<dyn DurableReadFile>> {
+        let file = self.inner.open_read(path)?;
+        if path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("MANIFEST-"))
+            && !self.swapped.swap(true, Ordering::SeqCst)
+        {
+            let original = path.with_extension("opened");
+            std::fs::rename(path, original)?;
+            std::fs::write(path, b"replacement")?;
+        }
+        Ok(file)
+    }
+
+    fn sync_directory(&self, path: &Path) -> std::io::Result<()> {
+        self.inner.sync_directory(path)
+    }
+
+    fn atomic_replace(&self, source: &Path, destination: &Path) -> std::io::Result<()> {
+        self.inner.atomic_replace(source, destination)
+    }
 }
 
 fn create_sstable(dir: &Path, number: u64) {

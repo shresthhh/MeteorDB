@@ -1,136 +1,61 @@
-# Storage engine
+# Storage-engine concepts
 
-MeteorDB combines a log-structured merge-tree layout with MVCC point reads.
-This page explains the storage concepts behind the current pre-alpha engine and
-the trade-offs applications should expect.
+MeteorDB is an LSM tree with MVCC visibility. Foreground writes append a WAL
+and update ordered memory. Flush creates immutable level-0 SSTables; explicit
+leveled compaction merges overlapping files and reclaims versions no active
+snapshot can observe.
 
-## LSM trees
+## Reads and scans
 
-An LSM tree accepts writes in memory and periodically turns sorted memory into
-immutable files. MeteorDB writes new files to level 0, where key ranges may
-overlap. Its version metadata and point-read path also understand
-non-overlapping higher levels, but automatic compaction does not yet move or
-merge files between levels.
+Reads merge mutable/immutable memtables and a retained immutable file version.
+L0 files may overlap and are searched newest first; each higher level has
+non-overlapping ranges. A `Snapshot` fixes sequence visibility for point,
+range, and prefix reads. `KvIterator` validates blocks lazily and returns an
+error rather than skipping corrupt content.
 
-This layout makes foreground writes sequential and avoids editing SSTables in
-place. Without compaction, however, level 0 grows over time and point reads can
-probe more files.
+Prefix scans calculate the exclusive upper bound by incrementing the last byte
+that is not `0xff` and truncating after it. An empty prefix or an all-`0xff`
+prefix has no finite upper bound. Exact prefix checking still prevents keys
+outside the requested prefix from being emitted.
 
-## WAL segments
+Bloom filters answer “definitely absent” or “possibly present.” False positives
+are expected and cost a normal table lookup; false negatives are not allowed.
+Metadata and data use separate cache partitions so bulk data cannot evict all
+navigation blocks.
 
-The write-ahead log is the first durable destination for a batch. A batch is
-encoded as one logical record with a sequence number and operation count, then
-fragmented across fixed-size physical blocks when necessary. CRC32C checksums
-detect damaged fragments.
+## Writes, flush, and compaction
 
-MeteorDB creates a new WAL when it rotates a memtable. The manifest records the
-oldest required WAL and the active WAL. Recovery replays the required range in
-strict sequence order. A structurally short final header or payload, or an
-unfinished final fragment chain, is treated as a torn tail and ignored.
-Checksum damage, invalid fragment order, a missing required segment, or a
-sequence gap is an error.
+Atomic batches are validated before logging and share one sequence. Size
+options (`memtable_bytes`, block/file targets, cache bytes) govern resources;
+file/block targets can be exceeded to preserve record boundaries.
 
-Synchronous durability is the default and synchronizes each successful append.
-Buffered durability can reduce foreground synchronization but risks losing
-recent acknowledged writes on power loss until `Engine::sync` or
-`Engine::close` succeeds.
+Flush publication and recovery ordering are described in
+[durability](durability.md). Compaction selects one overfull level per call.
+It increases write amplification and may temporarily require input plus output
+space, but reduces read/space amplification. Long-lived snapshots and iterators
+delay version and file reclamation.
 
-## Memtables
+## TTL
 
-The mutable memtable is an ordered in-memory map of internal keys. An internal
-key combines the application key, a sequence number, and a value or deletion
-kind. This ordering keeps versions of one user key adjacent and makes the
-newest version visible at a selected sequence easy to find.
+TTLs are persisted absolute wall-clock deadlines. Expired values are invisible
+to current and snapshot reads and are discarded when compaction can do so
+safely. Snapshots do not freeze time. See the clock requirements and rollback
+limitation in [durability](durability.md#ttl-and-clocks).
 
-When the configured memory threshold is reached, the mutable table and its WAL
-become immutable and a fresh pair accepts writes. A bounded immutable queue
-prevents unlimited memory growth; writes return a stall error when flush cannot
-keep up.
+## Adapter semantics
 
-## SSTables
+Adapters encode versioned, namespace-prefixed keys over the byte API.
+Inference-cache singleflight is process-local, not distributed. Feature rows
+are immutable event-time records with typed values. Embedding batch gets use
+one snapshot and preserve input order; batch puts are atomic. None provides
+cross-adapter transactions or ANN search.
 
-A flush writes an immutable sorted-string table. SSTables contain
-prefix-compressed data blocks, restart points for bounded seeks, an index,
-per-table Bloom-filter data, checksummed block trailers, and a footer describing
-the format.
+## Trade-offs
 
-The builder writes a temporary file and atomically installs the completed table.
-The manifest publishes it only after the file and directory have been
-synchronized. Readers never modify a published SSTable.
-
-## Bloom filters
-
-A Bloom filter compactly answers either “definitely absent” or “possibly
-present.” MeteorDB builds a filter from the user keys in each SSTable. A
-definite negative skips the data-block lookup; a positive result still checks
-the table because false positives are possible.
-
-More bits per key consume more metadata space but generally reduce unnecessary
-data reads. Bloom filters do not replace index lookup and do not support range
-scans.
-
-## MVCC
-
-Every committed batch receives one monotonically increasing sequence number.
-Current point reads use the latest published sequence. A snapshot stores the
-sequence visible when it was created, so later updates and deletions do not
-change point reads through that snapshot.
-
-MeteorDB currently retains historical versions because compaction and version
-reclamation are roadmap work. Snapshots provide stable point reads, not
-multi-key transactions or scan isolation.
-
-## Manifests
-
-The manifest is the durable source of truth for live SSTables and recovery
-counters. Each edit is framed and checksummed. Applying an edit validates a new
-immutable version, synchronizes newly referenced SSTables, appends and
-synchronizes the edit, and only then publishes the version to readers.
-
-`CURRENT` identifies the active manifest. On recovery, MeteorDB replays its
-complete edits, rejects invalid metadata, validates referenced files, and
-truncates a structurally incomplete trailing manifest record to the last
-complete boundary. A checksum mismatch or invalid fragment order is corruption,
-not a truncatable torn tail.
-
-## Block caching
-
-Point reads use an in-process LRU block cache keyed by SSTable number, block
-offset, and block kind. The cache reserves 20% of its byte budget for Bloom and
-index metadata and 80% for data blocks. Independent budgets prevent a stream of
-large data blocks from evicting all navigation metadata. `TableReader` checks
-the cache; after a miss it reads and validates the checksummed SSTable block,
-then admits the validated decoded bytes. SSTable files do not query the cache.
-
-`Engine::stats` reports cache capacity, usage, hits, misses, admissions, and
-evictions together with point reads, Bloom checks, useful negatives, and table
-probes by level.
-
-## Read and write amplification
-
-Write amplification is currently dominated by the WAL plus one level 0
-SSTable write. That is a simple path, but the absence of compaction means old
-files and obsolete key versions are not reclaimed.
-
-Read amplification depends on where a key is found. Memory hits avoid SSTable
-I/O. On disk, level 0 may require multiple overlapping probes; each higher
-level requires at most one candidate probe. Bloom filters and the block cache
-reduce physical reads but do not remove the lookup work. The statistics API
-exposes average SSTable probes per point read for workload evaluation.
-
-## Current trade-offs
-
-- **Embedded and synchronous:** The API is easy to integrate but foreground
-  calls can perform filesystem work.
-- **Strong recovery ordering:** Extra synchronization favors explicit
-  durability over maximum write throughput.
-- **Point reads only:** Ordered storage exists internally, but range and prefix
-  scans are not yet public capabilities.
-- **Flush without compaction:** Data reaches immutable SSTables, but long-lived
-  databases accumulate level 0 files and historical versions.
-- **No TTL enforcement:** Batches can carry expiration metadata internally, but
-  the engine does not enforce expiry.
-- **No workload adapters:** Inference-cache, feature-store, embedding, and ANN
-  surfaces remain roadmap layers over the byte API.
-- **No published performance claims:** Evaluate the current code with your own
-  durability mode, dataset, and hardware.
+- Embedded synchronous calls simplify deployment but can perform filesystem
+  work on application threads.
+- LSM writes are sequential but compaction rewrites bytes.
+- MVCC snapshots stabilize sequence visibility but retain old versions.
+- Strong corruption detection favors explicit failure over best-effort reads.
+- The engine is optimized for local ordered storage, not network distribution,
+  relational queries, or RocksDB compatibility.

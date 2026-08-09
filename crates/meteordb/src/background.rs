@@ -1,4 +1,18 @@
-use std::sync::{Condvar, Mutex};
+use std::collections::VecDeque;
+use std::sync::{Arc, Condvar, Mutex};
+
+use crate::Version;
+
+pub(crate) struct ObsoleteSstables {
+    pub(crate) version: Arc<Version>,
+    pub(crate) files: VecDeque<u64>,
+}
+
+impl ObsoleteSstables {
+    pub(crate) fn is_unreferenced(&self) -> bool {
+        Arc::strong_count(&self.version) == 1
+    }
+}
 
 /// Wakes the flush worker and engine callers waiting for flush progress.
 #[derive(Default)]
