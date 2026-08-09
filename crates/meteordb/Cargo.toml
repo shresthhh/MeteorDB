@@ -4,6 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+description = "Embedded ordered key-value storage with MVCC, TTL, and AI workload adapters"
+readme = "README.md"
+documentation = "https://docs.rs/meteordb"
+categories = ["database-implementations", "embedded"]
+keywords = ["database", "embedded", "lsm", "key-value", "ai"]
 
 [dependencies]
 blake3.workspace = true
