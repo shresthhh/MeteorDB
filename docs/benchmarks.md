@@ -32,7 +32,7 @@ access schedule for both engines.
 | `embedding-storage` | Uniform batched gets and atomic batched puts of 6 KiB values |
 | `prefix-scan` | Bounded scans using a declared key-prefix length |
 | `range-scan` | Bounded ordered half-open range scans |
-| `compaction` | Overwrite batches followed by flush and explicit compaction |
+| `compaction` | Fresh pre-populated/flushed database followed by verified explicit compaction |
 
 The smoke profile uses one foreground thread, no compression, 8 MiB cache, 4
 MiB write buffers/files, 50 warm-up operations, 200 measured operations, and
@@ -145,8 +145,17 @@ The following are deliberately labeled non-equivalent in JSON:
 
 - RocksDB has no per-entry TTL in this runner. TTL-marked writes use normal
   puts and do not measure expiry, while MeteorDB records expirations.
-- MeteorDB performs one highest-priority leveled compaction; RocksDB
-  `compact_range` covers the full key range.
+- Compaction setup is never timed: every sample gets a fresh database that is
+  opened, populated, repeatedly flushed into a compactable state, and
+  inspected before the timer starts. MeteorDB must report that `compact()`
+  selected work. RocksDB disables automatic compaction, runs synchronous
+  manual `compact_range` over the fixture's explicit
+  minimum-inclusive/maximum-exclusive key bounds, and verifies that the
+  level-zero file count decreases after completion.
+- These compactions are not exactly equivalent: MeteorDB selects one
+  highest-priority overfull level, while RocksDB manual range compaction has
+  engine-specific selection semantics. Structured and pretty JSON both retain
+  this non-equivalence label.
 - cache layout, Bloom filters, file format, recovery algorithm, and background
   scheduling are engine-specific. `threads` is foreground workload concurrency
   and currently must be `1` for both frontends. RocksDB's two background jobs

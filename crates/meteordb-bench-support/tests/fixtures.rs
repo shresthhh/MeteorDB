@@ -2,8 +2,9 @@ use meteordb_bench_support::{
     AccessDistribution, Amplification, CACHE_VALUE_BYTES, ComponentBenchmarkReport,
     CounterSnapshot, Dataset, EMBEDDING_VALUE_BYTES, LatencySummary, WorkloadFile, WorkloadKind,
     capture_environment, compression_equivalence, measure_prepared_samples,
-    read_amplification_delta, smoke_workload,
+    read_amplification_delta, smoke_workload, verify_compaction_sample,
 };
+use std::time::Duration;
 
 #[test]
 fn smoke_dataset_is_reproducible_and_uses_declared_sizes() {
@@ -242,6 +243,35 @@ fn prepared_latency_probe_prepares_every_sample_outside_the_operation() {
 
     assert_eq!(setups, 4);
     assert_eq!(latencies.len(), 4);
+}
+
+#[test]
+fn prepared_latency_probe_does_not_charge_setup_to_the_sample() {
+    let latencies = measure_prepared_samples(
+        2,
+        || {
+            std::thread::sleep(Duration::from_millis(20));
+        },
+        |()| (),
+        |()| true,
+    )
+    .unwrap();
+
+    assert!(
+        latencies
+            .iter()
+            .all(|&latency| latency < Duration::from_millis(10).as_nanos() as u64),
+        "setup leaked into measured latency: {latencies:?}"
+    );
+}
+
+#[test]
+fn compaction_verification_rejects_false_and_unchanged_samples() {
+    assert!(verify_compaction_sample(Some(true), None, None));
+    assert!(verify_compaction_sample(None, Some(6), Some(1)));
+    assert!(!verify_compaction_sample(Some(false), None, None));
+    assert!(!verify_compaction_sample(None, Some(6), Some(6)));
+    assert!(!verify_compaction_sample(None, None, None));
 }
 
 #[test]

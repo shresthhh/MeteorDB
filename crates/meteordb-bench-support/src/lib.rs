@@ -556,6 +556,18 @@ pub fn read_amplification_delta(before: CounterSnapshot, after: CounterSnapshot)
     (point_reads > 0).then(|| sstable_probes as f64 / point_reads as f64)
 }
 
+pub fn verify_compaction_sample(
+    direct_result: Option<bool>,
+    before_marker: Option<u64>,
+    after_marker: Option<u64>,
+) -> bool {
+    direct_result.unwrap_or_else(|| {
+        before_marker
+            .zip(after_marker)
+            .is_some_and(|(before, after)| after < before)
+    })
+}
+
 pub fn measure_prepared_samples<S, O>(
     sample_count: usize,
     mut prepare: impl FnMut() -> S,

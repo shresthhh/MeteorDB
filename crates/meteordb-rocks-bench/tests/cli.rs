@@ -43,6 +43,10 @@ fn meteordb_smoke_emits_versioned_result_schema() {
             .iter()
             .any(|note| note.contains("both engines are configured with no compression"))
     );
+    assert!(result.non_equivalence.iter().any(|note| {
+        note.contains("explicit minimum-inclusive/maximum-exclusive key bounds")
+            && note.contains("not exactly equivalent")
+    }));
 }
 
 #[test]

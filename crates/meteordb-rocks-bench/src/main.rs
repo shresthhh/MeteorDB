@@ -11,7 +11,7 @@ use meteordb::{Durability, Engine, Options, ScanBounds, WriteBatch as MeteorWrit
 use meteordb_bench_support::{
     Amplification, ComparisonResult, CompressionConfig, CounterSnapshot, Dataset, DurabilityConfig,
     LatencySummary, WorkloadFile, WorkloadKind, WorkloadResult, WorkloadSpec, capture_environment,
-    compression_equivalence, read_amplification_delta, smoke_workload,
+    compression_equivalence, read_amplification_delta, smoke_workload, verify_compaction_sample,
 };
 
 type BenchResult<T> = Result<T, Box<dyn Error>>;
@@ -79,7 +79,8 @@ trait KvEngine {
     fn scan_prefix(&self, prefix: &[u8], limit: usize) -> BenchResult<usize>;
     fn scan_range(&self, start: &[u8], end: &[u8], limit: usize) -> BenchResult<usize>;
     fn flush(&self) -> BenchResult<()>;
-    fn compact(&self) -> BenchResult<()>;
+    fn compaction_marker(&self) -> BenchResult<Option<u64>>;
+    fn compact(&self, start: &[u8], end: &[u8]) -> BenchResult<Option<bool>>;
     fn read_stats(&self) -> Option<CounterSnapshot>;
     fn close(&self) -> BenchResult<()>;
 }
@@ -140,9 +141,12 @@ impl KvEngine for MeteorEngine {
         Ok(self.inner.flush()?)
     }
 
-    fn compact(&self) -> BenchResult<()> {
-        self.inner.compact()?;
-        Ok(())
+    fn compaction_marker(&self) -> BenchResult<Option<u64>> {
+        Ok(None)
+    }
+
+    fn compact(&self, _start: &[u8], _end: &[u8]) -> BenchResult<Option<bool>> {
+        Ok(Some(self.inner.compact()?))
     }
 
     fn read_stats(&self) -> Option<CounterSnapshot> {
@@ -185,7 +189,7 @@ fn run_meteordb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Compari
         );
     }
     let root = benchmark_tempdir()?;
-    let factory = |path: &Path| -> BenchResult<Box<dyn KvEngine>> {
+    let factory = |path: &Path, _spec: &WorkloadSpec| -> BenchResult<Box<dyn KvEngine>> {
         Ok(Box::new(MeteorEngine {
             inner: Engine::open(meteor_options(path, &workload))?,
         }))
@@ -196,7 +200,7 @@ fn run_meteordb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Compari
     let non_equivalence = engine_non_equivalence(
         &workload,
         vec![
-            "MeteorDB compacts one highest-priority level; RocksDB compact_range compacts the full key range".into(),
+            "MeteorDB compacts one highest-priority level; RocksDB uses synchronous manual compact_range over the fixture's explicit minimum-inclusive/maximum-exclusive key bounds, so the work selected is not exactly equivalent".into(),
             "foreground workload concurrency is one; MeteorDB background scheduling is engine-internal".into(),
         ],
     );
@@ -232,15 +236,21 @@ fn execute_suite<F>(
     factory: F,
 ) -> BenchResult<RunSummary>
 where
-    F: Fn(&Path) -> BenchResult<Box<dyn KvEngine>>,
+    F: Fn(&Path, &WorkloadSpec) -> BenchResult<Box<dyn KvEngine>>,
 {
     let mut results = Vec::with_capacity(workload.workloads.len());
     let mut probes = 0_u64;
     let mut point_reads = 0_u64;
     for (index, spec) in workload.workloads.iter().enumerate() {
+        if spec.kind == WorkloadKind::Compaction {
+            results.push(execute_compaction_workload(
+                workload, dataset, spec, root, index, &factory,
+            )?);
+            continue;
+        }
         let path = root.join(format!("{index:02}-{}", spec.name));
         fs::create_dir(&path)?;
-        let engine = factory(&path)?;
+        let engine = factory(&path, spec)?;
         seed_engine(engine.as_ref(), dataset, spec)?;
         let (result, before, after) = execute_workload(engine.as_ref(), dataset, spec, workload)?;
         if let (Some(before), Some(after)) = (before, after) {
@@ -255,17 +265,14 @@ where
 
     let recovery_path = root.join("recovery");
     fs::create_dir(&recovery_path)?;
-    let engine = factory(&recovery_path)?;
-    seed_engine(
-        engine.as_ref(),
-        dataset,
-        workload.workloads.first().expect("validated workloads"),
-    )?;
+    let recovery_spec = workload.workloads.first().expect("validated workloads");
+    let engine = factory(&recovery_path, recovery_spec)?;
+    seed_engine(engine.as_ref(), dataset, recovery_spec)?;
     engine.flush()?;
     engine.close()?;
     drop(engine);
     let started = Instant::now();
-    let recovered = factory(&recovery_path)?;
+    let recovered = factory(&recovery_path, recovery_spec)?;
     let recovery_time_ns = nanos(started.elapsed());
     recovered.close()?;
     drop(recovered);
@@ -285,6 +292,99 @@ where
             },
         ),
     })
+}
+
+fn execute_compaction_workload<F>(
+    workload: &WorkloadFile,
+    dataset: &Dataset,
+    spec: &WorkloadSpec,
+    root: &Path,
+    workload_index: usize,
+    factory: &F,
+) -> BenchResult<WorkloadResult>
+where
+    F: Fn(&Path, &WorkloadSpec) -> BenchResult<Box<dyn KvEngine>>,
+{
+    let total = workload.measurement.warmup_operations + workload.measurement.measured_operations;
+    let mut measured_elapsed_ns = 0_u64;
+    let mut latencies = Vec::new();
+    let (start, end) = compaction_bounds(dataset);
+
+    for sample_index in 0..total {
+        let path = root.join(format!(
+            "{workload_index:02}-{}-{sample_index:04}",
+            spec.name
+        ));
+        fs::create_dir(&path)?;
+        let engine = factory(&path, spec)?;
+        prepare_compaction_sample(engine.as_ref(), dataset)?;
+        let before = engine.compaction_marker()?;
+
+        let started = Instant::now();
+        let direct_result = engine.compact(start, &end)?;
+        let elapsed = nanos(started.elapsed());
+
+        let after = engine.compaction_marker()?;
+        let did_work = verify_compaction_sample(direct_result, before, after);
+        if !did_work {
+            return Err(format!("compaction sample {} performed no work", sample_index + 1).into());
+        }
+        engine.close()?;
+
+        if sample_index >= workload.measurement.warmup_operations {
+            measured_elapsed_ns = measured_elapsed_ns.saturating_add(elapsed);
+            let measured_index = sample_index - workload.measurement.warmup_operations;
+            if measured_index % workload.measurement.sample_interval_operations == 0 {
+                latencies.push(elapsed);
+            }
+        }
+    }
+
+    let operations = workload.measurement.measured_operations as u64;
+    let throughput = if measured_elapsed_ns == 0 {
+        0.0
+    } else {
+        operations as f64 * 1_000_000_000.0 / measured_elapsed_ns as f64
+    };
+    Ok(WorkloadResult {
+        name: spec.name.clone(),
+        operations,
+        elapsed_ns: measured_elapsed_ns,
+        throughput_ops_per_second: throughput,
+        latency: LatencySummary::from_nanos(&latencies)?,
+    })
+}
+
+fn prepare_compaction_sample(engine: &dyn KvEngine, dataset: &Dataset) -> BenchResult<()> {
+    for round in 0..6 {
+        for (keys, values) in dataset.keys.chunks(32).zip(dataset.cache_values.chunks(32)) {
+            let entries = keys
+                .iter()
+                .zip(values.iter().cycle().skip(round))
+                .map(|(key, value)| (key.as_slice(), value.as_slice()))
+                .collect::<Vec<_>>();
+            engine.write_batch(&entries)?;
+        }
+        engine.flush()?;
+    }
+    Ok(())
+}
+
+fn compaction_bounds(dataset: &Dataset) -> (&[u8], Vec<u8>) {
+    let start = dataset
+        .keys
+        .iter()
+        .map(Vec::as_slice)
+        .min()
+        .expect("validated non-empty dataset");
+    let mut end = dataset
+        .keys
+        .iter()
+        .max()
+        .expect("validated non-empty dataset")
+        .clone();
+    end.push(0);
+    (start, end)
 }
 
 fn seed_engine(engine: &dyn KvEngine, dataset: &Dataset, spec: &WorkloadSpec) -> BenchResult<()> {
@@ -377,12 +477,7 @@ fn execute_operation(
         WorkloadKind::RangeScan => {
             scan_range(engine, dataset, key_index, spec.scan_length)?;
         }
-        WorkloadKind::Compaction => {
-            let entries = batch_entries(dataset, key_index, spec.batch_size, false);
-            engine.write_batch(&entries)?;
-            engine.flush()?;
-            engine.compact()?;
-        }
+        WorkloadKind::Compaction => unreachable!("compaction uses fresh prepared samples"),
         _ => {
             let selector = ((operation as u64 * 37) % u64::from(spec.operation_mix.total())) as u32;
             let read_end = spec.operation_mix.reads;
@@ -644,9 +739,13 @@ mod rocks {
             Ok(self.db.flush()?)
         }
 
-        fn compact(&self) -> BenchResult<()> {
-            self.db.compact_range::<&[u8], &[u8]>(None, None);
-            Ok(())
+        fn compaction_marker(&self) -> BenchResult<Option<u64>> {
+            Ok(self.db.property_int_value("rocksdb.num-files-at-level0")?)
+        }
+
+        fn compact(&self, start: &[u8], end: &[u8]) -> BenchResult<Option<bool>> {
+            self.db.compact_range(Some(start), Some(end));
+            Ok(None)
         }
 
         fn read_stats(&self) -> Option<CounterSnapshot> {
@@ -659,12 +758,17 @@ mod rocks {
         }
     }
 
-    pub(super) fn options(path: &Path, workload: &WorkloadFile) -> BenchResult<RocksEngine> {
+    pub(super) fn options(
+        path: &Path,
+        workload: &WorkloadFile,
+        manual_compaction: bool,
+    ) -> BenchResult<RocksEngine> {
         let mut options = RocksOptions::default();
         options.create_if_missing(true);
         options.set_write_buffer_size(workload.engine.write_buffer_bytes);
         options.set_target_file_size_base(workload.engine.target_file_bytes as u64);
         options.set_max_background_jobs(ROCKSDB_BACKGROUND_JOBS);
+        options.set_disable_auto_compactions(manual_compaction);
         options.set_compression_type(match workload.engine.compression {
             CompressionConfig::None => DBCompressionType::None,
             CompressionConfig::Snappy => DBCompressionType::Snappy,
@@ -684,8 +788,12 @@ mod rocks {
 #[cfg(feature = "rocksdb-engine")]
 fn run_rocksdb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<ComparisonResult> {
     let root = benchmark_tempdir()?;
-    let factory = |path: &Path| -> BenchResult<Box<dyn KvEngine>> {
-        Ok(Box::new(rocks::options(path, &workload)?))
+    let factory = |path: &Path, spec: &WorkloadSpec| -> BenchResult<Box<dyn KvEngine>> {
+        Ok(Box::new(rocks::options(
+            path,
+            &workload,
+            spec.kind == WorkloadKind::Compaction,
+        )?))
     };
     let summary = execute_suite(&workload, &dataset, root.path(), factory)?;
     let environment = capture_environment(std::env::current_dir()?)?;
@@ -694,7 +802,7 @@ fn run_rocksdb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Comparis
         &workload,
         vec![
             "RocksDB has no per-entry TTL in this runner; TTL-marked writes persist and expiry is not measured".into(),
-            "RocksDB compact_range covers the full key range while MeteorDB compacts one highest-priority level".into(),
+            "RocksDB uses synchronous manual compact_range over the fixture's explicit minimum-inclusive/maximum-exclusive key bounds while MeteorDB compacts one highest-priority level; selection semantics are not exactly equivalent".into(),
             "RocksDB uses two background jobs independently of the one foreground workload thread; cache implementation, file format, Bloom filters, and recovery algorithms are engine-specific".into(),
         ],
     );
@@ -720,4 +828,121 @@ fn run_rocksdb(workload: WorkloadFile, dataset: Dataset) -> BenchResult<Comparis
         semantic_equivalence,
         non_equivalence,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use super::*;
+
+    struct CompactionProbe {
+        compacted: Mutex<bool>,
+        no_op: bool,
+    }
+
+    impl KvEngine for CompactionProbe {
+        fn get(&self, _key: &[u8]) -> BenchResult<Option<Vec<u8>>> {
+            unreachable!()
+        }
+
+        fn put(&self, _key: &[u8], _value: &[u8]) -> BenchResult<()> {
+            unreachable!()
+        }
+
+        fn put_with_ttl(&self, _key: &[u8], _value: &[u8], _ttl_ms: u64) -> BenchResult<()> {
+            unreachable!()
+        }
+
+        fn delete(&self, _key: &[u8]) -> BenchResult<()> {
+            unreachable!()
+        }
+
+        fn write_batch(&self, _entries: &[(&[u8], &[u8])]) -> BenchResult<()> {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        }
+
+        fn scan_prefix(&self, _prefix: &[u8], _limit: usize) -> BenchResult<usize> {
+            unreachable!()
+        }
+
+        fn scan_range(&self, _start: &[u8], _end: &[u8], _limit: usize) -> BenchResult<usize> {
+            unreachable!()
+        }
+
+        fn flush(&self) -> BenchResult<()> {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(())
+        }
+
+        fn compaction_marker(&self) -> BenchResult<Option<u64>> {
+            Ok(None)
+        }
+
+        fn compact(&self, _start: &[u8], _end: &[u8]) -> BenchResult<Option<bool>> {
+            let mut compacted = self.compacted.lock().unwrap();
+            assert!(!*compacted, "a timed sample reused its database");
+            *compacted = true;
+            Ok(Some(!self.no_op))
+        }
+
+        fn read_stats(&self) -> Option<CounterSnapshot> {
+            None
+        }
+
+        fn close(&self) -> BenchResult<()> {
+            Ok(())
+        }
+    }
+
+    fn compaction_only_workload() -> WorkloadFile {
+        let mut workload = smoke_workload();
+        workload.measurement.warmup_operations = 1;
+        workload.measurement.measured_operations = 2;
+        workload
+            .workloads
+            .retain(|spec| spec.kind == WorkloadKind::Compaction);
+        workload
+    }
+
+    #[test]
+    fn comparison_compaction_prepares_fresh_samples_outside_timing() {
+        let workload = compaction_only_workload();
+        let dataset = Dataset::generate(&workload).unwrap();
+        let root = benchmark_tempdir().unwrap();
+        let summary = execute_suite(&workload, &dataset, root.path(), |_, _| {
+            Ok(Box::new(CompactionProbe {
+                compacted: Mutex::new(false),
+                no_op: false,
+            }))
+        })
+        .unwrap();
+
+        let result = &summary.results[0];
+        assert_eq!(result.operations, 2);
+        assert!(
+            result.elapsed_ns < Duration::from_millis(10).as_nanos() as u64,
+            "setup leaked into compaction latency: {}ns",
+            result.elapsed_ns
+        );
+    }
+
+    #[test]
+    fn comparison_compaction_rejects_a_no_op_sample() {
+        let workload = compaction_only_workload();
+        let dataset = Dataset::generate(&workload).unwrap();
+        let root = benchmark_tempdir().unwrap();
+        let error = execute_suite(&workload, &dataset, root.path(), |_, _| {
+            Ok(Box::new(CompactionProbe {
+                compacted: Mutex::new(false),
+                no_op: true,
+            }))
+        })
+        .err()
+        .expect("no-op compaction must fail");
+
+        assert!(error.to_string().contains("performed no work"), "{error}");
+    }
 }

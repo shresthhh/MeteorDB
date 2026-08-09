@@ -246,3 +246,62 @@ cargo run -q -p meteordb-rocks-bench -- --engine meteordb --smoke
 git diff --check
   passed
 ```
+
+## Final compaction-latency finding
+
+- The comparison runner now routes compaction through a dedicated prepared
+  sample path. Every warm-up and measured sample receives a distinct
+  directory and engine. Open, population, six flushed overwrite rounds,
+  compaction-state capture, post-operation verification, close, and recursive
+  sizing all occur outside the `Instant` interval; the interval contains only
+  the engine's explicit compaction call.
+- MeteorDB propagates the boolean returned by `Engine::compact()` and rejects
+  `false`. RocksDB compaction samples disable automatic compaction, capture
+  `rocksdb.num-files-at-level0`, run synchronous manual `compact_range` over
+  the generated fixture's minimum-inclusive/maximum-exclusive key bounds, and
+  reject a sample unless the level-zero file count falls.
+- Structured compact JSON and pretty JSON retain an explicit non-equivalence
+  note: MeteorDB selects one highest-priority overfull level, while RocksDB's
+  manually bounded compaction has engine-specific selection semantics.
+
+Red/green evidence:
+
+```text
+cargo test -p meteordb-bench-support --test fixtures prepared_latency_probe_does_not_charge_setup_to_the_sample -- --exact
+  Boundary check passed against the already-correct support timer, proving the
+  setup-timing defect was runner integration rather than the timer.
+cargo test -p meteordb-bench-support --test fixtures compaction_verification_rejects_false_and_unchanged_samples -- --exact
+  RED: unresolved verify_compaction_sample import.
+  GREEN: 1 passed; direct false, unchanged RocksDB markers, and unavailable
+  verification are rejected.
+cargo test -p meteordb-rocks-bench --bin meteordb-rocks-bench comparison_compaction -- --nocapture
+  RED: failed to compile because KvEngine::compact returned (), so a runner
+  sample could not communicate or reject false/no-op compaction.
+  GREEN: 2 passed; delayed setup was excluded, every timed sample used a fresh
+  engine, and a simulated no-op was rejected.
+```
+
+Final validation:
+
+```text
+cargo test -p meteordb-bench-support --test fixtures
+  18 passed
+cargo test -p meteordb-rocks-bench
+  8 passed (2 runner unit tests, 6 CLI tests)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo bench --no-run
+  passed
+cargo run -q -p meteordb-rocks-bench -- --engine meteordb --smoke
+  passed; schema 1, 7 workloads, 200 verified compaction samples
+cargo run -q -p meteordb-rocks-bench -- --engine rocksdb --smoke
+  exited 1 before native Cargo invocation with actionable diagnostics for
+  missing cc, c++, CMake, pkg-config, and libclang
+git diff --check
+  passed
+```
+
+The native RocksDB implementation remains uncompiled on this host because
+those prerequisites are absent. The exact command's prerequisite gate proves
+that this limitation is diagnosed before Cargo attempts `librocksdb-sys`.
