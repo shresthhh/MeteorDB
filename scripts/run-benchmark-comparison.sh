@@ -52,14 +52,6 @@ if [[ $engine == rocksdb ]]; then
     "$repo/scripts/check-rocksdb-bench-deps.sh"
 fi
 
-root="$repo/.superpowers/sdd/local-toolchain/root"
-if [[ -x $root/usr/bin/gcc-13 ]]; then
-    export PATH="$root/usr/bin:$PATH"
-    export CC="$root/usr/bin/gcc-13"
-    export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$root/usr/bin/gcc-13"
-    export LIBRARY_PATH="$root/usr/lib/x86_64-linux-gnu:$root/usr/lib/gcc/x86_64-linux-gnu/13"
-fi
-
 cargo_args=(run --quiet -p meteordb-rocks-bench)
 if [[ $engine == rocksdb ]]; then
     cargo_args+=(--features rocksdb-engine)

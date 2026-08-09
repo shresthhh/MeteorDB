@@ -1,0 +1,84 @@
+name: Bug report
+description: Report reproducible incorrect behavior in MeteorDB
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve MeteorDB. For suspected vulnerabilities, stop and use the private process in SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: MeteorDB version or commit
+      description: Provide a release version or the full commit SHA.
+      placeholder: "0.1.0 or 0123456789abcdef..."
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      description: Include operating system, architecture, Rust version, and filesystem when relevant.
+      placeholder: "Linux x86_64, rustc 1.88.0, ext4"
+    validations:
+      required: true
+  - type: dropdown
+    id: durability
+    attributes:
+      label: Durability mode
+      description: Select the mode used when the problem occurred.
+      options:
+        - Sync
+        - Buffered
+        - Both
+        - Not applicable or unknown
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Provide the smallest complete sequence of API calls, crashes, reopens, or filesystem events that reproduces the problem.
+      placeholder: |
+        1. Open the engine with...
+        2. Write...
+        3. Simulate...
+        4. Reopen...
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the value, error, durability, or recovery result you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened, including exact error types and whether data was acknowledged before a crash.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and diagnostics
+      description: Paste relevant redacted output. Do not include credentials, tokens, private database contents, or other secrets.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Submission checks
+      options:
+        - label: I searched existing issues and pull requests for this problem.
+          required: true
+        - label: I removed credentials, tokens, private data, and other secrets from this report.
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure.
+          required: true

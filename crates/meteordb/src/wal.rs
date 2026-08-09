@@ -149,7 +149,8 @@ impl WalWriter {
     /// [`WalWriter::append`]. It must be nonzero. The same value must be passed
     /// to [`replay_wal`] so writing and recovery enforce identical payload and
     /// checked encoded-overhead limits. If `path` already exists, creation
-    /// fails without modifying its bytes because recovery is not implemented.
+    /// fails without modifying its bytes because this standalone writer does
+    /// not append to existing segments. Engine recovery uses [`replay_wal`].
     pub fn create(path: impl AsRef<Path>, max_batch_bytes: usize) -> Result<Self> {
         Self::create_with_fs(path, max_batch_bytes, Arc::new(OsDurableFs))
     }

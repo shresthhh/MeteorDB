@@ -100,15 +100,14 @@ scripts/run-benchmark-comparison.sh --engine meteordb --smoke \
   --output .bench-results/meteordb-smoke.json
 ```
 
-The script uses the repository-local GCC 13 workaround when present. To invoke
-Cargo directly on this host:
+If the system `cc` name is unavailable but GCC is installed elsewhere, select
+it explicitly before invoking Cargo or the script:
 
 ```bash
-ROOT="$PWD/.superpowers/sdd/local-toolchain/root"
-export PATH="$ROOT/usr/bin:$PATH"
-export CC="$ROOT/usr/bin/gcc-13"
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$ROOT/usr/bin/gcc-13"
-export LIBRARY_PATH="$ROOT/usr/lib/x86_64-linux-gnu:$ROOT/usr/lib/gcc/x86_64-linux-gnu/13"
+export CC=/path/to/gcc
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$CC"
+# If GCC's runtime libraries are outside the system search path:
+export LIBRARY_PATH=/path/to/gcc-libraries
 ```
 
 ## Result schema and interpretation
