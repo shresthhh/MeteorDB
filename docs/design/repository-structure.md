@@ -107,5 +107,5 @@ engine implementation. Validation includes:
 - shell commands run from the repository root;
 - the quickstart compiles and runs;
 - feature tables match implemented code;
-- no tracked `.superpowers` or `docs/superpowers` artifacts remain; and
+- no internal workflow artifacts are tracked; and
 - the full Rust workspace passes formatting, Clippy, and tests.
